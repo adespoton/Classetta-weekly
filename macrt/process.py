@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Callable
 
 from .m68k import segload
 from .macfile import Folder, MacFile, is_control_panel
-from .memory import ADDRESS_MASK
+from .memory import ADDRESS_MASK, BusError
 from .resfork import InvalidForkError, open_fork
 from .toolbox import lowmem
 from .toolbox.events import EventQueue, ProcessKilled, tick_count
@@ -79,30 +79,37 @@ class Process:
                  partition_size: int | None = None, app: MacFile | None = None,
                  folder: Folder | None = None, page_option: int = 0,
                  memory: int | None = None, as_panel: bool = True,
-                 code0: segload.Layout | None = None):
+                 code0: segload.Layout | None = None, finder_info: bytes | None = None):
         self.system = system
         self.name = name
         self.events = events
         self.app = app
+        # The Finder information the application that launched it left
+        # in its AppParmHandle; None: its own documents'.
+        self.finder_info = finder_info
         self.serial_number = next(_serial_numbers)
         self.launch_ticks = tick_count()
         layout = None
+        hosted = False
         if main is None:
             # A control panel is hosted, as the Finder does, unless it's
             # an application as well, launched as one: After Dark 3.0's
             # file has CODE resources, and its INIT launches it.  code0 is
             # CODE 0's layout, if the launching application has read it.
             panel = app is not None and is_control_panel(app)
-            if panel and (as_panel or not segload.has_code(app)):
+            hosted = panel and (as_panel or not segload.has_code(app))
+            if hosted:
                 from .m68k import controlpanel
                 layout = controlpanel.LAYOUT
             elif app is not None:
                 layout = code0 or segload.code0(app)
             if layout is None:
-                raise ValueError(f"{name} has no 68k code (no CODE resources) to run")
+                why = segload.why_no_code(app) if app is not None else "no application"
+                raise ValueError(f"{name} has no 68k code ({why}) to run")
         # A negative page option, as a word, asks for the alternate screen.
         alternate = bool(page_option & 0x8000)
-        self.partition = self._open_partition(partition_size, layout, memory, alternate)
+        self.partition = self._open_partition(partition_size, layout, memory, alternate,
+                                              hosted=hosted)
         self.heap = self.partition.heap
         self.world = self.partition.world
         self.world.w16(lowmem.CurPageOption, page_option)  # Launch's: < 0 for the alternate screen
@@ -135,6 +142,8 @@ class Process:
         self.faulted = False                        # its records broke the GUI; it's being stopped
         self.notifications: set[int] = set()        # NMRecs installed (NMInstall)
         self.responses_due: deque[int] = deque()    # of those, the ones to respond to
+        self.shutdown_procs: dict[int, int] = {}    # ShutDwnInstall's, with their flags
+        self.pict_infos: dict[int, object] = {}     # NewPictInfo's surveys, by ID
         # The Palette Manager's: each window's palette and the colour updates
         # it wants; -1's, the application's own default palette.
         self.palettes: dict[int, tuple[int, int]] = {}
@@ -153,10 +162,14 @@ class Process:
         self.main = main
 
     def _open_partition(self, size: int | None, layout: segload.Layout | None,
-                        memory: int | None = None, alternate: bool = False):
+                        memory: int | None = None, alternate: bool = False,
+                        hosted: bool = False):
         """memory, if given, is the memory size the Finder's Get Info sets,
         in place of the SIZE resource's.  alternate: it was launched with
-        the alternate screen, whose room comes on top."""
+        the alternate screen, whose room comes on top.  hosted: it's a
+        control panel, hosted as the Finder does, with a partition of the
+        host's.  Its file's memory size and SIZE resource are for the
+        application its CODE makes (After Dark 4.0's Demo)."""
         world = {}
         if layout is not None:
             world = dict(above_a5=max(layout.above_a5, APP_PARAMS), below_a5=layout.below_a5,
@@ -166,7 +179,8 @@ class Process:
             world["alternate"] = True
         if size is not None:
             return self.system.open_partition(self.name, size + room, **world)
-        sizes = (memory, memory) if memory else size_resource(self.app) if self.app else None
+        sizes = (None if hosted else (memory, memory) if memory else
+                 size_resource(self.app) if self.app else None)
         if sizes is None:
             return self.system.open_partition(self.name, DEFAULT_PARTITION + room, **world)
         # As the Finder does: the preferred size if there's room, else as
@@ -211,8 +225,12 @@ class Process:
     def close(self) -> None:
         """Close the application's resource files and the files and working
         directories it left open, and give the partition back once the
-        application is gone."""
-        self.resources.close_all()
+        application is gone. A map chain the application overwrote
+        leaves its maps where they are; their files close with the rest."""
+        try:
+            self.resources.close_all()
+        except BusError:
+            pass
         self.files.close_all()
         self.system.screen.detach(self)
         self.system.close_partition(self.partition)

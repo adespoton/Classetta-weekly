@@ -30,9 +30,9 @@ import time
 from PyQt6.QtCore import QTimer
 from PyQt6.QtWidgets import QApplication
 
-from .m68k.segload import has_code
+from .m68k.segload import has_code, why_no_code
 from .macfile import is_control_panel, open_application, open_disks
-from .resfork import InvalidForkError, is_fork, open_fork
+from .resfork import is_fork
 from .toolbox import constants as k
 from .toolbox.api import Toolbox
 from .toolbox.types import Rect
@@ -278,6 +278,11 @@ def parse_args(argv=None):
                     help="with --model ii, the screen's bits a pixel: 1 for black and white, "
                          "2 to 8 for colours by a colour table, 16 and 32 for direct colour "
                          "(default: 8)")
+    ap.add_argument("--row-bytes", type=int, metavar="N", default=None,
+                    help="how many bytes apart the screen's rows are at the depth it starts "
+                         "at (and at another, as many pixels apart), for a program that writes "
+                         "to the screen taking them to be so many rather than asking QuickDraw "
+                         "(default: as few as a row needs)")
     ap.add_argument("--no-sound", action="store_true",
                     help="don't play the Mac's sound on the host's sound output")
     ap.add_argument("--record-sound", metavar="FILE.wav",
@@ -298,7 +303,8 @@ def parse_args(argv=None):
     ap.add_argument("--memory", type=int, default=None, metavar="K",
                     help="give the application K kilobytes of memory, in place of what its "
                          "SIZE resource asks for, as the memory size in the Finder's Get "
-                         "Info does")
+                         "Info does; a control panel's is for the application it launches "
+                         "from its own file")
     ap.add_argument("--list", action="store_true", help="list the file's resources and exit")
     ap.add_argument("--view", action="store_true",
                     help="show the application's menus, windows and dialogs from its "
@@ -313,6 +319,8 @@ def parse_args(argv=None):
         ap.error("--memory is a size in K, more than 0")
     if args.depth not in (None, 1) and args.model != "ii":
         ap.error("a Mac Plus's screen is black and white: --depth needs --model ii")
+    if args.row_bytes is not None and (args.row_bytes & 1 or not 0 < args.row_bytes < 0x4000):
+        ap.error("--row-bytes is an even number of bytes, less than 16384")
     return args
 
 
@@ -331,6 +339,9 @@ def open_targets(args):
             print(f"Opening {doc.name} with it.")
         if args.list:
             continue
+        if not f.rsrc and is_fork(f.data):
+            return None, None, (f"{f.name}'s resource fork is in its data fork: it was copied "
+                                "by something that didn't keep its two forks apart.")
         if not f.rsrc:
             return None, None, (f"{f.name} has no resource fork. A Mac file has to travel in "
                                 "a form that keeps it: MacBinary, BinHex, AppleDouble or a "
@@ -341,21 +352,11 @@ def open_targets(args):
         if view:
             print("Showing its menus and windows from its resources, without running its code.")
         elif not has_code(f) and not is_control_panel(f):
-            print(f"{f.name} has no 68k code ({_why_no_code(f)}), so macrt shows its menus "
+            print(f"{f.name} has no 68k code ({why_no_code(f)}), so macrt shows its menus "
                   "and windows from its resources.")
             view = True
         targets.append((f, view))
     return targets, disks, None
-
-
-def _why_no_code(f) -> str:
-    try:
-        fm = open_fork(f.rsrc)
-    except InvalidForkError:
-        return "no CODE resources"
-    if fm.find(b"cfrg", 0) is not None:
-        return "it's a PowerPC application"
-    return "no CODE resources"
 
 
 def main(argv=None) -> int:
@@ -382,7 +383,8 @@ def main(argv=None) -> int:
     display = Display(DisplayConfig(host=args.host, menu_bar=args.menubar, screen_size=size,
                                     sticky_menus=not args.classic_menus,
                                     system_file=system_file, speed=args.speed,
-                                    model=args.model, depth=args.depth, disks=disks,
+                                    model=args.model, depth=args.depth,
+                                    row_bytes=args.row_bytes, disks=disks,
                                     sound=not args.no_sound, record_sound=args.record_sound))
     display.show()
     if targets:

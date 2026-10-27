@@ -27,6 +27,7 @@ disk images among them, to be put in the drives.
 from __future__ import annotations
 
 import binascii
+import mmap
 import os
 import struct
 from dataclasses import dataclass, field
@@ -35,7 +36,7 @@ from typing import Iterator, Protocol
 
 import machfs
 import machfs.main
-from machfs.btree import dump_btree
+from machfs.btree import dump_btree, unpack_extent_record
 
 from . import moof
 from .resfork import InvalidForkError, is_fork, open_fork
@@ -54,6 +55,7 @@ APM_ENTRY = b"PM"                       # each partition map entry
 HFS_SIGNATURE = b"BD"
 MFS_SIGNATURE = b"\xd2\xd7"
 SECTOR, TAG = 512, 12                   # a floppy sector, and the tag the drive keeps with it
+MAPPED = 16 << 20                       # an image this big is mapped, not read
 
 
 @dataclass(eq=False)
@@ -222,11 +224,30 @@ class VolumeFolder:
                 if isinstance(f, machfs.File)]
 
 
+class _VolumeFile(MacFile):
+    """A file on a volume, its forks read from it the first time they're
+    wanted: looking through a CD for one application reads no other's."""
+
+    def __init__(self, node: machfs.File, *args, **kw):
+        self._node, self._forks = node, {}
+        super().__init__(*args, **kw)
+
+    def _get(self, fork: str) -> bytes:
+        if self._forks.get(fork) is None:
+            self._forks[fork] = bytes(getattr(self._node, fork))
+        return self._forks[fork]
+
+    def _set(self, fork: str, value: bytes | None) -> None:
+        self._forks[fork] = value                       # None: what's on the volume
+
+    data = property(lambda self: self._get("data"), lambda self, v: self._set("data", v))
+    rsrc = property(lambda self: self._get("rsrc"), lambda self, v: self._set("rsrc", v))
+
+
 def _from_machfs(volume: machfs.Volume, folder: VolumeFolder, name: str,
                  f: machfs.File) -> MacFile:
     key = ":".join((volume.name, *folder.path, name))
-    return MacFile(name, bytes(f.data), bytes(f.rsrc), bytes(f.type), bytes(f.creator),
-                   f.flags, key, folder)
+    return _VolumeFile(f, name, None, None, bytes(f.type), bytes(f.creator), f.flags, key, folder)
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +259,7 @@ class Disk:
     each sector's 512 bytes, its 12-byte tag if the image kept them (none
     if it didn't), and what's on its tracks: a MOOF image's, or a floppy's
     as a Mac's format writes them, from a raw image of one."""
-    sectors: bytearray
+    sectors: bytearray | mmap.mmap
     tags: bytearray
     tracks: moof.Tracks | None = None
 
@@ -268,9 +289,9 @@ def _sectors(data: bytes) -> tuple[bytes, bytes]:
     return data, b""
 
 
-def _hfs_partition(data: bytes) -> bytes | None:
-    """The first HFS partition in an Apple partition map (a hard disk or
-    CD-ROM image), if data starts with one."""
+def _hfs_partition(data: bytes) -> tuple[int, int] | None:
+    """Where the first HFS partition in an Apple partition map (a hard disk
+    or CD-ROM image) starts and ends, if data starts with one."""
     if data[:2] != APM_SIGNATURE or len(data) < 1024:
         return None
     for size in dict.fromkeys((struct.unpack_from(">H", data, 2)[0], 512)):
@@ -278,13 +299,14 @@ def _hfs_partition(data: bytes) -> bytes | None:
             continue
         count = struct.unpack_from(">I", data, size + 4)[0]
         for i in range(1, min(count, 256) + 1):
-            entry = data[i * size:i * size + 80]
+            entry = bytes(data[i * size:i * size + 80])
             if entry[:2] != APM_ENTRY or len(entry) < 80:
                 break
             start, blocks = struct.unpack_from(">II", entry, 8)
-            part = data[start * size:(start + blocks) * size]
-            if entry[48:80].split(b"\0")[0] == b"Apple_HFS" and part[1024:1026] == HFS_SIGNATURE:
-                return part
+            start, end = start * size, min((start + blocks) * size, len(data))
+            if (entry[48:80].split(b"\0")[0] == b"Apple_HFS"
+                    and data[start + 1024:start + 1026] == HFS_SIGNATURE):
+                return start, end
     return None
 
 
@@ -293,7 +315,7 @@ def _volume_start(data: bytes) -> tuple[int, bytes] | None:
     its signature."""
     for i in range(0, min(len(data), 64 * 512), 512):
         if data[i + 1024:i + 1026] in (HFS_SIGNATURE, MFS_SIGNATURE):
-            return i, data[i + 1024:i + 1026]
+            return i, bytes(data[i + 1024:i + 1026])
     return None
 
 
@@ -380,107 +402,181 @@ def is_disk_image(data: bytes) -> bool:
     return _hfs_partition(data) is not None or _volume_start(data) is not None
 
 
-_machfs_link_aliases = machfs.main._link_aliases
-
-
 def _link_aliases(vol_cr_date, cnids):
     """machfs's, leaving out alias files whose resource fork isn't one:
     machfs gives up on the whole volume over one, and The Secret of Monkey
     Island's disk has an alias in its Recent Applications whose resource
     fork stops short."""
-    _machfs_link_aliases(vol_cr_date, {
+    machfs.main._link_aliases(vol_cr_date, {
         cnid: f for cnid, f in cnids.items()
         if not isinstance(f, machfs.File) or not f.flags & 0x8000 or is_fork(f.rsrc)})
 
 
-machfs.main._link_aliases = _link_aliases
+class OnDisk(machfs.File):
+    """A file on an HFS disk image, its forks left on the disk until
+    they're wanted: the thousands of files on a CD aren't all read when
+    it's put in a drive, only the ones that are opened."""
+
+    def __init__(self, disk, forks: dict[str, tuple[int, list[tuple[int, int]]]]):
+        self._read: dict[str, bytes] = {}
+        super().__init__()
+        self._read.clear()                  # machfs's empty forks
+        self._disk = disk                   # the volume's bytes
+        self._forks = forks                 # each fork's length, and where its bytes are
+
+    def _fork(self, fork: str) -> bytes:
+        got = self._read.get(fork)
+        if got is None:
+            length, spans = self._forks[fork]
+            got = self._read[fork] = b"".join(self._disk[a:b] for a, b in spans)[:length]
+        return got
+
+    def _length(self, fork: str) -> int:
+        if fork in self._read:
+            return len(self._read[fork])
+        length, spans = self._forks[fork]
+        n = len(self._disk)                 # an image cut short has less of it
+        return min(length, sum(len(range(a, min(b, n))) for a, b in spans))
+
+    def sizes(self) -> tuple[int, int]:
+        """Its forks' lengths, without reading them."""
+        return self._length("data"), self._length("rsrc")
+
+    @property
+    def data(self) -> bytes:
+        return self._fork("data")
+
+    @data.setter
+    def data(self, value: bytes) -> None:
+        self._read["data"] = value
+
+    @property
+    def rsrc(self) -> bytes:
+        return self._fork("rsrc")
+
+    @rsrc.setter
+    def rsrc(self, value: bytes) -> None:
+        self._read["rsrc"] = value
 
 
-def load_volume(source: str | os.PathLike | bytes) -> machfs.Volume:
+def _read_hfs(data) -> machfs.Volume:
+    """An HFS volume (Inside Macintosh IV, the File Manager, "Data
+    Organization on Volumes") as machfs reads one, without its Desktop
+    files, but with each file's forks left on the disk until they're
+    wanted (OnDisk), its location in its folder as the MFS reader has it,
+    and its flags (filFlags, which machfs reads and drops) kept as the MFS
+    reader keeps its directory entry's: bit 0 is locked, and the File
+    Manager reports the rest in ioFlAttrib all the same.  Microsoft File's
+    master disk sets bit 6 on two files, and File looks for it there."""
+    at = next((i for i in range(0, len(data), 512)
+               if data[i + 1024:i + 1026] == HFS_SIGNATURE), None)
+    if at is None:
+        raise ValueError("it has no MDB")
+    disk, mdb = data[at:], 1024             # the volume, from its boot blocks
+    crdate, mddate = struct.unpack_from(">II", disk, mdb + 2)
+    block_size, = struct.unpack_from(">I", disk, mdb + 20)
+    first, = struct.unpack_from(">H", disk, mdb + 28)
+    bkdate, = struct.unpack_from(">I", disk, mdb + 64)
+    overflow: dict[tuple[int, int, int], bytes] = {}    # (fork type, file, block): extents
+
+    def spans(length: int, extents: bytes, cnid: int, kind: int) -> list[tuple[int, int]]:
+        """Where a fork's bytes are on the disk: its first extents', then
+        the extents overflow file's."""
+        out, blocks, wanted = [], 0, -(-length // block_size)
+        while True:
+            for start, count in unpack_extent_record(extents):
+                where = first * 512 + start * block_size
+                out.append((where, where + count * block_size))
+                blocks += count
+            if blocks >= wanted:
+                return out
+            extents = overflow[kind, cnid, blocks]
+
+    def fork(at: int, cnid: int) -> bytes:  # one of the volume's own files, named in the MDB
+        length, extents = struct.unpack_from(">I12s", disk, mdb + at)
+        return b"".join(disk[a:b] for a, b in spans(length, extents, cnid, 0))[:length]
+
+    for rec in dump_btree(fork(130, 3)):                # the extents overflow file
+        if rec[0] == 7:
+            kind, cnid, start, extents = struct.unpack_from(">xBLH12s", rec)
+            if kind in (0, 0xFF):                       # a data fork's, a resource fork's
+                overflow[kind, cnid, start] = extents
+    cnids: dict[int, machfs.Folder | machfs.File] = {}
+    children = []
+    for rec in dump_btree(fork(146, 4)):                # the catalog
+        if not rec[0]:
+            continue
+        parent, length = struct.unpack_from(">LB", rec, 2)
+        name, value = rec[7:min(7 + length, 1 + rec[0])], rec[(rec[0] + 2) & ~1:]
+        if value[:1] == b"\x01":                        # a folder
+            cnid, *dates = struct.unpack_from(">LLLL", value, 6)
+            node = machfs.Folder()
+        elif value[:1] == b"\x02":                      # a file
+            flags, info, cnid, dlen, rlen, *dates, dext, rext = \
+                struct.unpack_from(">xxBx16sL2xL4x2xL4xLLL16x2x12s12s", value)
+            node = OnDisk(disk, {"data": (dlen, spans(dlen, dext, cnid, 0)),
+                                 "rsrc": (rlen, spans(rlen, rext, cnid, 0xFF))})
+            node.type, node.creator, node.flags, v, h = struct.unpack_from(">4s4sHhh", info)
+            node.y, node.x = v, h
+            node.locked, node.attributes = bool(flags & 1), flags & 0x7E
+        else:                                           # a thread
+            continue
+        node.crdate, node.mddate, node.bkdate = dates
+        cnids[cnid] = node
+        children.append((parent, name, node))
+    for parent, name, node in children:
+        if parent != 1:
+            cnids[parent][name] = node
+    vol = machfs.Volume()
+    vol.update(cnids[2])
+    for name in ("Desktop", "Desktop DB", "Desktop DF"):
+        vol.pop(name, None)
+    _link_aliases(crdate, cnids)
+    vol.crdate, vol.mddate, vol.bkdate = crdate, mddate, bkdate
+    vol.name = bytes(disk[mdb + 37:mdb + 37 + min(disk[mdb + 36], 27)]).decode("mac_roman")
+    return vol
+
+
+def _image(path: Path) -> bytes | mmap.mmap:
+    """A disk image's bytes.  A big one, a hard disk's or a CD's, is mapped
+    copy-on-write rather than read: only what's looked at is in memory, and
+    what the disk driver writes stays there, as it does in a copy read."""
+    with path.open("rb") as f:
+        size = os.fstat(f.fileno()).st_size
+        if size < MAPPED:
+            return f.read()
+        return mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_COPY)
+
+
+def load_volume(source: str | os.PathLike | bytes | mmap.mmap) -> machfs.Volume:
     """The volume on a disk image; its disk, for the disk driver, is its
     .disk."""
-    data = source if isinstance(source, (bytes, bytearray)) else Path(source).read_bytes()
+    data = source if isinstance(source, (bytes, bytearray, mmap.mmap)) else _image(Path(source))
     if moof.is_moof(data):
         tracks = moof.Disk(bytes(data))
         disk = Disk(bytearray(tracks.image), bytearray(tracks.tags), tracks)
     else:
-        disk = Disk(*map(bytearray, _sectors(bytes(data))))
+        sectors, tags = _sectors(data)
+        disk = Disk(sectors if isinstance(sectors, mmap.mmap) else bytearray(sectors),
+                    bytearray(tags))
         disk.tracks = moof.Formatted.of(disk.sectors, disk.tags)
-    data = bytes(disk.sectors)
-    data = _hfs_partition(data) or data
+    data = memoryview(disk.sectors)     # read through, not copied
+    part = _hfs_partition(data)
+    if part is not None:
+        data = data[part[0]:part[1]]
     start = _volume_start(data)
-    startup = _startup_name(data[start[0]:start[0] + 1024]) if start else None
+    startup = _startup_name(bytes(data[start[0]:start[0] + 1024])) if start else None
     if start and start[1] == MFS_SIGNATURE:
-        vol = _read_mfs(data[start[0]:], start[0] // SECTOR)
+        vol = _read_mfs(bytes(data[start[0]:]), start[0] // SECTOR)
         vol.size, vol.startup, vol.disk = len(data), startup, disk
         return vol
-    vol = machfs.Volume()
+    try:
+        vol = _read_hfs(data)
+    except Exception as e:      # noqa: BLE001 - a damaged catalog trips over anything
+        raise ValueError(f"the disk image is damaged ({type(e).__name__}: {e})") from None
     vol.size = len(data)                # the disk's: whether it's a floppy's
     vol.startup, vol.disk = startup, disk
-    try:
-        vol.read(data)
-    except Exception as e:      # noqa: BLE001 - machfs raises whatever it trips over
-        raise ValueError(f"the disk image is damaged ({type(e).__name__}: {e})") from None
-    # machfs doesn't keep the volume's name; it's drVN in the MDB.
-    mdb = next((i + 1024 for i in range(0, len(data), 512)
-                if data[i + 1024:i + 1026] == HFS_SIGNATURE), None)
-    vol.name = (data[mdb + 37:mdb + 37 + min(data[mdb + 36], 27)].decode("mac_roman")
-                if mdb is not None else "Untitled")
-    if mdb is not None:
-        _read_file_flags(data[mdb - 1024:], vol)
     return vol
-
-
-def _read_file_flags(data: bytes, vol: machfs.Volume) -> None:
-    """Each file's flags from its catalog record (filFlags), which machfs
-    reads and drops, kept as the MFS reader keeps its directory entry's:
-    bit 0 is locked, and the File Manager reports the rest in ioFlAttrib
-    all the same.  Microsoft File's master disk sets bit 6 on two files,
-    and File looks for it there."""
-    mdb = 1024
-    block_size, = struct.unpack_from(">I", data, mdb + 20)
-    first, = struct.unpack_from(">H", data, mdb + 28)
-    overflow: dict[tuple[int, int], bytes] = {}
-
-    def fork(at: int, cnid: int) -> bytes:     # the file's first extents at, then overflow's
-        size, extents = struct.unpack_from(">I12s", data, mdb + at)
-        out, blocks = bytearray(), 0
-        while True:
-            for start, count in struct.iter_unpack(">HH", extents):
-                out += data[first * 512 + start * block_size:][:count * block_size]
-                blocks += count
-            if len(out) >= size or (cnid, blocks) not in overflow:
-                return bytes(out[:size])
-            extents = overflow[cnid, blocks]
-
-    try:
-        for rec in dump_btree(fork(130, 3)):                # the extents overflow file
-            kind, cnid, start, extents = struct.unpack_from(">xBLH12s", rec)
-            if rec[0] == 7 and kind == 0:               # a data fork's
-                overflow[cnid, start] = extents
-        folders, files = {}, []
-        for rec in dump_btree(fork(146, 4)):                # the catalog
-            parent, length = struct.unpack_from(">LB", rec, 2)
-            name, value = rec[7:7 + length], rec[(rec[0] + 2) & ~1:]
-            if value[:1] == b"\x01":
-                folders[struct.unpack_from(">L", value, 6)[0]] = parent, name
-            elif value[:1] == b"\x02":
-                files.append((parent, name, value[2]))
-    except (struct.error, IndexError, KeyError):
-        return
-
-    def folder(cnid: int):
-        if cnid == 2:                           # the root's
-            return vol
-        parent, name = folders[cnid]
-        return folder(parent)[name]
-
-    for parent, name, flags in files:
-        try:
-            f = folder(parent)[name]
-        except (KeyError, RecursionError):
-            continue
-        f.locked, f.attributes = bool(flags & 1), flags & 0x7E
 
 
 def volume_files(volume: machfs.Volume) -> Iterator[MacFile]:
@@ -801,7 +897,7 @@ def open_disks(paths, names=()) -> tuple[list[MacFile], list[machfs.Volume]]:
 
 def _volume_or_file(path: str | os.PathLike) -> tuple[machfs.Volume | None, MacFile | None]:
     path = Path(path)
-    raw = path.read_bytes() if path.exists() else b""       # app with only app.rsrc
+    raw = _image(path) if path.exists() else b""          # app with only app.rsrc
     volume, problem = None, None
     if is_disk_image(raw):
         try:
