@@ -242,6 +242,62 @@ def test_a_suitcase_in_the_fonts_folder_has_the_strike(qapp):
     assert (ascent, descent, leading) == (5, 1, 3)
 
 
+def test_a_real_systems_fonts_folder_has_its_fonts(qapp):
+    """System 7.5's System file has Geneva 9 and 12, and the Geneva in its
+    Fonts folder the other sizes and the FOND that lists them all; Courier
+    and Helvetica are only there.  HyperCard Player's stacks ask for them."""
+    def suitcase(*resources):
+        f = machfs.File()
+        f.type, f.creator, f.rsrc = b"FFIL", b"DMOV", build_fork(list(resources))
+        return f
+
+    v = machfs.Volume()
+    v.name = "Disk"
+    v["System Folder"] = machfs.Folder()
+    v["System Folder"]["Fonts"] = fonts = machfs.Folder()
+    system = machfs.File()
+    system.type, system.creator = b"zsys", b"MACS"
+    system.rsrc = build_fork([Resource(b"FOND", 3, sysres.fond(3, (12,)), b"Geneva"),
+                              Resource(b"FONT", 3 << 7 | 12, blocky())])
+    v["System Folder"]["System"] = system
+    fonts["Geneva"] = suitcase(
+        Resource(b"FOND", 3, sysres.fond(3, (10, 12), (2000, 2001)), b"Geneva"),
+        Resource(b"NFNT", 2000, blocky(leading=3)), Resource(b"NFNT", 2001, blocky()),
+        Resource(b"sfnt", 2002, bytes(64)))
+    fonts["Courier"] = suitcase(
+        Resource(b"FOND", 22, sysres.fond(22, (0,), (2003,)), b"Courier"),
+        Resource(b"sfnt", 2003, bytes(64)))
+    fonts["Cairo"] = suitcase(
+        Resource(b"FOND", 11, sysres.fond(11, (18,), (2004,)), b"Cairo"),
+        Resource(b"NFNT", 2004, blocky()), Resource(b"NFNT", 2005, blocky()))
+    real = system_on(load_volume(v.write(800 * 1024, desktopdb=False, bootable=False)))
+    g = Guest(system_file=real)
+    m = g.system.sys_map
+    assert m.find(b"sfnt", 2002) is None and m.find(b"NFNT", 2005) is None
+
+    def number(name: bytes) -> int:
+        num = g.ptr(bytes(2))
+        g("GetFNum", g.ptr(bytes([len(name)]) + name), num)
+        return g.mem.r16(num)
+
+    assert (number(b"Courier"), number(b"Cairo"), number(b"Helvetica")) == (22, 11, 0)
+    assert g("RealFont", 3, 10) and g("RealFont", 3, 12) and not g("RealFont", 3, 14)
+    assert g("RealFont", 22, 14)                    # an outline font: any size
+    g.port(48, 24)
+    info = g.ptr(bytes(8))
+    g("TextFont", 3)
+    g("TextSize", 10)                               # measured with the suitcase's strike
+    g("GetFontInfo", info)
+    ascent, descent, _, leading = struct.unpack(">4h", g.mem.read(info, 8))
+    assert (ascent, descent, leading) == (5, 1, 3)
+    port, _ = g.port(48, 24)
+    g("TextFont", 11)                               # drawn from its strike
+    g("TextSize", 18)
+    g("MoveTo", 2, 7)
+    g("DrawString", g.ptr(b"\x02AC"))
+    assert g.rows(port)[4][:8] == "..####.#"
+
+
 def test_what_the_font_has_no_width_for_draws_nothing(qapp):
     """NUL and return are blank glyphs of no width in Chicago, Geneva and
     Monaco, where the host font standing in would draw boxes: Social
@@ -325,6 +381,14 @@ def test_the_menus_are_drawn_in_the_applications_own_chicago(qapp):
     g.tb._gui = lambda fn, *args: fn(*args)
     g.tb.InsertMenu(g.tb.NewMenu(5, "AC"), 0)
     assert g.process.system_strike is None
+
+
+def test_a_menu_title_with_the_command_mark_shows_it_in_a_host_font(qapp):
+    """RoboSport's menu titles are "Pause \u2318P" and "Quit \u2318Q", with
+    Chicago's $11 in them: a host font has the mark as Unicode's."""
+    metrics = QFontMetrics(theme.menu_bar_font())
+    menu = Menu(5, "Pause \x11P", parse_menu_items("Go"))
+    assert _title_width(menu, metrics) == metrics.horizontalAdvance("Pause \u2318P")
 
 
 def test_outline_is_every_pixel_round_the_glyph(qapp):

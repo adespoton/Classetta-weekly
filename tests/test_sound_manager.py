@@ -2,6 +2,7 @@
 synthesizers, its channels' queues at each tick, and SndPlay's 'snd '
 resources, played through the sound buffer."""
 
+import math
 import struct
 
 import pytest
@@ -9,7 +10,11 @@ import pytest
 from macrt.m68k import dispatch, sound_manager as sm
 from macrt.m68k.hardware import vBufB
 from macrt.m68k.sound import FRAME, SILENCE, SILENT_FRAME, vSndEnb
+from macrt.macfile import MacFile, MemoryFolder
+from macrt.resfork import Resource
+from macrt.toolbox import files as fm
 from macrt.toolbox import lowmem
+from macrt.toolbox.files import FileManager
 
 from guest import Guest, Processor
 
@@ -271,6 +276,35 @@ def test_a_double_buffer_not_ready_yet_is_waited_for_in_silence(g):
     assert tick(g) == SILENT * FRAME
 
 
+def test_each_double_buffer_goes_back_as_it_s_played_however_many_a_tick(g):
+    """Digital Messiah gives its double buffers no frames till its music
+    starts, then plays them again with SndPlayDoubleBuffer: by then each
+    buffer played has been back to its doubleBack, and is ready."""
+    given = []
+
+    def nothing_yet(chan, buf):
+        given.append(buf)
+        g.mem.w32(buf + 4, sm.dbBufferReady)
+
+    def music(chan, buf):
+        g.mem.write(buf + 16, bytes([0x90]) * 300)
+        g.mem.w32(buf, 300)
+        g.mem.w32(buf + 4, sm.dbBufferReady)
+
+    g.procs[0x2000] = nothing_yet
+    chan = channel(g)
+    bufs = tuple(g.ptr(struct.pack(">IIII", 0, sm.dbBufferReady, 0, 0) + bytes(300))
+                 for _ in range(2))
+    head = double_header(g, bufs, 0x2000)
+    assert g("SndPlayDoubleBuffer", chan, head) == 0
+    assert tick(g) == SILENT * FRAME
+    assert len(given) == sm.MAX_BUFFERS
+    assert all(g.mem.r32(buf + 4) & sm.dbBufferReady for buf in bufs)
+    g.procs[0x2000] = music
+    assert g("SndPlayDoubleBuffer", chan, head) == 0
+    assert tick(g) == bytes([0x90]) * FRAME
+
+
 def test_a_double_buffer_it_can_t_play(g):
     chan = channel(g)
     bufs = (double_buffer(g, bytes(8)), double_buffer(g, bytes(8)))
@@ -485,3 +519,151 @@ def test_mace_sound_expands_to_silence(g, routine):
     out = g.ptr(bytes(20))
     g(routine, g.ptr(bytes(8)), out, 3, 0, 0, 2, 1)
     assert g.mem.read(out, 20) == SILENT * 18 + bytes(2)
+
+
+# -- play from disk ----------------------------------------------------------------
+def extended(x: float) -> bytes:
+    """x as an 80-bit SANE extended, as AIFF's sample rate is."""
+    m, e = math.frexp(x)
+    return struct.pack(">HQ", e - 1 + 16383, int(m * 2 ** 64))
+
+
+def chunk(kind: bytes, data: bytes) -> bytes:
+    return kind + struct.pack(">I", len(data)) + data + bytes(len(data) & 1)
+
+
+def aiff(samples: bytes, channels: int = 1, bits: int = 8, compression: bytes | None = None,
+         frames: int | None = None, before: bytes = b"") -> bytes:
+    """An AIFF file, or with compression an AIFF-C one, of two's
+    complement samples; before goes ahead of its chunks."""
+    if frames is None:
+        frames = len(samples) // (channels * ((bits + 7) // 8))
+    comm = struct.pack(">hIh", channels, frames, bits) + extended(sm.MAC_RATE)
+    if compression is not None:
+        comm += compression + bytes(2)                  # its name: none
+    body = (b"AIFC" if compression is not None else b"AIFF") + before \
+        + chunk(b"COMM", comm) + chunk(b"SSND", bytes(8) + samples)
+    return b"FORM" + struct.pack(">I", len(body)) + body
+
+
+def test_an_aiff_file_s_samples():
+    """Two's complement samples, played as offset binary ones, their high
+    bytes for 16-bit ones and channels averaged; chunks in any order, an
+    odd one padded."""
+    data, rate = sm.parse_aiff(aiff(bytes([0x00, 0x7F, 0x80, 0xFF])))
+    assert data == bytes([0x80, 0xFF, 0x00, 0x7F]) and rate == pytest.approx(sm.MAC_RATE)
+    stereo = aiff(bytes.fromhex("12345678" "80000000"), channels=2, bits=16)
+    assert sm.parse_aiff(stereo)[0] == bytes([(0x92 + 0xD6) // 2, (0x00 + 0x80) // 2])
+    assert sm.parse_aiff(aiff(b"\x10\x20", compression=b"NONE"))[0] == b"\x90\xa0"
+    swapped = aiff(b"\x10\x20", before=chunk(b"NAME", b"odd")).replace(
+        b"AIFF", b"AIFF" + chunk(b"SSND", bytes(8) + b"\x30"), 1)
+    assert sm.parse_aiff(swapped)[0] == b"\xb0"       # the first SSND, after an odd NAME
+    assert sm.parse_aiff(aiff(bytes(10), compression=b"MAC3", frames=30)) == (
+        SILENT * 30, pytest.approx(sm.MAC_RATE))
+    assert sm.parse_aiff(aiff(bytes(10), compression=b"ABCD")) == sm.siInvalidCompression
+    assert sm.parse_aiff(b"RIFF" + bytes(20)) == sm.badFileFormat
+    assert sm.parse_aiff(b"FORM\x00\x00\x00\x04AIFF") == sm.badFileFormat     # no COMM
+
+
+def open_file(g, data: bytes) -> int:
+    files = FileManager(g.system.files, None, g.system.files.dir_for(
+        MemoryFolder([MacFile("Sound", data=data, type=b"AIFF", creator=b"TEST")])))
+    return files.open(0, 0, "Sound", False, fm.fsRdPerm).refnum
+
+
+def file_play(g, chan: int, refnum: int, res: int = 0, selection: int = 0,
+              completion: int = 0, asynch: bool = True) -> int:
+    return g("SndStartFilePlay", chan, refnum, res, 0, 0, selection, completion, asynch)
+
+
+def test_a_file_plays_on_a_channel_then_its_completion_is_called(g):
+    done = []
+    g.procs[0x2000] = done.append
+    chan = channel(g)
+    samples = bytes(i % 100 for i in range(500))
+    assert file_play(g, chan, open_file(g, aiff(samples)), completion=0x2000) == 0
+    status = g.ptr(bytes(24))
+    assert tick(g) == samples[:FRAME].translate(sm._FLIP) and not done
+    g("SndChannelStatus", chan, 24, status)
+    start, end, now, busy, _, paused = struct.unpack(">3IBBB", g.mem.read(status, 15))
+    assert (start, end, now) == (0, round(500 / sm.MAC_RATE * 0x10000),
+                                 round(FRAME / sm.MAC_RATE * 0x10000))
+    assert busy and not paused
+    assert tick(g) == samples[FRAME:].translate(sm._FLIP) + SILENT * (2 * FRAME - 500)
+    assert done == [chan]
+    g("SndChannelStatus", chan, 24, status)
+    assert g.mem.read(status, 24) == bytes(24)
+
+
+def test_a_file_play_paused_and_resumed(g):
+    chan = channel(g)
+    assert g("SndPauseFilePlay", chan) == sm.channelNotBusy
+    samples = bytes(range(0x10, 0x10 + 200)) * 3
+    assert file_play(g, chan, open_file(g, aiff(samples))) == 0
+    tick(g)
+    assert g("SndPauseFilePlay", chan) == 0
+    assert tick(g) == SILENT * FRAME and tick(g) == SILENT * FRAME
+    status = g.ptr(bytes(24))
+    g("SndChannelStatus", chan, 24, status)
+    assert g.mem.r8(status + 12) == 1 and g.mem.r8(status + 14) == 1     # busy, and paused
+    assert g("SndPauseFilePlay", chan) == 0
+    assert tick(g) == samples[FRAME:].translate(sm._FLIP) + SILENT * (2 * FRAME - 600)
+
+
+def test_a_file_play_stopped_or_disposed_of_calls_its_completion(g):
+    done = []
+    g.procs[0x2000] = done.append
+    chan = channel(g)
+    refnum = open_file(g, aiff(bytes(2000)))
+    assert g("SndStopFilePlay", chan, True) == 0                # nothing to stop
+    assert file_play(g, chan, refnum, completion=0x2000) == 0
+    assert file_play(g, chan, refnum, completion=0x2000) == sm.channelBusy
+    tick(g)
+    assert g("SndStopFilePlay", chan, True) == 0 and done == [chan]
+    assert tick(g) == SILENT * FRAME
+    assert file_play(g, chan, refnum, completion=0x2000) == 0
+    assert g("SndDisposeChannel", chan, True) == 0 and done == [chan, chan]
+    assert not g.machine.sound_manager.channels
+
+
+def test_a_file_play_s_selection_and_what_it_can_t_play(g):
+    chan = channel(g)
+    samples = bytes(range(250))
+    refnum = open_file(g, aiff(samples))
+    seconds = [round(n / sm.MAC_RATE * 0x10000) for n in (100, 200)]
+    assert file_play(g, chan, refnum, selection=g.ptr(struct.pack(">I2i", 0, *seconds))) == 0
+    assert tick(g) == samples[100:200].translate(sm._FLIP) + SILENT * (FRAME - 100)
+    backwards = g.ptr(struct.pack(">I2i", 0, *reversed(seconds)))
+    assert file_play(g, chan, refnum, selection=backwards) == -50   # paramErr
+    everything = g.ptr(struct.pack(">I2i", 0xFFFF, *reversed(seconds)))    # unitTypeNoSelection
+    assert file_play(g, chan, refnum, selection=everything) == 0
+    assert tick(g) == samples.translate(sm._FLIP) + SILENT * (FRAME - 250)
+    assert file_play(g, 0, refnum) == sm.badChannel             # its own channel: synchronous
+    assert file_play(g, 0x1234, refnum) == sm.badChannel
+    assert file_play(g, chan, 0x7FF0) == -51                    # rfNumErr
+    assert g("SndStopFilePlay", chan, True) == 0
+    assert file_play(g, chan, open_file(g, b"not a sound")) == sm.badFileFormat
+
+
+def test_a_snd_resource_plays_from_disk(qapp):
+    samples = bytes(i % 200 + 20 for i in range(300))
+    g = Guest([Resource(b"snd ", 128, format_2(samples))])
+    chan = channel(g)
+    assert file_play(g, chan, 0, 128) == 0
+    assert tick(g) == samples + SILENT * (FRAME - 300)
+    assert file_play(g, chan, 0, 129) == sm.resProblem
+
+
+def test_a_file_play_with_no_channel_waits_for_its_end(p):
+    """Its own channel, in the application's heap, freed once it's done."""
+    samples = bytes(i % 100 for i in range(1000))
+    refnum = open_file(p, aiff(samples))
+    p.run(bytes.fromhex("554f" "42a7"                          # its result; chan NIL
+                        "3f3c") + struct.pack(">H", refnum & 0xFFFF) + bytes.fromhex(
+                        "4267" "42a7" "42a7" "42a7" "42a7"     # resNum, buffer, selection...
+                        "4267"                                 # async FALSE
+                        "203c0d000008" "a800"                  # _SoundDispatch: SndStartFilePlay
+                        "301f"))
+    assert p.cpu.d(0) & 0xFFFF == 0
+    assert b"".join(p.frames)[:1000] == samples.translate(sm._FLIP) and len(p.frames) == 3
+    assert not p.machine.sound_manager.channels

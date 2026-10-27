@@ -5,18 +5,20 @@ V-212)."""
 import struct
 
 import pytest
+from PyQt6.QtGui import QImage, QPainter
 
 from macrt.m68k import glue_controls
 from macrt.m68k.glue_cport import STANDARD_CCTB, STANDARD_WCTB
 from macrt.resfork import Resource
 from macrt.toolbox import lowmem
-from macrt.toolbox.color import color_rgb, color_table
+from macrt.toolbox.color import STANDARD_8BIT, color_rgb, color_table
 from macrt.toolbox.constants import pushButProc, redColor
 from macrt.toolbox.gdevice import (PIXMAP_SIZE, PixMap, PixPat, RGBPat, deref, device_pixmap,
                                    oldPat, pixPat, write_pixmap)
 from macrt.toolbox.quickdraw import BLACK_PAT, GRAY_PAT, LT_GRAY_PAT, WHITE_PAT, GrafPort
-from macrt.toolbox.types import Rect
+from macrt.toolbox.types import Point, Rect
 from macrt.toolbox.windows import WindowRecord, find_aux_win
+from macrt.ui import chrome
 
 from builders import wind
 from conftest import Recorder
@@ -392,6 +394,72 @@ def test_get_new_c_window_shows_its_content_in_its_content_colour(qapp):
     assert w.backing.image.pixel(10, 10) | 0xFF000000 == paper
 
 
+def _frame_pixels(f: chrome.Frame, w: int, h: int) -> QImage:
+    img = QImage(w + chrome.shadow(f), h + chrome.shadow(f), QImage.Format.Format_RGB32)
+    img.fill(0xFF808080)
+    p = QPainter(img)
+    chrome.paint(p, f, w, h)
+    p.end()
+    return img
+
+
+def test_a_windows_frame_is_drawn_in_its_colours(g):
+    """On a colour Mac a window's frame is drawn in the colours of its
+    'wctb', as the screen shows them: its own auxiliary record's, or the
+    default record's, with a part the table hasn't in its first colour.
+    The standard colours are black and white."""
+    g.process.world.switch_in()                 # as the running application's are
+    w = WindowRecord.new(g.system, g.process, g.heap, 0, Rect(40, 40, 100, 200), "Colour",
+                         True, 0, True, 0, color=True)
+    w.hilited = True
+    assert chrome.Frame.for_window(w).colors is None
+    lilac, green, yellow = (0x8000, 0x8000, 0xFFFF), (0, 0xFFFF, 0), (0xFFFF, 0xFFFF, 0)
+    parts = [lilac, RED, BLUE, green, yellow]
+    g("SetWinColor", w.addr, g.handle(color_table(parts)))
+    f = chrome.Frame.for_window(w)
+    shown = tuple(g.system.devices.nearest(argb(c)) for c in parts)
+    assert f.colors == shown
+    content, frame, text, hilite, bar = shown
+    width, height = chrome.structure_size(f, 160, 60)
+    img = _frame_pixels(f, width, height)
+    tr = chrome.title_rect(f, width)
+
+    def px(x, y):
+        return img.pixel(x, y) | 0xFF000000
+    assert px(0, 30) == px(width, 30) == frame          # its outline and shadow
+    assert px(3, tr.bottom() + 1) == frame              # the line under the title bar
+    assert px(3, tr.y() + 3) == hilite and px(3, tr.y() + 4) == bar
+    title = {px(x, y) for x in range(40, width - 40) for y in range(tr.y(), tr.bottom())}
+    assert text in title and bar in title
+
+    # A dialog box: its outline in the frame colour, its band in the content colour.
+    d = WindowRecord.new(g.system, g.process, g.heap, 0, Rect(40, 40, 100, 200), "",
+                         True, 1, False, 0, color=True)
+    g("SetWinColor", d.addr, g.handle(color_table([lilac, RED])))
+    f = chrome.Frame.for_window(d)
+    assert f.colors == (content, frame, content, content, content)
+    img = _frame_pixels(f, *chrome.structure_size(f, 160, 60))
+    band = [img.pixel(i, 30) | 0xFF000000 for i in (0, 1, 2, 4)]
+    assert band == [frame, content, frame, content]
+
+    # One without a record of its own is in the default's colours.
+    other = WindowRecord.new(g.system, g.process, g.heap, 0, Rect(40, 40, 100, 200), "Other",
+                             True, 0, True, 0, color=True)
+    assert chrome.Frame.for_window(other).colors is None
+    g("SetWinColor", 0, g.handle(color_table(parts[::-1])))
+    assert chrome.Frame.for_window(other).colors == shown[::-1]
+    assert chrome.Frame.for_window(w).colors == shown
+
+
+def test_a_new_colour_window_has_the_default_content_colour(g):
+    """And its background is the default record's content colour."""
+    g.tb._d = NoDisplay()
+    lilac = (0x8000, 0x8000, 0xFFFF)
+    g("SetWinColor", 0, g.handle(color_table([lilac] + STANDARD_WCTB[1:])))
+    w = g("NewCWindow", 0, g.rect_ptr(Rect(40, 40, 100, 200)), g.ptr(b"\x01x"), 0, 0, -1, 0, 0)
+    assert w.is_color and w.rgb_bk_color == lilac
+
+
 def test_controls_auxiliary_records(g):
     """GetAuxCtl and SetCtlColor, as GetAuxWin and SetWinColor, with a list
     of their own: BMAPEdit's own CDEF asks for its controls' colours."""
@@ -475,6 +543,26 @@ def test_a_picture_recorded_in_a_colour_port_keeps_its_colours_and_pixel_pattern
     assert screen_colors(g, Rect(48, 40, 52, 48)) == [[blue_value] * 8] * 4
 
 
+def test_copy_bits_in_colour_is_recorded_as_a_pixel_map(g):
+    """CopyBits from a colour PixMap into a cGrafPort that's recording
+    records a pixel map, through a colour table of its colours, not a
+    black-and-white bitmap (Populous II's title picture)."""
+    port = cport(g)
+    table = g.handle(color_table([WHITE, BLACK, RED, BLUE]))
+    src = offscreen(g, [bytes([2] * 4 + [3] * 4)] * 2 + [bytes(8)] * 2, table)
+    r = Rect(0, 0, 4, 8)
+    pic = g("OpenPicture", g.rect_ptr(r))
+    g("CopyBits", deref(g.mem, src), port.addr + 2, g.rect_ptr(r), g.rect_ptr(r), 0, 0)
+    g("ClosePicture")
+    data = g.contents(pic)
+    assert b"\x00\x98\x80\x02" in data              # three colours: 2 bits a pixel
+    g("EraseRect", g.rect_ptr((0, 0, 100, 100)))
+    g("DrawPicture", pic, g.rect_ptr((40, 40, 44, 48)))
+    red, blue, white = (g.system.devices.nearest(argb(c)) for c in (RED, BLUE, WHITE))
+    assert screen_colors(g, Rect(40, 40, 44, 48)) == [[red] * 4 + [blue] * 4] * 2 + [
+        [white] * 8] * 2
+
+
 class ColourRecorder(Recorder):
     def new_window(self):
         return self.tb.NewWindow(Rect.from_xywh(60, 60, 200, 120), "Colour", True, color=True)
@@ -498,6 +586,79 @@ def test_new_cwindow_draws_in_colour_on_the_screen(harness):
     assert all(table[system.mem.r8(at + x)] == red for x in range(20, 36))
     with w.backing.lock:
         assert w.backing.image.pixel(25, 12) | 0xFF000000 == red
+
+
+def test_a_colour_window_draws_in_its_pixel_values_as_they_are(harness):
+    """A cGrafPort draws in fgColor, its colour's pixel value: one a
+    program writes there itself, its RGB colour still black, draws in
+    the colour the screen has for it, and after the screen's colours
+    change, in the colour it has then (Rainbow)."""
+    h = harness(model="ii", depth=8)
+    rec = ColourRecorder("Colour")
+    h.launch(rec)
+    system = h.d.system
+    w = rec.tb.FrontWindow()
+    value = STANDARD_8BIT.index(0xFF00FF00)
+    bits, c = system.screen_bits, w.content
+    at = bits.base + (c.top + 12) * bits.row_bytes + c.left
+    with system.lock:
+        rec.tb.SetPort(w)
+        w.fg_color = value
+        rec.tb.PaintRect(Rect(10, 20, 14, 36))
+    assert w.rgb_fg_color == (0, 0, 0)
+    assert all(system.mem.r8(at + x) == value for x in range(20, 36))
+    with w.backing.lock:
+        assert w.backing.image.pixel(25, 12) | 0xFF000000 == 0xFF00FF00
+
+    with system.lock:
+        pm = system.devices.pixmap(system.devices.main)
+        ct = deref(system.mem, pm.pm_table)
+        system.mem.write(ct + 8 + 8 * value + 2, struct.pack(">HHH", 0x8888, 0, 0x8888))
+        system.mem.w32(ct, system.devices.next_seed())
+        rec.tb.PaintRect(Rect(20, 20, 24, 36))
+    at += 10 * bits.row_bytes
+    assert all(system.mem.r8(at + x) == value for x in range(20, 36))
+    with w.backing.lock:
+        assert w.backing.image.pixel(25, 22) | 0xFF000000 == 0xFF880088
+
+
+class SideBySide(Recorder):
+    def new_window(self):
+        n = len(self.tb._p.windows)
+        return self.tb.NewWindow(Rect.from_xywh(60 + 100 * n, 60, 90, 90), f"Colour {n + 1}",
+                                 True, color=True)
+
+
+def test_get_cpixel_reads_what_another_window_drew_on_the_screen(harness):
+    """GetCPixel reads the screen: at a point local to the current
+    window but outside it, the colour of the window that drew there
+    (MonsterPaint's palette, read in its tools window's port)."""
+    h = harness(model="ii", depth=8)
+    rec = SideBySide("Colour", windows=2)
+    h.launch(rec)
+    system = h.d.system
+    left, right = rec.tb._p.windows[1], rec.tb._p.windows[0]
+    assert left.content.right < right.content.left
+    red = system.devices.nearest(argb(RED))
+    with system.lock:
+        rec.tb.SetPort(right)
+        rec.tb.qd.set_rgb_color(right, True, RED)
+        rec.tb.PaintRect(Rect(10, 10, 20, 20))
+    a, b = left.content, right.content
+    at = Point(b.top + 15 - a.top, b.left + 15 - a.left)       # left's, over right's red
+    assert rec.tb.qd.get_rgb(left, at) == red
+    assert rec.tb.qd.get_rgb(left, Point(at.v, at.h + 20)) == argb(WHITE)
+
+
+def test_a_new_cport_is_black_on_white_in_the_devices_colours(g):
+    """OpenCPort's black and white are the pixel values nearest them in
+    the current device's colours, as a program has left them."""
+    port = cport(g)
+    assert (port.fg_color, port.bk_color) == (255, 0)
+    g("SetEntries", 0, 0, g.ptr(struct.pack(">4H", 0, 0, 0, 0)))
+    g("SetEntries", 255, 0, g.ptr(struct.pack(">4H", 0, 0xFFFF, 0xFFFF, 0xFFFF)))
+    port = cport(g)
+    assert (port.fg_color, port.bk_color) == (0, 255)
 
 
 def test_save_and_restore_the_colours(g):

@@ -6,6 +6,7 @@ import threading
 
 from builders import alrt, ditl, dlog, menu, pstr, size_res, vers, wind
 from macrt.demo import main
+from macrt.m68k.segload import why_no_code
 from macrt.macfile import MacFile
 from macrt.resfork import Resource, build_fork
 from macrt.toolbox import constants as k
@@ -99,12 +100,24 @@ def test_command_line_errors(tmp_path, capsys):
     bare = tmp_path / "Game"
     bare.write_bytes(b"just a data fork, the resource fork was lost on the way")
     assert "has no resource fork" in fails(bare)
+    copied = tmp_path / "copied.bin"
+    copied.write_bytes(macbinary("Copied", APP_FORK, b""))
+    assert "resource fork is in its data fork" in fails(copied)
     broken = tmp_path / "broken.bin"
     broken.write_bytes(macbinary("Broken", b"", b"not a resource fork" * 20))
     assert "damaged" in fails(broken)
     app = tmp_path / "app.bin"
     app.write_bytes(macbinary("Test App", b"", APP_FORK))
     assert "No such file" in fails(app, "--system", tmp_path / "System")
+
+
+def test_why_an_application_has_no_68k_code():
+    code = build_fork([Resource(b"CODE", 0, bytes(16))])
+    ppc = build_fork([Resource(b"cfrg", 0, bytes(32))])
+    assert why_no_code(MacFile("PPC", b"Joy!peffpwpc", ppc)) == "it's a PowerPC application"
+    assert why_no_code(MacFile("Copied", code, b"")) == \
+        "no CODE resources: its resource fork is in its data fork"
+    assert why_no_code(MacFile("Plain", b"", APP_FORK)) == "no CODE resources"
 
 
 def test_an_app_too_big_for_memory(tmp_path, capsys, qapp):

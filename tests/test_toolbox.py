@@ -347,6 +347,21 @@ def test_inset_rect_moves_only_the_sides(qapp):
     assert inset(-7, -10) == (104, 261, 122, 275)
 
 
+def test_a_toolbox_routine_with_no_result_leaves_d0_clear(qapp):
+    """BMAPEdit's bitmap routine, a C function, falls off its end after
+    SetPort and returns what D0 holds; the registers stack-based traps
+    keep, A2-A6 and D3-D7, are kept."""
+    m = Processor()
+    port = m.ptr(bytes(108))
+    m.cpu.set_d(3, 0x5678)
+    # MOVE.L #$000BF460,D0; MOVE.L #port,-(SP); _SetPort
+    m.run(struct.pack(">HIHIH", 0x203C, 0x000BF460, 0x2F3C, port, 0xA873))
+    assert m.cpu.d(0) == 0 and m.cpu.d(3) == 0x5678 and m.cpu.sp == m.stack_top
+    # A function's result is still where Pascal puts it, and D0 is its own.
+    m.run(struct.pack(">HIHH", 0x203C, 0x1234, 0x42A7, 0xA924))    # CLR.L -(SP); _FrontWindow
+    assert m.cpu.d(0) == 0x1234 and m.cpu.sp == m.stack_top - 4
+
+
 def test_hwpriv_has_no_caches_to_mind(qapp):
     m = Processor()
     assert dispatch.implemented(dispatch.trap_key(0xA198))
@@ -359,10 +374,11 @@ def test_hwpriv_has_no_caches_to_mind(qapp):
 
 def test_swap_mmu_mode_stays_in_24_bit_mode(qapp):
     """Maelstrom asks for 32-bit mode around its drawing and puts back the
-    mode it's given: D0's low byte, the rest of D0 kept."""
+    mode it's given: D0's low byte, the rest of D0 clear, which Prince of
+    Persia 2's sprite code counts on."""
     m = Processor()
     m.run(bytes.fromhex("203C12345601 A05D"))      # MOVE.L #$12345601,D0; _SwapMMUMode
-    assert m.cpu.d(0) == 0x12345600 and m.mem.r8(lowmem.MMU32Bit) == 0
+    assert m.cpu.d(0) == 0 and m.mem.r8(lowmem.MMU32Bit) == 0
     m.run(bytes.fromhex("7000 A05D"))              # back to 24-bit
     assert m.cpu.d(0) == 0 and m.missing == []
 
@@ -486,6 +502,34 @@ def test_slopes_and_angles_as_inside_macintosh_draws_them(qapp):
     assert all(g("AngleFromSlope", g("SlopeFromAngle", a)) == a for a in range(1, 181))
 
 
+def test_string_to_num_takes_each_characters_last_four_bits(qapp):
+    """IM I-490's examples: no character is checked, a space is a zero
+    (Idealiner Jr reads "WGF" as 776, its startup dialog's size)."""
+    g = Guest()
+
+    def num(s):
+        return g("StringToNum", g.ptr(bytes([len(s)]) + s))[1]
+    assert [num(s) for s in (b"12", b"-23", b"-0", b"055", b"2:", b"CAT", b"+CAT")] == \
+        [12, 0xFFFFFFE9, 0, 55, 30, 314, 314]
+    assert num(b"-CAT") == 0x100000000 - 314 and num(b"12 ") == 120
+    assert num(b"2147483648") == num(b"-2147483648") == 0x80000000
+    assert num(b"4294967295") == 0xFFFFFFFF and num(b"-4294967295") == 1
+    assert num(b"WGF") == 776
+
+
+def test_a_nil_string_is_the_one_at_address_0(qapp):
+    """SCSI Evaluator has NumToString put its numbers at NIL and draws
+    them from there."""
+    g = Guest()
+    port, _ = g.port(64, 16)
+    g("NumToString", 1234, 0)
+    assert g.mem.read(0, 5) == b"\x041234"
+    assert g("StringWidth", 0) == g("StringWidth", g.ptr(b"\x041234")) > 0
+    g("MoveTo", 2, 12)
+    g("DrawString", 0)
+    assert port.pn_loc.h == 2 + g("StringWidth", 0)
+
+
 def extended(v: float) -> bytes:
     m, e = math.frexp(abs(v))
     return struct.pack(">HQ", (v < 0) << 15 | (e + 16382 if m else 0), int(m * 2 ** 64))
@@ -577,6 +621,7 @@ def test_the_event_manager_calls_system_task_and_system_event_through_their_patc
     task, event = 0xF00000, 0xF00010
     g.patches = {glue_desk.SYSTEM_TASK: task, glue_desk.SYSTEM_EVENT: event}
     g.in_patch, g.machine.drivers = set(), {}           # no desk accessories open
+    g.mem.w8(lowmem.SEvtEnb, 0xFF)                      # as the runtime starts
     g.procs[task] = lambda: glue_desk.give_time(g)      # calls back in, and gets the System's
     g.procs[event] = lambda p: 1
     glue_desk.give_time(g)
@@ -602,3 +647,19 @@ def test_still_down_is_false_with_a_mouse_event_queued_and_wait_mouse_up_takes_i
     assert not events.peek(k.everyEvent, tb._next_update)[0]
     state.down, state.releases = False, 1               # up, and its mouse-up taken
     assert not tb.WaitMouseUp()
+
+
+def test_the_system_heap_grows_as_gestalt_says(qapp):
+    """SoundApp wants the system heap to grow and all of HFSDispatch
+    (gestaltSysZoneGrowable, gestaltFullExtFSDispatching) before it
+    starts."""
+    g = Guest()
+    err, os = Gestalt(g, int.from_bytes(b"os  ", "big"))
+    assert err == noErr and os & 1
+    err, fs = Gestalt(g, int.from_bytes(b"fs  ", "big"))
+    assert err == noErr and fs & 0b11 == 0b11
+    heap = g.system.sys_heap
+    end = heap.end
+    p = heap.new_ptr(end - heap.start)                          # more than it has
+    assert p and heap.end > end and heap.end <= heap.limit
+    assert g.mem.r32(heap.start) & 0xFFFFFF == heap.end         # bkLim

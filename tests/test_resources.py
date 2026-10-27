@@ -17,7 +17,8 @@ from macrt.toolbox import constants as k
 from macrt.toolbox import lowmem
 from macrt.toolbox import resources as rm
 from macrt.toolbox import sysres
-from macrt.toolbox.files import fsRdPerm, fsRdWrPerm
+from macrt.toolbox.files import (
+    CATALOG_FILE, EXTENTS_FILE, fsRdPerm, fsRdWrPerm, vcbXTRef)
 from macrt.toolbox.events import EventQueue
 from macrt.toolbox.memmgr import LOCKED, PURGEABLE, RESOURCE, Heap
 from macrt.toolbox.menus import MENU_PROC, read_mbdf_id, read_menu_list
@@ -68,6 +69,11 @@ def make(app_fork=APP_FORK, others=(), system=None, **kw):
     proc = Process(system, "Test App", lambda tb: None, EventQueue(lambda: (None, 0)), app=app,
                    **kw)
     return system, proc, proc.resources
+
+
+def files_left_open(system):
+    """The open files, less the volumes' own paths to their catalog trees."""
+    return [n for n, p in system.fcbs.items() if p.node.cnid not in (EXTENTS_FILE, CATALOG_FILE)]
 
 
 def fill(heap):
@@ -125,9 +131,9 @@ def test_system_file_heads_every_chain():
     system, proc, res = make()
     sys_map = system.mem.r32(lowmem.SysMapHndl)
     assert system.sys_heap.contains(sys_map)
-    assert system.mem.r16(lowmem.SysMap) == 2
+    assert system.mem.r16(lowmem.SysMap) == res.sys_refnum
     assert system.mem.r_pstr(lowmem.SysResName) == b"System"
-    assert [m.refnum for m in res.maps()][-1] == 2
+    assert [m.refnum for m in res.maps()][-1] == res.sys_refnum
     assert list(res.maps())[-1].handle == sys_map
 
 
@@ -135,7 +141,7 @@ def test_defprocs_are_system_resources():
     system, proc, res = make()
     wdef = system.defproc("WDEF", 0)
     assert res.GetResource("WDEF", 0) == wdef
-    assert res.HomeResFile(wdef) == 2
+    assert res.HomeResFile(wdef) == res.sys_refnum
     assert res.GetResInfo(wdef)[:2] == (0, b"WDEF")
     assert system.defproc_id(wdef) == ("WDEF", 0)
     assert system.defproc_id(res.GetResource("STR ", 128)) == ("", 0)
@@ -251,7 +257,7 @@ def test_the_drivers_of_the_disks_system_file_join_macrts_own():
 def test_application_file_is_open_and_current():
     system, proc, res = make()
     refnum = res.CurResFile()
-    assert refnum not in (0, 2) and proc.world.r16(lowmem.CurApRefNum) == refnum
+    assert refnum not in (0, res.sys_refnum) and proc.world.r16(lowmem.CurApRefNum) == refnum
     top = ResourceMap(system.mem, proc.world.r32(lowmem.TopMapHndl))
     assert top.refnum == refnum and top.next == system.mem.r32(lowmem.SysMapHndl)
     assert proc.heap.contains(top.handle)
@@ -368,13 +374,18 @@ def test_get1_and_use_res_file():
     app = res.CurResFile()
     assert res.Get1Resource("WDEF", 0) == 0
     res.UseResFile(0)
-    assert res.CurResFile() == 2
+    assert res.CurResFile() == res.sys_refnum
     assert res.Get1Resource("WDEF", 0) == system.defproc("WDEF", 0)
     assert res.GetResource("STR ", 128) == 0          # the app's file is above the current one
     res.UseResFile(app)
     assert res.GetResource("STR ", 128)
     res.UseResFile(12345)
     assert res.ResError() == rm.resFNotFound and res.CurResFile() == app
+    trees = struct.unpack(">hh", system.mem.read(system.files.boot.vcb + vcbXTRef, 4))
+    for tree in trees:                                # open, but no resource file
+        res.UseResFile(tree)
+        assert res.ResError() == rm.resFNotFound and res.CurResFile() == app
+    assert 2 in trees                                 # Poly-Dol's UseResFile(machineType)
 
 
 def test_counting_and_indexing():
@@ -453,6 +464,19 @@ def test_release_and_detach():
     assert res.GetResource("STR ", 129) != again
 
 
+def test_rsrc_map_entry_is_where_the_resource_is_in_its_map():
+    system, proc, res = make()
+    h = res.GetResource("STR ", 129)
+    at = res.RsrcMapEntry(h)
+    assert res.ResError() == rm.noErr
+    m = ResourceMap(system.mem, proc.world.r32(lowmem.TopMapHndl))
+    assert system.mem.r16s(m.ptr + at) == 129               # its ID
+    assert system.mem.r32(m.ptr + at + 8) & 0xFFFFFF == h   # and its handle
+    res.DetachResource(h)
+    assert res.RsrcMapEntry(h) == 0 and res.ResError() == rm.resNotFound
+    assert res.RsrcMapEntry(0) == 0 and res.ResError() == rm.noErr
+
+
 def test_a_resource_that_wont_expand():
     bent = b"\xa8\x9f\x65\x72" + bytes(12)          # the compressed tag, then nonsense
     fork = build_fork([*read_fork(APP_FORK), Resource(b"BENT", 1, bent, None, 0x01)])
@@ -469,20 +493,27 @@ def test_open_search_and_close_another_file():
     app = res.CurResFile()
     n = res.OpenResFile("other")
     assert n not in (app, 2) and res.CurResFile() == n
-    assert [m.refnum for m in res.maps()] == [n, app, 2]
+    assert [m.refnum for m in res.maps()] == [n, app, res.sys_refnum]
     newest = res.GetResource("STR ", 128)
     assert contents(system, newest) == pstr("Other hello") and res.HomeResFile(newest) == n
     assert res.CountResources("STR ") == 5           # with the System's printer's name
-    # Opening it again just answers its number; asked for writing, it's
-    # made current too (Technote 1120).
+    # Opened again, it has a read-only map of its own, made current, as
+    # Tristan Pinball looks for its sounds; asked for writing, its number
+    # is answered and made current (Technote 1120).
     res.UseResFile(app)
-    assert res.OpenResFile("Other") == n and res.CurResFile() == app
+    copy = res.OpenResFile("Other")
+    assert copy not in (n, app, -1) and res.CurResFile() == copy
+    assert [m.refnum for m in res.maps()] == [copy, n, app, res.sys_refnum]
+    assert res.HomeResFile(res.GetResource("STR ", 128)) == copy
+    res.CloseResFile(copy)
+    assert res.HomeResFile(newest) == n
+    res.UseResFile(app)
     assert res.GetResource("STR ", 300) == 0          # above the current file
     assert res.OpenRFPerm("Other", 0, fsRdWrPerm) == n and res.CurResFile() == n
     res.UseResFile(app)
     res.UseResFile(n)
     res.CloseResFile(n)
-    assert [m.refnum for m in res.maps()] == [app, 2]
+    assert [m.refnum for m in res.maps()] == [app, res.sys_refnum]
     assert res.CurResFile() == app and not proc.heap.is_handle(newest)
     assert n not in system.fcbs
 
@@ -496,15 +527,24 @@ def test_opened_again_for_reading_a_file_has_a_map_of_its_own():
     mine = res.GetResource("STR ", 128)
     again = res.OpenRFPerm("Test App", 0, fsRdPerm)
     assert again not in (app, -1) and res.CurResFile() == again
-    assert [m.refnum for m in res.maps()] == [again, app, 2]
+    assert [m.refnum for m in res.maps()] == [again, app, res.sys_refnum]
     assert not system.fcbs[again].write
     copy = res.Get1Resource("STR ", 128)
     assert copy != mine and res.HomeResFile(copy) == again
     assert contents(system, copy) == contents(system, mine)
     res.ReleaseResource(copy)
     res.CloseResFile(again)
-    assert [m.refnum for m in res.maps()] == [app, 2] and res.CurResFile() == app
+    assert [m.refnum for m in res.maps()] == [app, res.sys_refnum] and res.CurResFile() == app
     assert proc.heap.is_handle(mine) and res.GetResource("STR ", 128) == mine
+
+
+def test_the_system_file_opened_again_answers_its_number():
+    """Font/DA Mover writes to the System file through the number
+    OpenResFile answers for it (Inside Macintosh I-115)."""
+    system, proc, res = make()
+    app = res.CurResFile()
+    assert res.OpenResFile("System") == res.sys_refnum and res.CurResFile() == app
+    assert [m.refnum for m in res.maps()] == [app, res.sys_refnum]
 
 
 def test_open_res_file_errors():
@@ -512,16 +552,26 @@ def test_open_res_file_errors():
     assert res.OpenResFile("Missing") == -1 and res.ResError() == rm.fnfErr
     assert res.OpenResFile("Data Only") == -1 and res.ResError() == rm.eofErr
     res.CloseResFile(0)                                # never closes the System file
-    assert [m.refnum for m in res.maps()][-1] == 2
+    assert [m.refnum for m in res.maps()][-1] == res.sys_refnum
 
 
 def test_process_close_frees_its_files():
     other = MacFile("Other", rsrc=OTHER_FORK)
     system, proc, res = make(others=[other])
     res.OpenResFile("Other")
-    assert len(system.fcbs) == 3
+    assert len(files_left_open(system)) == 3
     proc.close()
-    assert list(system.fcbs) == [2]
+    assert files_left_open(system) == [res.sys_refnum]
+
+
+def test_process_close_frees_its_files_when_the_map_chain_is_broken():
+    other = MacFile("Other", rsrc=OTHER_FORK)
+    system, proc, res = make(others=[other])
+    res.OpenResFile("Other")
+    top = next(res.maps())
+    system.mem.w32(top.ptr + 16, 0xFC0000)            # a next map past the end of RAM
+    proc.close()
+    assert files_left_open(system) == [res.sys_refnum]
 
 
 # -- changing resources ------------------------------------------------------
@@ -582,13 +632,29 @@ def test_partial_resources_read_and_write_the_file():
     res.CloseResFile(n)
 
 
-def test_add_resource_refuses_a_resource_or_a_read_only_file():
+def test_add_resource_refuses_a_resource():
     system, proc, res = make()
     res.AddResource(res.GetResource("STR ", 128), "DUPE", 1)
     assert res.ResError() == rm.addResFailed
+
+
+def test_a_read_only_file_changes_only_in_memory():
+    """With mapReadOnly set the map still takes new resources, and
+    WriteResource and UpdateResFile write nothing, without an error
+    (Worm 1.0 keeps its settings this way on a CD)."""
+    system, proc, res = make()
+    before = proc.app.rsrc
     res.SetResFileAttrs(res.CurResFile(), mapReadOnly)
-    res.AddResource(proc.heap.new_handle(1), "NOPE", 1)
-    assert res.ResError() == rm.addResFailed
+    res.RemoveResource(res.GetResource("STR ", 129))
+    assert res.ResError() == 0
+    h = proc.heap.new_handle(1)
+    res.AddResource(h, "PREF", 1)
+    assert res.ResError() == 0 and res.GetResource("PREF", 1) == h
+    res.WriteResource(h)
+    assert res.ResError() == 0
+    res.UpdateResFile(res.CurResFile())
+    assert res.ResError() == 0 and proc.app.rsrc == before
+    assert res.GetResource("PREF", 1) == h and res.GetResource("STR ", 129) == 0
 
 
 def test_remove_and_rename():
@@ -739,7 +805,7 @@ def test_menus_from_resources_work(harness):
     h.wait_until(lambda: len(proc.windows) == 3, what="File > New")
     h.choose(bar, "File", 4)
     h.wait_until(lambda: proc not in h.d.processes, what="File > Quit")
-    assert list(h.d.system.fcbs) == [2]
+    assert files_left_open(h.d.system) == [h.d.system.mem.r16(lowmem.SysMap)]
 
 
 def test_get_menu_bar_is_a_copy(harness):

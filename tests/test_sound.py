@@ -8,9 +8,12 @@ import wave
 from PyQt6.QtMultimedia import QAudioFormat
 
 from macrt.m68k import glue_devices, sound
+from macrt.m68k.cpu import CPU
 from macrt.m68k.hardware import HZ, vBufA, vBufB
+from macrt.m68k.runtime import machine_for
 from macrt.memory import RAM
 from macrt.toolbox import lowmem
+from macrt.toolbox.system import System
 from macrt.ui.audio import Converter
 
 from guest import Processor
@@ -108,6 +111,82 @@ def test_a_wave_file_holds_each_frame(tmp_path):
     w.frame(sound.SILENT_FRAME)                     # after it's closed: nothing
     with wave.open(str(path)) as r:
         assert r.readframes(FRAME)[:3] == bytes([0, 1, 2])
+
+
+CODE = 0x10000
+
+
+def test_the_sound_chip_plays_what_68k_code_writes_to_its_fifos():
+    """Digital Messiah's VBL task writes its music to the Apple Sound Chip
+    with MOVEM.L: the speaker plays it at the next tick, the two FIFOs'
+    averaged, then silence, and nothing once they're empty.  What's written
+    from $800 reads back; the FIFOs read 0."""
+    mem, out = RAM(0x20000), Frames()
+    chip = sound.ASC()
+    cpu = CPU(mem)
+    chip.map(cpu.uc)
+    mem.write(CODE, bytes.fromhex(f"207C{sound.ASC_BASE:08X}"  # movea.l #ASC,a0
+                                  "203C 0102 0304"          # move.l #$01020304,d0
+                                  "223C 0506 0708"          # move.l #$05060708,d1
+                                  "48D0 0003"               # movem.l d0-d1,(a0)
+                                  "117C 0040 0400"          # move.b #$40,$400(a0)
+                                  "117C 0001 0801"          # move.b #1,$801(a0)
+                                  "1428 0801"               # move.b $801(a0),d2
+                                  "1610"))                  # move.b (a0),d3
+    try:
+        cpu.set_d(2, 0xFFFFFFFF)
+        cpu.set_d(3, 0xFFFFFFFF)
+        cpu.pc = CODE
+        assert cpu.run(CODE + 40).kind == "until"
+        assert (cpu.d(2), cpu.d(3)) == (0xFFFFFF01, 0xFFFFFF00)
+    finally:
+        cpu.close()
+    speaker = sound.Speaker(mem, FakeVIA(), [out], chip)    # its own sound off
+    assert speaker.waiting
+    speaker.retrace()
+    first = bytes(range(1, 9)).ljust(FRAME, b"\x80")
+    second = b"\x40".ljust(FRAME, b"\x80")
+    assert out.frames == [bytes((a + b) >> 1 for a, b in zip(first, second))]
+    assert not speaker.waiting
+    speaker.retrace()
+    assert len(out.frames) == 1
+
+
+def test_a_full_fifo_drops_what_s_written_and_the_speaker_s_own_sound_is_added():
+    mem, via, out = RAM(0x20000), FakeVIA(), Frames()
+    chip = sound.ASC()
+    cpu = CPU(mem)
+    chip.map(cpu.uc)
+    mem.write(CODE, bytes.fromhex(f"207C{sound.ASC_BASE:08X}"  # movea.l #ASC,a0
+                                  "343C 04FF"               # move.w #$4FF,d2
+                                  "1142 0400"               # move.b d2,$400(a0)
+                                  "51CA FFFA"))             # dbra d2,*-4
+    try:
+        cpu.pc = CODE
+        assert cpu.run(CODE + 18).kind == "until"
+    finally:
+        cpu.close()
+    kept = bytes((0x4FF - n) & 0xFF for n in range(sound.FIFO))
+    mem.w32(lowmem.SoundBase, 0x1000)
+    mem.write(0x1000, bytes([0xC0, 0]) * FRAME)
+    via.regs[vBufB] = 0                                     # on
+    speaker = sound.Speaker(mem, via, [out], chip)
+    for _ in range(4):
+        speaker.retrace()
+    chips = [kept[:FRAME], kept[FRAME:2 * FRAME], kept[2 * FRAME:].ljust(FRAME, b"\x80")]
+    mixed = [bytes(min(255, s + 0x40) for s in f) for f in chips]
+    assert out.frames == mixed + [bytes([0xC0]) * FRAME]   # then only the speaker's
+
+
+def test_a_mac_ii_has_the_sound_chip_where_ascbase_says_and_a_plus_has_none(qapp):
+    for model, base in (("ii", sound.ASC_BASE), ("plus", 0)):
+        system = System(model=model)
+        m = machine_for(system)
+        try:
+            assert system.mem.r32(lowmem.ASCBase) == base
+            assert (m.asc is not None) is bool(base)
+        finally:
+            m.cpu.close()
 
 
 def test_the_host_gets_the_changes_in_level_at_its_own_rate():

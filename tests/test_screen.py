@@ -89,6 +89,20 @@ def test_the_front_window_has_the_pixels_where_two_overlap(harness):
     assert shows(back, bx, bv)
 
 
+def test_get_pixel_reads_what_another_window_drew_outside_the_port(harness):
+    """GetPixel reads the screen: at a point local to the back window,
+    outside it, what the front window drew there (IM I's GetPixel)."""
+    h, g, system = launch(harness, windows=2)
+    front, back = g.tb.FrontWindow(), g.tb._p.windows[1]
+    f, b = front.content, back.content
+    x, v = b.right + 5, b.bottom + 5                        # front's, outside back
+    at = Point(v - b.top + back.port_rect.top, x - b.left + back.port_rect.left)
+    assert not g.tb.qd.get_pixel(back, at)
+    g.tb.SetPort(front)
+    g.tb.PaintRect(Rect(v - f.top - 2, x - f.left - 2, v - f.top + 2, x - f.left + 2))
+    assert g.tb.qd.get_pixel(back, at)
+
+
 def test_a_moved_window_is_written_where_it_is_now(harness):
     h, g, system = launch(harness)
     w = g.tb.FrontWindow()
@@ -115,6 +129,24 @@ def test_the_desk_a_window_leaves_is_gray_again_at_once(harness):
     poke(system, c.left + 8, c.top + 2)
     system.screen.look()
     assert black(system, c.left + 8, c.top + 2)
+
+
+def test_a_window_shown_covers_what_was_written_under_it(harness):
+    """What a program wrote on the desk before ShowWindow was under the
+    window, not in it: SnapShot zooms frames in the screen port, drawing
+    and undoing each where its window is about to come."""
+    h, g, system = launch(harness)
+    w = g.tb.FrontWindow()
+    c = w.content
+    x, v = (c.left + 40) // 8 * 8, c.top + 30
+    g.tb.HideWindow(w)
+    system.screen.look()
+    poke(system, x, v)
+    system.screen.look()
+    poke(system, x, v, DESK[v % 8])         # undone: gray, as the desk was
+    g.tb.ShowWindow(w)
+    assert not any(shows(w, x + i, v) for i in range(8))
+    assert not black(system, x, v) and not black(system, x + 1, v)
 
 
 def test_a_program_that_calls_no_traps_is_shown_from_the_clock(harness):

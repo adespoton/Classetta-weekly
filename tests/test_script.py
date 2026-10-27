@@ -5,6 +5,7 @@ ScriptUtil dispatcher."""
 import struct
 
 from macrt.m68k import dispatch
+from macrt.toolbox import intl
 from macrt.toolbox import lowmem
 from macrt.toolbox import script as sm
 
@@ -186,6 +187,40 @@ def test_the_systems_international_bundle_is_romans(qapp):
 def test_a_date_cache(qapp):
     g = ScriptGuest()
     assert g("InitDateCache", g.ptr(bytes(512))) == 0
+
+
+def test_string_to_date_and_time(qapp):
+    """Inside Macintosh: Text's own example, a date then a time; other
+    dates it says StringToDate reads; and what it says of the status."""
+    g = ScriptGuest()
+    g.mem.w32(lowmem.Time, 3_850_000_000)               # in 2025
+    cache, used, date = g.ptr(bytes(512)), g.ptr(bytes(4)), g.ptr(bytes(28))
+    g("InitDateCache", cache)
+
+    def parse(routine, text):
+        g.mem.write(date, b"\x55" * 28)
+        status = g(routine, g.ptr(text), len(text), cache, used, date) & 0xFFFF
+        return status, g.mem.r32(used), struct.unpack(">14h", g.mem.read(date, 28))
+
+    text = b"March 27, 1992 08:14 p.m."
+    status, n, fields = parse("StringToDate", text)
+    assert status == intl.longDateFound | intl.leftOverChars and n == len(b"March 27, 1992")
+    assert fields[1:4] == (1992, 3, 27) and fields[7] == 6        # a Friday
+    assert fields[4:7] == (0x5555,) * 3                          # the time's left alone
+    status, n, fields = parse("StringToTime", text[n:])
+    assert (status, n, fields[4:7]) == (0, len(b" 08:14 p.m."), (20, 14, 0))
+    assert fields[1:4] == (0x5555,) * 3
+    for text in (b"September 1, 1987", b"1 Sept 1987", b"9/1/1987", b"1 1987 sEpT"):
+        assert parse("StringToDate", text)[2][1:4] == (1987, 9, 1), text
+    assert parse("StringToDate", b"9/1/87")[2][1] == 2087       # this century
+    assert parse("StringToDate", b"9/1/987")[2][1] == 1987
+    assert parse("StringToDate", b"9/1")[2][1:4] == (2025, 9, 1)
+    assert parse("StringToDate", b"9-1-1987")[0] == intl.sepNotIntlSep
+    assert parse("StringToDate", b"2/30/1987")[0] == intl.dateTimeInvalid
+    assert parse("StringToDate", b"no date")[0] == intl.dateTimeNotFound
+    assert parse("StringToTime", b"1:05:09 PM")[2][4:7] == (13, 5, 9)
+    assert parse("StringToTime", b"12:30 AM")[2][4:7] == (0, 30, 0)
+    assert parse("StringToTime", b"25:00")[0] == intl.dateTimeInvalid
 
 
 def test_transliterate_sizes_the_destination(qapp):

@@ -45,6 +45,14 @@ def test_rgb_colours_become_black_or_white(g):
     assert read_rgb(g, out) == (0, 0, 0)
 
 
+def test_color_bit_sets_the_ports_plane(g):
+    port, _ = g.port()
+    g("ColorBit", 2)
+    assert port.colr_bit == 2
+    g("PaintRect", g.rect_ptr((0, 0, 4, 64)))
+    assert g.rows(port)[0] == "#" * 64                   # the screen has the one plane
+
+
 def test_luminance():
     assert luminance(0xFFFF, 0xFFFF, 0xFFFF) == 0xFFFF and luminance(0, 0, 0) == 0
     assert is_light(0, 0xFFFF, 0) and not is_light(0xFFFF, 0, 0)     # green light, red dark

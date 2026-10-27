@@ -88,6 +88,17 @@ def test_plot_icon_takes_a_handle_the_program_made(g):
     assert all(r[:32] == "#" * 16 + "." * 16 for r in g.rows(port)[:32])
 
 
+def test_plot_icon_takes_a_master_pointer_moved_into_its_block(qapp):
+    """Icon Exchanger points a resource's master pointer at an icon inside
+    it, past the block's start, and plots that."""
+    g = guest(("ICON", 132, EMPTY + LEFT_HALF))
+    port, _ = g.port()
+    h = g("GetIcon", 132)
+    g.mem.w32(h, g.mem.r32(h) + 128)
+    g("PlotIcon", g.rect_ptr((0, 0, 32, 32)), h)
+    assert all(r[:32] == "#" * 16 + "." * 16 for r in g.rows(port)[:32])
+
+
 # -- families -------------------------------------------------------------------
 def test_plot_icon_id_draws_through_the_mask(g):
     port, _ = g.port()
@@ -187,6 +198,37 @@ def test_icon_suites(g):
     assert g.contents(resource) == FRAME + SOLID           # still the Resource Manager's
 
 
+def ostype(kind: bytes) -> int:
+    return int.from_bytes(kind, "big")
+
+
+def test_for_each_icon_do_calls_the_action_for_each_type_the_selector_names(g):
+    """More Macintosh Toolbox, Icon Utilities: with the suite's handle for
+    each, NIL for a type it hasn't; what the action leaves in its VAR
+    theIcon goes in the suite, and a result other than noErr stops it."""
+    out = g.ptr(bytes(4))
+    g("GetIconSuite", out, 129, 0xFFFFFFFF)
+    suite = g.mem.r32(out)
+    g("GetIconFromSuite", out, suite, ostype(b"ICN#"))
+    icn, mine, action = g.mem.r32(out), g.handle(bytes(1024)), 0xF00000
+    seen = []
+
+    def act(kind, var, data):
+        seen.append((kind.to_bytes(4, "big"), g.mem.r32(var), data))
+        if kind == ostype(b"icl8"):
+            g.mem.w32(var, mine)
+    g.procs[action] = act
+    assert g("ForEachIconDo", suite, 0x107, action, 0x1234) == 0  # the large ones and the ics#
+    assert [kind for kind, _, _ in seen] == [b"ICN#", b"icl4", b"icl8", b"ics#"]
+    assert seen[0][1:] == (icn, 0x1234) and seen[1][1] == 0 and seen[3][1]
+    g("GetIconFromSuite", out, suite, ostype(b"icl8"))
+    assert g.mem.r32(out) == mine
+    seen.clear()
+    g.procs[action] = lambda kind, var, data: seen.append(kind) or -1
+    assert g("ForEachIconDo", suite, 0xFFFFFFFF, action, 0) == -1 and len(seen) == 1
+    assert g("ForEachIconDo", g.handle(b""), 1, action, 0) == -50 and len(seen) == 1
+
+
 def test_a_suite_of_only_some_icons(g):
     port, _ = g.port()
     out = g.ptr(bytes(4))
@@ -242,6 +284,30 @@ def test_a_menu_title_can_be_an_icon_suite(qapp):
         assert at(img, 2) == 0xFFFFFF and at(img, 12) == 0
     finally:
         bar.deleteLater()
+
+
+def test_an_apple_in_a_menu_title_of_text_is_the_apple_menus(qapp):
+    """Chicago's $14 is its apple wherever it is in a title: TME's first
+    menu is a space and an apple, which looks like the Apple menu's."""
+    g = guest()
+
+    def black(title):
+        menu = MenuInfo(g.system, g("NewMenu", 300, g.ptr(bytes([len(title)]) + title)))
+        bar = MenuBarWidget(SimpleNamespace(application_menu_for=lambda bar: None))
+        try:
+            bar.resize(300, bar.height())
+            bar.process = SimpleNamespace(bar_menus=lambda: [menu])
+            (_, cell), = bar.cells()
+            img = bar.image()
+            dots = {(x, y) for x in range(cell.left(), cell.right() + 1)
+                    for y in range(cell.top(), cell.bottom() + 1)
+                    if img.pixel(x, y) & 0xFFFFFF == 0}
+        finally:
+            bar.deleteLater()
+        left, top = min(x for x, _ in dots), min(y for _, y in dots)
+        return {(x - left, y - top) for x, y in dots}
+
+    assert black(b" \x14") == black(b"\x14")
 
 
 # -- colour icons and SICNs -----------------------------------------------------

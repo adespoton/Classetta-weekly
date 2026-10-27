@@ -17,11 +17,13 @@ from macrt.m68k.glue_cport import STANDARD_WCTB
 from macrt.macfile import open_application
 from macrt.resfork import Resource
 from macrt.toolbox import constants as k
+from macrt.toolbox import textedit as te
 from macrt.toolbox.color import color_table
 from macrt.toolbox.controls import Control
 from macrt.toolbox.dialogs import HIDDEN, Dialog, items, substitute
 from macrt.toolbox.qdraw import rgb_argb
-from macrt.toolbox.templates import btnCtrl, ctrlItem, editText, resCtrl, statText
+from macrt.toolbox.templates import (
+    btnCtrl, ctrlItem, editText, itemDisable, resCtrl, statText, userItem)
 from macrt.toolbox.types import Rect
 
 from builders import alrt, ditl, dlog
@@ -318,6 +320,29 @@ def ditl_dialog(model="plus"):
     return g, g("NewDialog", 0, bounds, title, 0, k.dBoxProc, -1, 0, 0, item_list)
 
 
+def test_a_user_items_procedure_put_in_the_list_is_kept(qapp):
+    """The placeholder is "for the item's handle or, for item type
+    userItem, its procedure pointer" (Inside Macintosh I, the Dialog
+    Manager): a program that makes its own item list can put the
+    procedure there before NewDialog, as LaserKey's installer does."""
+    g = Guest()
+    g.tb._d = NoDisplay()
+    data = bytearray(ditl((ctrlItem + btnCtrl, (70, 230, 90, 290), b"OK"),
+                          (userItem | itemDisable, (10, 10, 26, 200), b""),
+                          (userItem, (30, 10, 46, 200), b"")))
+    proc = g.ptr(b"\x4e\x75")
+    struct.pack_into(">I", data, 18, proc)                         # item 2's placeholder
+    drawn = []
+    g.procs[proc] = lambda w, n: drawn.append(n)
+    bounds, title = g.rect_ptr(Rect(40, 40, 140, 340)), g.ptr(b"\0")
+    w = g("NewDialog", 0, bounds, title, 1, k.dBoxProc, -1, 0, 0, g.handle(bytes(data)))
+    found = items(g.mem, Dialog(g.mem, w.addr).items)
+    assert [item.handle for item in found[1:]] == [proc, 0]
+    drawn.clear()
+    g("DrawDialog", w.addr)
+    assert drawn == [2]
+
+
 def test_items_are_appended(qapp):
     """Over the dialog's, at its right or bottom, which grows to hold them,
     or from another item (Inside Macintosh: Macintosh Toolbox Essentials,
@@ -358,10 +383,13 @@ def test_items_are_taken_away(qapp):
     d = Dialog(g.mem, w.addr)
     assert d.edit_field == 2 and d.text_h
     button = items(g.mem, d.items)[3].handle
+    typed = items(g.mem, d.items)[2].handle
     glue_dialogs.ShortenDITL(g, w.addr, 2)
     assert glue_dialogs.CountDITL(g, w.addr) == 2
-    assert d.edit_field == -1 and d.text_h == 0
-    assert not g.heap.is_handle(button)
+    rec = te.TERec(g.mem, g.mem.r32(d.text_h) & 0xFFFFFF)
+    assert d.edit_field == -1 and not rec.active                   # the record stays
+    assert g.heap.is_handle(rec.h_text) and not g.heap.is_handle(typed)
+    assert not g.heap.is_handle(button) or button == rec.h_text     # its master pointer again
     assert g.heap.handle_size(d.items) == len(ditl(
         (ctrlItem + btnCtrl, (70, 230, 90, 290), b"OK"),
         (statText, (10, 10, 26, 200), b"Some text")))
@@ -369,6 +397,26 @@ def test_items_are_taken_away(qapp):
     assert glue_dialogs.CountDITL(g, w.addr) == 0
     glue_dialogs.AppendDITL(g, w.addr, g.handle(ditl((statText, (5, 5, 20, 50), b"Back"))), 0)
     assert glue_dialogs.CountDITL(g, w.addr) == 1
+
+
+def test_a_dialog_without_edit_text_has_a_textedit_record(qapp):
+    """Generate Numbers sets the font of its About box's textH, a dialog
+    of static text, and stops at its own check for NIL if there's none.
+    The record has the dialog's font and is inactive until an editText
+    item is edited with it, which then has its text."""
+    g, w = ditl_dialog()
+    d = Dialog(g.mem, w.addr)
+    assert d.edit_field == -1 and d.text_h and g.heap.is_handle(d.text_h)
+    rec = te.TERec(g.mem, g.mem.r32(d.text_h) & 0xFFFFFF)
+    assert not rec.active and rec.tx_font == w.tx_font
+    assert g.heap.is_handle(rec.h_text)
+    glue_dialogs.AppendDITL(g, w.addr, g.handle(ditl(
+        (editText, (40, 10, 56, 100), b"Typed"))), glue_dialogs.overlayDITL)
+    typed = items(g.mem, d.items)[2].handle
+    assert d.edit_field == 2 and rec.h_text == typed
+    record = d.text_h
+    g("DisposeDialog", w.addr)
+    assert not g.heap.is_handle(record) and not g.heap.is_handle(typed)
 
 
 def test_the_communications_toolbox_dispatch(qapp):
