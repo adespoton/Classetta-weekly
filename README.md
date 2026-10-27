@@ -1,8 +1,8 @@
-# Classetta (previously MacRT)
+# macrt
 
-A runtime for classic Mac OS (System 1–7) applications with a PyQt6 front end.  __Weekly builds available every Wednesday!__
+A runtime for classic Mac OS (System 1–7) applications with a PyQt6 front end.
 
-Classetta runs an application's own 68k code on an emulated CPU, catches its
+macrt runs an application's own 68k code on an emulated CPU, catches its
 A-line traps, and answers them with a Toolbox written in Python, with Qt
 widgets standing in for what QuickDraw used to draw. There is no
 disassembly or translation step. The program runs as it did on a Mac, and
@@ -16,7 +16,9 @@ and Glider+ among them (see
 - **The processor** is unicorn's 68020, in 24-bit mode, which tells programs
   it's a Mac Plus's 68000 (or, with `--model ii`, a Mac II's 68020 and
   68881) and stacks that processor's exception frames, with its trace mode
-  run an instruction at a time. The Segment Loader builds each
+  run an instruction at a time, and the few 68020 and 68881 instructions
+  unicorn doesn't have (`CHK2`, `CMP2`, packed decimal `FMOVE`, `FSAVE`,
+  `FRESTORE`) run in Python. The Segment Loader builds each
   application's A5 world and jump table, reading segments through a patch
   the program has on `GetResource`, and a trap dispatcher
   generated from the Multiversal interfaces passes Pascal-stack and
@@ -26,6 +28,8 @@ and Glider+ among them (see
     Scrap, File and Process Managers, TextEdit and Standard File;
   - the Apple Event Manager, for the Open Application event and an
     application's events to itself;
+  - the Edition Manager's publishers and subscribers, with their dialogs,
+    and the section events it sends between applications;
   - QuickDraw in black and white, with real regions, pictures and icons;
   - SANE's arithmetic, conversions and elementary functions, the
     International Utilities' dates, times and string order, and the
@@ -40,7 +44,7 @@ and Glider+ among them (see
   depth, colour ports, colour windows, pixel patterns, offscreen pixel
   maps and GWorlds, the Palette Manager and the Color Picker are there,
   but not colour pictures, icons and cursors throughout), and
-  Apple events between applications.
+  Apple events an application sends another with `AESend`.
   Applications that need them get as far as they can without them.
 
 To run one, see **[docs/running-apps.md](docs/running-apps.md)**, which
@@ -156,7 +160,11 @@ guest thread (one per app)                         GUI thread
   `_Pack3` or `_OSDispatch`. Then it calls the Python routine registered
   under the trap's name with `@trap`. A known trap with nothing behind it
   is logged and skipped; one that isn't known at all stops the application
-  with system error 12. `SetTrapAddress` patches work, and so does calling a
+  with system error 12. On a Plus, whose 128K ROM took a Toolbox trap's
+  number from bits 0-8 of the word alone (Inside Macintosh IV, Using
+  Assembly Language), a Toolbox word with bit 9 set that names nothing is
+  the trap in bits 0-8: Crozzle 0.8 calls `NewWindow` as `$AB13`.
+  `SetTrapAddress` patches work, and so does calling a
   trap through the address `GetTrapAddress` gave. A patch on an OS trap is
   entered as the Mac's dispatcher enters it, with the registers it saved on
   the stack, since some patches unwind that frame themselves. `GetTrapAddress` calls
@@ -214,9 +222,10 @@ macrt/
   ui/        display.py, window.py, menubar.py, tracking.py, chrome.py,
              theme.py, bridge.py, keymap.py, stdfile.py (Open and Save),
              colordlg.py (the Color Picker's dialog), audio.py (the host's sound output), fonts/
-  m68k/      cpu.py (unicorn), runtime.py (Machine, Runner, system errors),
+  m68k/      cpu.py (unicorn), instructions.py (what unicorn doesn't run),
+             runtime.py (Machine, Runner, system errors),
              hardware.py (the VIA and the IWM),
-             sound.py (the Sound Driver and the speaker),
+             sound.py (the Sound Driver, the speaker and the Apple Sound Chip),
              sound_manager.py (the Sound Manager's channels),
              segload.py (CODE 0, the jump table, LoadSeg), dispatch.py and
              trapdefs.py (trap signatures), glue_*.py (the trap routines:
@@ -226,7 +235,7 @@ macrt/
              sane, intl, script)
   resfork.py the resource fork format, read (every offset checked) and written
   macfile.py Mac files from the host: MacBinary, BinHex, AppleSingle/Double,
-             emulator side files, HFS images through machfs, MFS images
+             emulator side files, HFS and MFS disk images
   moof.py    Applesauce MOOF floppy images: each track's GCR bits decoded
              back to sectors
   process.py one running guest app
@@ -311,8 +320,11 @@ can read them in its own way.
   or macOS's `..namedfork/rsrc`. `open_application` is what the command line
   uses: it also opens disk images and refuses StuffIt and zip archives with a
   hint. `load_volume` opens HFS
-  disk images, raw, DiskCopy 4.2 or behind an Apple partition map, through
-  machfs, and reads MFS (400K) disks itself into the same form: their one
+  disk images, raw, DiskCopy 4.2 or behind an Apple partition map, into
+  machfs's form, walking their catalog and extents trees with machfs's
+  B*-tree reader but leaving each file's forks on the disk until they're
+  read (a CD's image, or any of 16 MB or more, is mapped rather than read
+  in). It reads MFS (400K) disks into the same form: their one
   flat directory, each fork followed through the block map. A MOOF image
   of a floppy's tracks is decoded to its sectors first (`macrt.moof`): the
   GCR bytes found in each track's bits, and each sector's three bytes to
@@ -475,7 +487,10 @@ truncation and justified measuring, and its dispatcher's selectors.
 `tests/test_bitfonts.py` checks an application's own bitmap fonts and the
 System's pattern list.
 `tests/test_aevents.py` checks Apple event data and the Apple Event
-Manager's own coercions.
+Manager's own coercions. `tests/test_editions.py` checks the Edition
+Manager: publishers and subscribers in two applications sharing one
+machine, the section events between them, an application's own edition
+opener, and the publisher, subscriber and options dialogs.
 `tests/test_screen.py` checks the screen buffer: QuickDraw's drawing
 written through to it, a program's own writes shown in its windows, and
 the desk. `tests/test_hardware.py` checks the VIA and the IWM, the
