@@ -18,10 +18,10 @@ from PyQt6.QtCore import QPoint, QRect, Qt, QTimer
 from PyQt6.QtGui import QColor, QFont, QFontMetrics, QImage, QPainter, QPen, QRegion
 from PyQt6.QtWidgets import QWidget
 
-from ..toolbox.constants import checkMark, kApplicationMenuID, kHMHelpMenuID
+from ..toolbox.constants import APPLE_MENU_TITLE, checkMark, kApplicationMenuID, kHMHelpMenuID
 from ..toolbox.icons import MINI, SMALL, suite_entries, suite_icon
 from ..toolbox.menus import RGB, Menu, MenuBase, MenuColors, MenuItem
-from ..toolbox.qdraw import char_codes
+from ..toolbox.qdraw import CHICAGO_SYMBOLS, char_codes
 from ..toolbox.types import Point, Rect
 from . import theme
 from .chrome import paint_dither
@@ -90,7 +90,23 @@ def _title_width(menu: Menu, metrics: QFontMetrics, strike: Strike | None = None
         return theme.bitmap_size(icon[0])[0]
     if strike is not None:
         return strike.width(char_codes(menu.title))
-    return metrics.horizontalAdvance(menu.title)
+    return sum(w for _, w in _title_runs(menu.title, metrics))
+
+
+def _title_runs(title: str, metrics: QFontMetrics) -> list[tuple[str | None, int]]:
+    """A title of text in the host's font, as runs of text and their widths,
+    None for each apple in it: Chicago's $14, which the host's font hasn't
+    got, so the Apple menu's own icon stands in for it (TME's title is a
+    space and an apple)."""
+    apple = theme.bitmap_size(theme.APPLE_ICON)[0]
+    runs: list[tuple[str | None, int]] = []
+    for i, text in enumerate(title.split(APPLE_MENU_TITLE)):
+        if i:
+            runs.append((None, apple))
+        if text:
+            text = text.translate(CHICAGO_SYMBOLS)
+            runs.append((text, metrics.horizontalAdvance(text)))
+    return runs
 
 
 def _draw_strike(p: QPainter, strike: Strike, text: str, r: QRect, color: QColor,
@@ -247,13 +263,31 @@ class MenuBarWidget(QWidget):
                 self._draw_icon(p, cell, icon[0], fg)
             elif strike is not None:
                 _draw_strike(p, strike, menu.title, cell, fg, centered=True)
+            elif APPLE_MENU_TITLE in menu.title:
+                self._draw_runs(p, cell, _title_runs(menu.title, QFontMetrics(font)), fg)
             else:
                 p.setPen(QPen(fg))
-                p.drawText(cell, Qt.AlignmentFlag.AlignCenter, menu.title)
+                p.drawText(cell, Qt.AlignmentFlag.AlignCenter,
+                           menu.title.translate(CHICAGO_SYMBOLS))
             if not menu.enabled:
                 paint_dither(p, cell.adjusted(1, 1, -1, -1), bg)
         if self.rounded:
             self._draw_screen_corners(p, w)
+
+    @staticmethod
+    def _draw_runs(p, cell, runs, color):
+        """Runs of text and apples, centred together in cell."""
+        x = cell.x() + (cell.width() - sum(w for _, w in runs)) // 2
+        p.setPen(QPen(color))
+        for text, w in runs:
+            if text is None:
+                h = theme.bitmap_size(theme.APPLE_ICON)[1]
+                y = cell.y() + (cell.height() - h) // 2
+                theme.draw_bitmap(p, x, y, theme.APPLE_ICON, color)
+            else:
+                p.drawText(QRect(x, cell.y(), w, cell.height()),
+                           Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, text)
+            x += w
 
     @staticmethod
     def _draw_icon(p, cell, bitmap, color, rows=None):
@@ -300,7 +334,7 @@ def _paint_frame(p: QPainter, w: int, h: int, back: QColor = WHITE) -> None:
 def _item_text_width(item: MenuItem, text: str, strike: Strike | None) -> int:
     if strike is not None:
         return strike.width(char_codes(text), item.style)
-    return QFontMetrics(_item_font(item)).horizontalAdvance(text)
+    return QFontMetrics(_item_font(item)).horizontalAdvance(text.translate(CHICAGO_SYMBOLS))
 
 
 def _cmd_width(item: MenuItem, strike: Strike | None) -> int:
@@ -423,7 +457,7 @@ class Pulldown(QWidget):
             align = Qt.AlignmentFlag.AlignCenter if centered else (
                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
             p.setPen(QPen(fg))
-            p.drawText(r, align, text)
+            p.drawText(r, align, text.translate(CHICAGO_SYMBOLS))
 
 
 class DrawnPulldown(QWidget):
