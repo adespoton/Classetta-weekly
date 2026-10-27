@@ -36,6 +36,7 @@ from ..memory import (
 )
 from . import constants as k
 from .qdraw import (
+    CHICAGO_SYMBOLS,
     Region,
     frame_path,
     oval_path,
@@ -291,24 +292,29 @@ class Painter:
         self.fill(frame_path(shape, r, Point(width, width)))
 
     def text(self, c: Control, h: int, r: Rect, centered: bool) -> Rect:
-        """The title at h (or centered in r), its baseline centered in r
-        vertically, in the system font or the window's, and clipped to the
-        control's rectangle.  Returns where it went."""
+        """The title at h (or each line centered in r), in the system font
+        or the window's, and clipped to the control's rectangle.  Its lines,
+        separated by returns, are a font's leading apart and centered in r
+        vertically together (Inside Macintosh IV, The Control Manager, The
+        Control Definition Function).  Returns where it went."""
         port, qd = self.port, self.qd
         saved = (port.pn_loc, port.tx_font, port.tx_face, port.tx_size, port.tx_mode)
         try:
             if not c.variation & k.useWFont:
                 port.tx_font, port.tx_face, port.tx_size = 0, 0, 0
             port.tx_mode = k.srcOr
-            title = c.title
-            width = qd.text_width(port, title)
-            ascent, descent, _, _ = qd.font_info(port)
-            if centered:
-                h = r.left + (r.width - width) // 2
-            base = r.top + (r.height - ascent - descent) // 2 + ascent
-            port.pn_loc = Point(base, h)
-            qd.draw_text(port, title, Region.rect(c.rect))
-            return Rect(base - ascent, h, base + descent, h + width)
+            lines = c.title.translate(CHICAGO_SYMBOLS).split("\r")
+            ascent, descent, _, leading = qd.font_info(port)
+            step = ascent + descent + leading
+            top = r.top + (r.height - len(lines) * step + leading) // 2
+            left, right = r.right, r.left
+            for i, line in enumerate(lines):
+                width = qd.text_width(port, line)
+                x = r.left + (r.width - width) // 2 if centered else h
+                left, right = min(left, x), max(right, x + width)
+                port.pn_loc = Point(top + i * step + ascent, x)
+                qd.draw_text(port, line, Region.rect(c.rect))
+            return Rect(top, left, top + len(lines) * step - leading, right)
         finally:
             port.pn_loc, port.tx_font, port.tx_face, port.tx_size, port.tx_mode = saved
 

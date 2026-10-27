@@ -249,6 +249,14 @@ class EventQueue:
         with self._cond:
             self._cond.notify_all()
 
+    def nap(self, seconds: float) -> None:
+        """Wait seconds, or until an event comes or the queue's woken."""
+        with self._cond:
+            if not self._killed:
+                self._cond.wait(seconds)
+        if self._killed:
+            raise ProcessKilled()
+
     def kill(self) -> None:
         with self._cond:
             self._killed = True

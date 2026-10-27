@@ -3,7 +3,9 @@ The machine: guest RAM and how it's divided up.
 
     $000000  low-memory globals
     $003000  the system heap: the Window Manager port, the desktop region,
-             the System file's resource map and its resources
+             the System file's resource map and its resources.  It
+             starts at 256K and grows as it needs to, up to where the
+             partitions start
     $100000  application partitions, one per running application
     top      the screen buffer: 1 bit a pixel, or on a Mac II with Color
              QuickDraw as many as its depth (see gdevice)
@@ -22,7 +24,7 @@ import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from ..macfile import MacFile
+from ..macfile import MacFile, fonts_beside
 from ..memory import ADDRESS_MASK, RAM, from_mac, to_mac
 from ..resfork import (InvalidForkError, build_fork, open_fork, resCompressed, resLocked,
                        resSysHeap, restype)
@@ -59,7 +61,17 @@ ROM_BASE, ROM_SIZE = RAM_SIZE, 0x1000
 EMPTY_END = 0xC00000
 SYS_HEAP_START = 0x3000
 SYS_HEAP_END = SYS_HEAP_START + 0x80000
+# A real System 7's System heap grows as it's needed ("the system heap
+# expands dynamically to meet your request", Inside Macintosh: Memory,
+# "Allocating Memory at Startup Time"), and its fonts and what programs
+# load into it take more of it: with one it may grow to 1.5 MB, and
+# applications' partitions start above that.  HomePublisher's segments
+# all go in the System heap.  macrt's own System keeps to 512K, so that
+# the first application's heap starts under 1 MB (below).
+SYS7_HEAP_END = SYS_HEAP_START + 0x180000
+SYS_HEAP_INITIAL = 0x40000      # the System heap's size before it grows
 FONT_ROOM = 0x20000             # how much of a disk's System's fonts it adds
+FOLDER_FONT_ROOM = 0x30000      # how much of a real System's Fonts folder's it adds
 # Drivers a disk's System file has that macrt doesn't take from it, or
 # load from any System file when a program opens one: those it answers
 # itself (the printer's, the disk's, the sound's and the serial ports')
@@ -75,7 +87,7 @@ APPLE_SYSTEM_TYPES = frozenset(restype(kind) for kind in (
     "PAT#", "PDEF", "PICT", "PREC", "PRC0", "PRC3", "PTCH", "SERD", "SICN", "STR ", "STR#",
     "WDEF", "actb", "atlk", "boot", "cctb", "cdev", "cicn", "clut", "crsr", "dctb", "fctb",
     "finf", "gama", "ictb", "itl0", "itl1", "itl2", "itl4", "itlb", "itlc", "lmgr", "mcky",
-    "mctb", "mitq", "pltt", "ppat", "ptch", "snd ", "sysz", "wctb"))
+    "mctb", "mitq", "pltt", "ppat", "ptch", "scrn", "snd ", "sysz", "wctb"))
 # The resource IDs a control panel owns ('cdev' -4064's), in its own file
 # and in the System file.
 CONTROL_PANEL_IDS = range(-4064, -4032)
@@ -94,9 +106,12 @@ CLASSIC_END = 0x80000           # the top of a Mac 512K's RAM, over the screen
 # 1986 write them there: Apache Strike's flight.  Here those are the classic
 # screens, and applications' partitions keep out from under them.
 PLUS_SCREENS, PLUS_SCREENS_END = 0x3F2000, 0x400000
+PLUS_SCREEN = 0x3FA700          # the main one there
 # An application launched with the alternate screen has its A5 world under
 # the alternate screen and sound buffers, and BufPtr still over them:
 # MacRacquetball launches itself again until BufPtr is that far over A5.
+# Unless its partition ends right under the Plus's screens, the top
+# ALTERNATE_ROOM of it stands for them.
 ALTERNATE_ROOM = 0x8000
 DEPTHS = (1, 2, 4, 8, 16, 32)  # bits a pixel the screen may have, with Color QuickDraw
 COLOR_DEPTH = 8                 # and has, unless it's told otherwise
@@ -130,11 +145,16 @@ class Model:
     hardware: int
     color: bool = False     # Color QuickDraw, and a screen of more than one bit a pixel
     slots: bool = False     # NuBus slots: the Slot Manager's VBL calls, the Start Manager's video
+    # The ROM's Toolbox trap table's entries: 512 in the 128K ROM, from
+    # $C00 to $13FF, whose dispatcher takes a Toolbox trap number from
+    # bits 0-8 of the word, bit 9 being "reserved for future use" (Inside
+    # Macintosh I and IV, Using Assembly Language).
+    toolbox_traps: int = 1024
 
 
 MODELS = {
     "plus": Model("Macintosh Plus", 0, False, gestalt=4, environs=2, rom=0x0075, keyboard=3,
-                  hardware=0x91),
+                  hardware=0x91, toolbox_traps=512),
     "ii": Model("Macintosh II", 2, True, gestalt=6, environs=4, rom=0x0178, keyboard=5,
                 hardware=0x9B, color=True, slots=True),
 }
@@ -164,13 +184,16 @@ class Partition:
     stack_base: int
     world: World
     vbl_task: int = 0       # the System's own task in its VBL queue
+    # Where its QuickDraw has the screen, if not where the screen is:
+    # another way to it (see System.screen_of).
+    screen_base: int = 0
+    # The A5 an InitGraf at another A5 moved QuickDraw's globals from; a
+    # trap with A5 back at it moves them back (see Runner._trap).
+    left_a5: int = 0
 
 
-def system_version(f: MacFile | None) -> int:
-    """The System version to give, with f the System file in use or on
-    the applications' disk: its 'vers' 1's, as System 7.5's own utilities
-    look for 7.5, but never earlier than SYSTEM_VERSION (macrt is a System
-    7) or later than LAST_SYSTEM_7."""
+def file_version(f: MacFile | None) -> int:
+    """The version f's 'vers' 1 gives, as $0755 for 7.5.5; 0 if it has none."""
     try:
         fork = open_fork(f.rsrc) if f is not None else None
     except InvalidForkError:
@@ -178,9 +201,18 @@ def system_version(f: MacFile | None) -> int:
     vers = next((fork.raw(e) for e in fork.entries
                  if e.type == b"vers" and e.id == 1 and not e.attrs & resCompressed),
                 b"") if fork is not None else b""
-    if len(vers) < 2:
+    return int.from_bytes(vers[:2], "big") if len(vers) >= 2 else 0
+
+
+def system_version(f: MacFile | None) -> int:
+    """The System version to give, with f the System file in use or on
+    the applications' disk: its 'vers' 1's, as System 7.5's own utilities
+    look for 7.5, but never earlier than SYSTEM_VERSION (macrt is a System
+    7) or later than LAST_SYSTEM_7."""
+    vers = file_version(f)
+    if not vers:
         return SYSTEM_VERSION
-    return min(max(int.from_bytes(vers[:2], "big"), SYSTEM_VERSION), LAST_SYSTEM_7)
+    return min(max(vers, SYSTEM_VERSION), LAST_SYSTEM_7)
 
 
 def init_pack(rm: ResourceManager, n: int) -> None:
@@ -203,7 +235,7 @@ class System:
                  menu_bar_height: int = 20, system_file: MacFile | None = None,
                  disk_system: MacFile | None = None, disk_fonts: Sequence[MacFile] = (),
                  speed: float | None = None, model: str = "plus", sound: Sequence = (),
-                 depth: int | None = None):
+                 depth: int | None = None, row_bytes: int | None = None):
         """system_file: a real System file to use in place of macrt's own.
         disk_system: the System file on the disk the applications come
         from, whose fonts macrt's own adds (see _disk_fonts), and
@@ -213,7 +245,12 @@ class System:
         fast as it goes.  model: which of MODELS it says it is.  sound:
         where the speaker's sound goes, if anywhere (macrt.m68k.sound's
         Speaker).  depth: the screen's bits a pixel, on a model with Color
-        QuickDraw (COLOR_DEPTH if not given); 1 on one without."""
+        QuickDraw (COLOR_DEPTH if not given); 1 on one without.  row_bytes:
+        how many bytes apart the screen's rows are at that depth, and at
+        another in proportion to its bits a pixel, as if the screen's
+        memory were that many pixels wider than shows (as few as a row
+        needs, if not given), for a program that takes them to be so many
+        rather than asking."""
         w, h = screen_size
         self.speed = speed
         self.sound = list(sound)
@@ -224,15 +261,19 @@ class System:
         if depth not in DEPTHS or (depth != 1 and not self.model.color):
             raise ValueError(f"a {self.model.name}'s screen can't be {depth} bits a pixel")
         self.depth = depth
+        self._width, self._row_bytes = w, (row_bytes or 0, depth)
+        if row_bytes is not None and (row_bytes & 1 or not 0 < row_bytes < 0x4000):
+            raise ValueError(f"a screen's rows can't be {row_bytes} bytes apart")
         self.mem = mem = RAM(RAM_SIZE + ROM_SIZE)
         self.lock = threading.RLock()
-        row_bytes = (w * depth + 15) // 16 * 2
+        row_bytes = self.row_bytes_for(depth)
         # Applications' partitions start where the System heap stops, or
         # over the classic screen, as on a Mac: the first one's heap starts
-        # under 1 MB.  Excel 1.0 keeps itself to the first megabyte, and
-        # can't start if none of its heap is there.
+        # under 1 MB, unless a real System 7's heap has room to grow
+        # (SYS7_HEAP_END).  Excel 1.0 keeps itself to the first megabyte,
+        # and can't start if none of its heap is there.
         self._reserved: list[tuple[int, int]] = []      # what partitions keep out of
-        classic = (w, h) == CLASSIC_SIZE and depth == 1
+        classic = (w, h) == CLASSIC_SIZE and depth == 1 and row_bytes == w // 8
         if classic:
             base, sys_heap_end = CLASSIC_SCREEN, CLASSIC_ALTERNATE
             self.partitions_start, self.partitions_end = CLASSIC_END, RAM_SIZE
@@ -242,7 +283,10 @@ class System:
             base = (RAM_SIZE - row_bytes * h) & ~3
             if base < SYS_HEAP_END + DEFAULT_PARTITION:
                 raise ValueError(f"a {w}x{h} screen leaves no room for applications")
-            sys_heap_end = self.partitions_start = SYS_HEAP_END
+            sys_heap_end = SYS_HEAP_END
+            if file_version(system_file) >= 0x0700 and base >= SYS7_HEAP_END + DEFAULT_PARTITION:
+                sys_heap_end = SYS7_HEAP_END
+            self.partitions_start = sys_heap_end
             self.partitions_end = base
         self.screen_bits = BitMap(base, row_bytes, Rect(0, 0, h, w))
         self.screen_room = row_bytes * h               # what a deeper screen has to fit in
@@ -251,7 +295,8 @@ class System:
         # What the heaps' blocks' sizes are multiples of, as the model's
         # Memory Manager has them: 2 on a 68000, 4 on a 68020 and later.
         self.align = 2 if self.model.cpu == 0 else 4
-        self.sys_heap = Heap(mem, SYS_HEAP_START, sys_heap_end, align=self.align)
+        self.sys_heap = Heap(mem, SYS_HEAP_START, SYS_HEAP_START + SYS_HEAP_INITIAL,
+                             sys_heap_end, align=self.align)
         # Room at the bottom of the System heap for the Device Manager's
         # unit table and drivers' device control entries, which a Mac makes
         # there at startup: macrt.m68k.glue_devices has it.
@@ -302,6 +347,17 @@ class System:
         # after its own menus; the display gives it its items.
         self.application_menu = MenuInfo.new(self, self.sys_heap, kApplicationMenuID, "")
 
+    def row_bytes_for(self, depth: int) -> int:
+        """How many bytes apart the screen's rows are at a depth: as many
+        as a row needs, or as many as asked for (row_bytes) at the depth
+        it was asked for at, in proportion, if more."""
+        asked, at = self._row_bytes
+        return max((self._width * depth + 15) // 16 * 2, (-(-asked * depth // at) + 1) & ~1)
+
+    def fits(self, depth: int) -> bool:
+        """Whether the screen's buffer has room for it at a depth."""
+        return self.row_bytes_for(depth) * self.screen_bits.bounds.height <= self.screen_room
+
     def set_depth(self, depth: int, gray: bool = False) -> bool:
         """Change the screen's bits a pixel, as its video card's driver
         changes mode (glue_video): to a depth whose buffer fits where the
@@ -311,9 +367,8 @@ class System:
         if the screen can't be that deep, or there's no Color QuickDraw."""
         devices = self.devices
         bits = self.screen_bits
-        w, h = bits.bounds.width, bits.bounds.height
-        row_bytes = (w * depth + 15) // 16 * 2
-        if devices is None or depth not in DEPTHS or row_bytes * h > self.screen_room:
+        row_bytes = self.row_bytes_for(depth)
+        if devices is None or depth not in DEPTHS or not self.fits(depth):
             return False
         with self.lock:
             if not devices.set_depth(depth, row_bytes, gray):
@@ -354,6 +409,13 @@ class System:
                 else:
                     port.bk_color = value
 
+    def wmgr_port_kept(self) -> bool:
+        """Whether the Window Manager port is still there, not closed or
+        disposed of."""
+        old = getattr(self, "_wmgr", None)
+        return (old is not None and self.ports.get(old.addr) is old
+                and self.sys_heap.is_ptr(old.addr))
+
     def open_wmgr_port(self) -> None:
         """Make the Window Manager port, at startup and again for InitWindows
         when a program has thrown the last one away; with Color QuickDraw,
@@ -384,13 +446,29 @@ class System:
         switched globals that describe them.  A 68k application's CODE 0
         says how big its A5 world is, and its own InitGraf call sets up
         its QuickDraw globals; for a Python one they're set up here.
-        alternate is for one launched with the alternate screen: the top
+        alternate is for one launched with the alternate screen: with the
+        classic screen, its partition ends right under the Plus's screens
+        if there's room, and its ScrnBase and BufPtr are the main screen
+        there, over the alternate buffers, as on a Mac Plus with 4 MB:
+        Arkanoid's demo stops unless BufPtr is ScrnBase.  Else the top
         ALTERNATE_ROOM of the partition stands for the alternate buffers,
-        between its A5 world and BufPtr."""
+        between its A5 world and BufPtr, which is the Plus's screen still
+        if the partition is under it (Arkanoid launches its game from a
+        partition there), else the partition's end."""
         with self.lock:
-            start = self._room_for(size)
+            start = self._under_plus_screens(size) if alternate else None
+            if start is None:
+                start = self._room_for(size)
+                top = start + size - (ALTERNATE_ROOM if alternate else 0)
+            else:
+                top = start + size
             end = start + size
-            a5 = (end - (ALTERNATE_ROOM if alternate else 0) - above_a5) & ~3
+            screen_base = buf_ptr = self.screen_bits.base
+            if alternate:
+                buf_ptr = end
+                if self.alternate_screen is not None and end <= PLUS_SCREENS:
+                    screen_base = buf_ptr = PLUS_SCREEN
+            a5 = (top - above_a5) & ~3
             # Exactly below_a5 under A5, not rounded: start-up code that
             # fills the globals from DATA and ZERO resources copies from
             # CurStackBase until it reaches A5, and runs on past it if the
@@ -402,6 +480,10 @@ class System:
                                   f"its globals and stack leave no room for a heap")
             self.mem.fill(appl_limit, end - appl_limit)
             world = World(self.mem)
+            if not qd_globals:
+                # QuickDraw and the Window Manager not set up yet, for the
+                # application to do (Burtonia sets up the Toolbox only then).
+                world.write(lowmem.WWExist, b"\xff\xff")      # and QDExist
             # The heap starts small and grows toward ApplLimit as it's
             # needed, or all at once when the application calls MaxApplZone.
             heap = Heap(self.mem, start, start + INITIAL_HEAP, appl_limit,
@@ -409,13 +491,12 @@ class System:
                         align=self.align, more_mast=APPL_MASTERS)
             if qd_globals:
                 the_port = a5 - 4
-                init_qd_globals(self.mem, the_port, self.screen_bits)
+                init_qd_globals(self.mem, the_port, self._screen_at(screen_base))
                 self.mem.w32(a5, the_port)              # what InitGraf leaves in 0(A5)
-            buf_ptr = end if alternate else self.mem.r32(lowmem.ScrnBase)
             for addr, value in ((lowmem.ApplZone, start), (lowmem.TheZone, start),
                                 (lowmem.HeapEnd, heap.end), (lowmem.ApplLimit, appl_limit),
                                 (lowmem.CurStackBase, stack_base), (lowmem.CurrentA5, a5),
-                                (lowmem.BufPtr, buf_ptr)):
+                                (lowmem.BufPtr, buf_ptr), (lowmem.ScrnBase, screen_base)):
                 world.w32(addr, value)
             app_name = to_mac(name)[:31]
             world.write(lowmem.CurApName, bytes([len(app_name)]) + app_name.ljust(31, b"\0"))
@@ -428,11 +509,25 @@ class System:
             world.write(lowmem.VBLQueue, struct.pack(">HII", 0, vbl, vbl))
             if self.devices is not None:
                 world.w32(lowmem.TheGDevice, self.devices.main)
-            part = Partition(name, start, end, heap, a5, stack_base, world, vbl)
+            part = Partition(name, start, end, heap, a5, stack_base, world, vbl,
+                             screen_base if screen_base != self.screen_bits.base else 0)
             self._partitions.append(part)
             self._partitions.sort(key=lambda p: p.start)
             self._bound_temp_zone()
             return part
+
+    def screen_of(self, process) -> BitMap:
+        """The screen as process's QuickDraw has it, for screenBits and
+        the ports it opens: at its partition's ScrnBase, which under the
+        Plus's screens is $3FA700, another way to the classic screen, as
+        on a Mac Plus with 4 MB.  Yeager's AFT launches itself again until
+        its A5 world is under screenBits.baseAddr less $8000."""
+        part = getattr(process, "partition", None)
+        return self._screen_at(part.screen_base if part is not None else 0)
+
+    def _screen_at(self, base: int) -> BitMap:
+        bits = self.screen_bits
+        return BitMap(base, bits.row_bytes, bits.bounds) if base else bits
 
     def close_partition(self, part: Partition) -> None:
         with self.lock:
@@ -464,6 +559,16 @@ class System:
         if at + size > self.partitions_end:
             raise MemoryError(f"no room for a {size // 1024}K partition")
         return at
+
+    def _under_plus_screens(self, size: int) -> int | None:
+        """Where a partition of size can start to end under the Plus's
+        screens, if they're the classic screens and nothing's in the way."""
+        start = PLUS_SCREENS - size
+        if self.alternate_screen is None or start < self.partitions_start:
+            return None
+        if any(s < PLUS_SCREENS and e > start for s, e in self._taken()):
+            return None
+        return start
 
     def largest_free(self) -> int:
         """The biggest partition open_partition could make now, in whole K."""
@@ -577,7 +682,9 @@ class System:
         """The System file's map heads every application's resource chain
         at the bottom.  Without a real one, one with only what sysres
         gives it and the definition procedures, and the fonts and drivers
-        of disk_system's, and the fonts of disk_fonts', that it hasn't."""
+        of disk_system's, and the fonts of disk_fonts', that it hasn't.
+        A real one gets the fonts of the Fonts folder beside it."""
+        real = f is not None
         f = f or MacFile(SYSTEM_FILE, rsrc=build_fork([]), key="<system>")
         name = to_mac(SYSTEM_FILE)
         self.mem.write(lowmem.SysResName, bytes([len(name)]) + name)
@@ -594,6 +701,10 @@ class System:
         m = self.sys_map
         self._add_system_resources([r for r in sysres.standard()
                                     if m.find(restype(r[0]), r[1]) is None])
+        # On a Mac II, the screen as it starts up, as the Control Panel
+        # would have left it ('scrn' 0).
+        if self.devices is not None and m.find(restype("scrn"), 0) is None:
+            self._add_system_resources([("scrn", 0, self.devices.scrn())])
         if all(next(m.entries(restype(kind)), None) is None for kind in ("FOND", "FONT", "NFNT")):
             self._add_system_resources(sysres.fonts())      # a real System file brings its own
             if disk_system is not None:
@@ -604,6 +715,8 @@ class System:
                         self.font_lines.setdefault(key, lines)
                 self._add_system_resources(self._disk_drivers(disk_system))
                 self._add_system_resources(self._disk_tables(disk_system))
+        if real:
+            self._add_system_resources(self._folder_fonts(fonts_beside(f)), replace=True)
         # The printer is macrt's whatever the System file says: its own
         # printer file's code would drive a serial port.
         name = to_mac(printing.PRINTER_NAME)
@@ -655,6 +768,46 @@ class System:
                     name = [e.name.decode("mac_roman")] if e.name else []
                     fonts.append((e.type.decode("mac_roman"), e.id, data, *name))
         return fonts
+
+    def _folder_fonts(self, files: Sequence[MacFile]) -> list[tuple]:
+        """The fonts in files, the suitcases in the Fonts folder beside a
+        real System file, up to FOLDER_FONT_ROOM's worth: their FONDs, in
+        place of the System file's of the same families, and then the
+        strikes these list and the suitcases' FONTs, those of families
+        host fonts don't stand in for first, as they're drawn from them.
+        System 7.5's System file has Geneva 9 and 12, and its Fonts
+        folder's Geneva the other sizes and the FOND that lists them all:
+        HyperCard Player's stacks ask for Geneva 10 and 14, and for
+        Courier and Helvetica by name.  Their outline fonts, the 'sfnt's,
+        aren't taken, as host fonts draw the standard families at any
+        size."""
+        fonds, strikes = [], []
+        for f in files:
+            try:
+                fork = open_fork(f.rsrc)
+            except InvalidForkError:
+                continue
+            entries = [e for e in fork.entries if not e.attrs & resCompressed]
+            families = [e for e in entries if e.type == b"FOND"]
+            listed = {rid: e.id for e in families for rid in fond_ids(fork.raw(e))}
+            fonds += [(fork, e) for e in families]
+            for e in entries:
+                if e.type in (b"FONT", b"NFNT") and (e.type == b"FONT" or e.id in listed):
+                    family = listed.get(e.id, font_family(e.id))
+                    strikes.append((family in sysres.FONTS, fork, e))
+        strikes.sort(key=lambda s: s[0])
+        found, room, taken = [], FOLDER_FONT_ROOM, set()
+        for fork, e in fonds + [s[1:] for s in strikes]:
+            if (e.type, e.id) in taken or (e.type != b"FOND"
+                                           and self.sys_map.find(e.type, e.id) is not None):
+                continue
+            data = fork.raw(e)
+            if len(data) <= room:
+                room -= len(data)
+                taken.add((e.type, e.id))
+                found.append((e.type.decode("mac_roman"), e.id, data,
+                              *([e.name.decode("mac_roman")] if e.name else [])))
+        return found
 
     def _disk_font_lines(self, f: MacFile) -> dict[tuple[int, int], tuple[int, int, int]]:
         """The ascent, descent and leading of the strikes of the standard

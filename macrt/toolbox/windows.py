@@ -79,7 +79,11 @@ AUX_CTL_SIZE = 22
 
 def aux_wins(mem: RAM, head: int = AuxWinHead) -> Iterator[int]:
     """The handles in the auxiliary window (or control) list, in order."""
-    h, seen = mem.r32(head) & ADDRESS_MASK, set()
+    return _aux_list(mem, mem.r32(head))
+
+
+def _aux_list(mem: RAM, h: int) -> Iterator[int]:
+    h, seen = h & ADDRESS_MASK, set()
     while h and h not in seen:
         seen.add(h)
         p = mem.r32(h) & ADDRESS_MASK
@@ -96,6 +100,41 @@ def find_aux_win(mem: RAM, window: int, head: int = AuxWinHead) -> int:
         if (mem.r32((mem.r32(h) & ADDRESS_MASK) + 4) ^ window) & ADDRESS_MASK == 0:
             return h
     return 0
+
+
+def table_colors(mem: RAM, ct: int) -> dict[int, tuple[int, int, int]]:
+    """A window or control colour table's colours, by part: the first
+    entry of each part's.  In order, so the first is the table's first
+    colour, the one a part the table hasn't is drawn in (Inside
+    Macintosh V, the Window Manager)."""
+    ct &= ADDRESS_MASK
+    p = mem.r32(ct) & ADDRESS_MASK if ct else 0
+    if not p:
+        return {}
+    n = mem.r16(p + 6) + 1 & 0xFFFF
+    out: dict[int, tuple[int, int, int]] = {}
+    for i in range(min(n, 64)):
+        e = p + 8 + 8 * i
+        out.setdefault(mem.r16(e), (mem.r16(e + 2), mem.r16(e + 4), mem.r16(e + 6)))
+    return out
+
+
+def window_colors(mem: RAM, world: World, window: int) -> dict[int, tuple[int, int, int]]:
+    """The colours a window's frame and content are drawn in, by part: its
+    auxiliary record's table's or, if it has none, the default record's,
+    from the list its application has (world's AuxWinHead, as it is while
+    another application runs).  Empty if the list has neither."""
+    found = 0
+    for h in _aux_list(mem, world.r32(AuxWinHead)):
+        owner = mem.r32((mem.r32(h) & ADDRESS_MASK) + 4) & ADDRESS_MASK
+        if owner == window & ADDRESS_MASK:
+            found = h
+            break
+        if not owner and not found:
+            found = h                   # the default, at the end
+    if not found:
+        return {}
+    return table_colors(mem, mem.r32((mem.r32(found) & ADDRESS_MASK) + 8))
 
 
 def unlink_aux_win(mem: RAM, h: int, head: int = AuxWinHead) -> None:
@@ -138,6 +177,7 @@ class WindowRecord(GrafPort):
         self.dialog = None              # the Dialog Manager's DialogState, for a dialog
         self._proc_id: tuple[int, int, bool] | None = None  # (windowDefProc, procID, own)
         self.saved_vis: tuple[Region, Rect] | None = None   # BeginUpdate's: the visRgn, portRect
+        self.updates_begun = 0          # its BeginUpdates so far
         # A window with a WDEF of the application's own (see own_wdef) has
         # the regions its wCalcRgns worked out once it has run, and the
         # frame its wDraw drew: (left, top, image), its top left relative
@@ -159,9 +199,10 @@ class WindowRecord(GrafPort):
         rec = cls(system, process, heap, addr)
         rec.owns_storage = not storage
         system.mem.fill(addr, cls.SIZE)
+        screen = system.screen_of(process)
         if not color:
-            rec.open(heap, system.screen_bits)
-        elif not rec.open_color(heap, system.screen_bits):
+            rec.open(heap, screen)
+        elif not rec.open_color(heap, screen):
             if rec.owns_storage:
                 heap.dispose_ptr(addr)
             return None
@@ -250,25 +291,36 @@ class WindowRecord(GrafPort):
 
     def calc_vis(self) -> None:
         """The visRgn, as CalcVis works it out: the port's rectangle,
-        without what of the menu bar isn't desk.  A program that hides the
-        bar puts it in GrayRgn and has the visRgns worked out again."""
+        without what of the menu bar isn't desk, and without what's too far
+        from the screen to be seen, which the Backing doesn't keep (the
+        visRgn is what of the port "is actually visible on the screen",
+        Inside Macintosh I, QuickDraw).  A program that hides the bar puts
+        it in GrayRgn and has the visRgns worked out again.  HyperCard 2.0
+        makes its card window at (16384, 16384), and on a Plus copies the
+        card to the screen itself, clipped to the visRgn, before it moves
+        the window onto the screen."""
         b = self.port_bits_bounds
-        hidden = self.system.screen.bar_hidden().offset(b.left, b.top).sect(
-            Region.rect(self.port_rect))
+        rect = self.port_rect.sect(self._seen().offset(b.left, b.top))
+        hidden = self.system.screen.bar_hidden().offset(b.left, b.top).sect(Region.rect(rect))
         if hidden.empty:
-            set_rect_rgn(self.heap, self.vis_rgn, self.port_rect)
+            set_rect_rgn(self.heap, self.vis_rgn, rect)
         else:
-            write_rgn(self.heap, self.vis_rgn, Region.rect(self.port_rect).diff(hidden))
+            write_rgn(self.heap, self.vis_rgn, Region.rect(rect).diff(hidden))
+
+    def _seen(self) -> Rect:
+        """Where a window can be seen (global): within a screen's width
+        and height of the screen.  The rest can't be seen without coming
+        nearer first."""
+        s = self.system.screen_bits.bounds
+        return s.inset(-s.width, -s.height)
 
     def kept(self, r: Rect) -> Rect:
         """The part of the content area r whose pixels the window's Backing
-        keeps, relative to r's top left: what lies within a screen's width
-        and height of the screen.  The rest can't be seen without coming
-        nearer first, so a window far bigger than the screen (Excel 3 makes
-        one 30000 pixels wide, nearly all of it off the screen) costs no
-        more than one three screens wide."""
-        s = self.system.screen_bits.bounds
-        seen = r.sect(s.inset(-s.width, -s.height))
+        keeps, relative to r's top left: what can be seen, so a window far
+        bigger than the screen (Excel 3 makes one 30000 pixels wide, nearly
+        all of it off the screen) costs no more than one three screens
+        wide."""
+        seen = r.sect(self._seen())
         return Rect(0, 0, 0, 0) if seen.empty else seen.offset(-r.left, -r.top)
 
     def fit_backing(self, moved: bool = False) -> bool:

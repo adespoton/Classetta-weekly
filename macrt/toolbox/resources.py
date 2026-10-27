@@ -445,22 +445,27 @@ class ResourceManager:
         """Open a file's resource fork through the File Manager and map it.
         A fork opened read-only gets a read-only map.
 
-        A file this application has open already, asked for reading only,
-        is opened again with a map of its own, which can be closed without
-        taking the first (Technotes TB 19 and 1120).  Asked for writing,
-        its map is made current and its number answered (Technote 1120).
-        Asked for whatever it can have, as OpenResFile asks, its number is
-        answered and the current file stays (Inside Macintosh I-115):
-        Font/DA Mover writes to the System file so, though Technote 1120
-        found a later System opening it again, read-only."""
+        A file this application has open already, asked for reading only
+        or for whatever it can have, as OpenResFile asks, is opened again,
+        read-only, with a map of its own, which can be closed without
+        taking the first (Technotes TB 19 and 1120): Tristan Pinball opens
+        its sounds' file each game and looks in it.  Asked for writing, its
+        map is made current and its number answered (Technote 1120).  The
+        System file, asked for whatever it can have, answers its number and
+        the current file stays, as Inside Macintosh I-115 says of any file:
+        Font/DA Mover writes to the System file through that number."""
         with self.system.lock:
             mine = [m for m in self.maps() if self._file(m).node is node]
-            if mine and perm != fsRdPerm:
+            if perm == fsCurPerm and any(m.refnum == self.sys_refnum for m in mine):
+                self.error = noErr
+                return self.sys_refnum
+            if mine and perm not in (fsRdPerm, fsCurPerm):
                 m = next((m for m in mine if self._file(m).fcb.write), mine[0])
-                if perm != fsCurPerm:
-                    self.world.w16(lowmem.CurMap, m.refnum)
+                self.world.w16(lowmem.CurMap, m.refnum)
                 self.error = noErr
                 return m.refnum
+            if mine:
+                perm = fsRdPerm
             if not node.fork(True):
                 self.error = eofErr
                 return -1
@@ -592,6 +597,18 @@ class ResourceManager:
             e = self._entry(h)
             self.error = noErr if e else resNotFound
             return e.map.refnum if e else -1
+
+    def RsrcMapEntry(self, h: int) -> int:
+        """The offset of h's reference list entry from the start of its
+        file's map in memory: 0 and resNotFound if h isn't a resource.
+        Inside Macintosh gives nothing in particular for NIL, but noErr."""
+        with self.system.lock:
+            if not h & ADDRESS_MASK:
+                self.error = noErr
+                return 0
+            e = self._entry(h)
+            self.error = noErr if e else resNotFound
+            return e.at if e else 0
 
     def ResError(self) -> int:
         return self.error
@@ -1041,12 +1058,13 @@ class ResourceManager:
     # =====================================================================
     def AddResource(self, h: int, rtype: ResType, rid: int, name: str = "") -> None:
         """Make h a resource in the current file.  It's written out by
-        UpdateResFile or CloseResFile."""
+        UpdateResFile or CloseResFile.  A read-only file takes it too: its
+        map changes in memory and nothing's written."""
         with self.system.lock:
             rtype = restype(rtype)
             m = self._map(self.cur_map)
             ok = (m is not None and h and self.system.heap_of(h).is_handle(h)
-                  and self._entry(h) is None and not m.attrs & mapReadOnly)
+                  and self._entry(h) is None)
             if not ok:
                 self.error = addResFailed
                 return

@@ -96,6 +96,7 @@ class Heap:
         self._handles: set[int] = set()
         self._masters: set[int] = set()                 # every master pointer MoreMasters made
         self._borrowed: set[int] = set()               # master pointers a program made itself
+        self._bk_seen = self.end                        # the bkLim last read back
         mem.fill(start, ZONE_HEADER)
         mem.w32(start, self.end)                        # bkLim
         # Multiplan calls MoreMasters until it has as many master pointers
@@ -111,9 +112,10 @@ class Heap:
         with self._lock:
             return {data: size for data, (_, size, _) in self._blocks.items()}
 
-    def free_bytes(self) -> int:
-        """FreeMem: what's free, counting what the zone could still grow by."""
-        return sum(n for _, n in self._free) + self.room_to_grow()
+    def free_bytes(self, grow: bool = True) -> int:
+        """What's free, counting what the zone could still grow by, or, if
+        grow is False, only its free blocks: zcbFree, which FreeMem returns."""
+        return sum(n for _, n in self._free) + (self.room_to_grow() if grow else 0)
 
     def max_block(self, grow: bool = True) -> int:
         """MaxBlock: the largest block that could be allocated now, the
@@ -175,6 +177,10 @@ class Heap:
                 return
             self._release(p & ADDRESS_MASK)
             self.error = noErr
+
+    def is_ptr(self, p: int) -> bool:
+        with self._lock:
+            return self._kind(p) == NONRELOCATABLE
 
     def ptr_size(self, p: int) -> int:
         with self._lock:
@@ -301,18 +307,33 @@ class Heap:
             return self._block(data)[1] if data else 0
 
     def set_handle_size(self, h: int, size: int) -> bool:
+        """SetHandleSize.  A block with no room to grow in place moves, if
+        it's unlocked, before the blocks after it are moved out of its way:
+        SetHandleSize "might need to move the relocatable block", and it's
+        a locked one whose growth the blocks around it can stop (Inside
+        Macintosh: Memory).  Mac'N Med Engine unloads the segment it's
+        running in, then grows its Apple menu, just below it, with
+        AppendResMenu."""
         with self._lock:
             data = self._handle_data(h)
             if not data:
                 return False
-            if self._resize_in_place(data, size):
+            flags = self.mem.r8(h)
+            if self._resize_in_place(data, size, clear=bool(flags & LOCKED)):
                 self.error = noErr
                 return True
-            flags = self.mem.r8(h)
             if flags & LOCKED:
                 self.error = memFullErr
                 return False
-            new = self._alloc(size, RELOCATABLE, (h & ADDRESS_MASK) - self.start)
+            link = (h & ADDRESS_MASK) - self.start
+            new = self._fit(size, RELOCATABLE, link)
+            if not new and self.room_to_grow():
+                self.grow_for(size)
+                new = self._fit(size, RELOCATABLE, link)
+            if not new and self._resize_in_place(data, size):
+                self.error = noErr
+                return True
+            new = new or self._alloc(size, RELOCATABLE, link)
             if not new:
                 self.error = memFullErr
                 return False
@@ -476,10 +497,16 @@ class Heap:
 
     def _check_free(self) -> None:
         """Read the zone back from its headers if a program has written
-        over a free block's, before what's free is merged or used:
-        Macintosh Pascal moves its handles to the top of the zone itself,
-        taking the room from the free block below them."""
-        if any(self.mem.r32(addr) != size for addr, size in self._free):
+        over a free block's or moved bkLim, before what's free is merged or
+        used: Macintosh Pascal moves its handles to the top of the zone
+        itself, taking the room from the free block below them, and PackIt
+        III, taking a Mac II's ROM85 for an old ROM's, grows the zone itself
+        as programs for the 64K ROM did, with a free block where it ended
+        and bkLim and HeapEnd past that."""
+        bk_lim = self._bk_lim()
+        if ((bk_lim != self.end and bk_lim != self._bk_seen)
+                or any(self.mem.r32(addr) != size for addr, size in self._free)):
+            self._bk_seen = bk_lim
             self._rescan()
 
     def _bk_lim(self) -> int:
@@ -809,14 +836,21 @@ class Heap:
         room has one that can't, as is found before any moves.  The blocks
         are read back from their headers first if a program has made its
         own in one of ours: Microsoft File reads its p-code file, laid out
-        as blocks, over the one it gets with ReallocHandle, headers and all."""
+        as blocks, over the one it gets with ReallocHandle, headers and all.
+        The zone grows toward its limit for the room and for the blocks
+        that move: Starter Accounts' BASIC runtime grows its locked program
+        handle, an unlocked handle after it, for its workspace."""
         mem, end = self.mem, addr
         in_way = []
+        last_free = False
         while end < addr + room:
             if end >= self.end:
-                return False
+                old = self.end
+                self.grow(max(addr + room, self.end + GROW_STEP))
+                return self.end > old and self._clear_after(addr, room, rescanned)
             i = bisect.bisect_left(self._free, [end, 0])
-            if i < len(self._free) and self._free[i][0] == end:
+            last_free = i < len(self._free) and self._free[i][0] == end
+            if last_free:
                 end += self._free[i][1]
                 continue
             data = end + HEADER
@@ -832,14 +866,27 @@ class Heap:
             end += block[0]
         if not in_way:
             return True
-        # Hold the free blocks in the room back, so nothing moves into it.
-        held = [f for f in self._free if addr <= f[0] < end]
+        # Hold the free blocks in the room back, so nothing moves into it,
+        # but for the part of the last one past the room, where the blocks
+        # in the way can go: HyperCard 2.0 grows a pointer past a handle
+        # with all the rest of the zone free after it.
+        held = [list(f) for f in self._free if addr <= f[0] < end]
         self._free = [f for f in self._free if not addr <= f[0] < end]
+        if last_free:
+            first = held[-1][0]
+            cut = max(addr + room, first + MIN_BLOCK)
+            if end - cut >= MIN_BLOCK:
+                self._free.insert(bisect.bisect_left(self._free, [cut, 0]), [cut, end - cut])
+                self._write_header(cut, FREE, end - cut, 0, 0)
+                held[-1][1], end = cut - first, cut
         self._counted_free(-sum(n for _, n in held))
         for data, h in in_way:
             phys, size, _ = self._blocks[data]
             flags = mem.r8(h)
             new = self._fit(size, RELOCATABLE, h - self.start)
+            if not new and self.room_to_grow():
+                self.grow_for(size)
+                new = self._fit(size, RELOCATABLE, h - self.start)
             if new:
                 mem.move(data, new, size)
                 mem.w32(h, flags << 24 | new)
@@ -853,7 +900,9 @@ class Heap:
             self._add_free(at, n)
         return sum(n for _, n in held) >= end - addr
 
-    def _resize_in_place(self, data: int, size: int) -> bool:
+    def _resize_in_place(self, data: int, size: int, clear: bool = True) -> bool:
+        """Change a block's size where it is; clear, by moving the blocks
+        after it out of the way if it must."""
         self._check_free()
         block = self._block(data)
         phys, _, kind = block
@@ -871,7 +920,7 @@ class Heap:
                 i = bisect.bisect_left(self._free, [nxt, 0])
                 return self._free[i][1] if i < len(self._free) and self._free[i][0] == nxt else 0
             avail = free_after()
-            if phys + avail < need and self._clear_after(nxt, need - phys):
+            if phys + avail < need and clear and self._clear_after(nxt, need - phys):
                 avail = free_after()
             if phys + avail < need and nxt + avail == self.end and self.room_to_grow():
                 self.grow(max(start + need, self.end + GROW_STEP))
