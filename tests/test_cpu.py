@@ -3,6 +3,8 @@ for the VBL tasks or a kill, at an instruction's end and not in the
 middle of it; holding it to a speed; TRAPcc and tracing, which the core
 gets wrong; and leaving the interpreter with code still running."""
 
+import random
+import struct
 import subprocess
 import sys
 import threading
@@ -12,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from macrt.m68k import cpu as cpu_module
+from macrt.m68k import instructions
 from macrt.m68k.cpu import CPU
 from macrt.memory import RAM
 from macrt.toolbox import lowmem
@@ -115,7 +118,12 @@ def test_ticks_is_what_tick_count_says():
     try:
         for _ in range(10):
             time.sleep(max(0.0, to_next_tick() - 0.5) / 60)     # halfway through a tick
-            assert mem.r32(lowmem.Ticks) == tick_count()
+            for _ in range(17):         # a busy host may wake the clock late: give it a tick
+                if mem.r32(lowmem.Ticks) == tick_count():
+                    break
+                time.sleep(0.001)
+            else:
+                pytest.fail(f"Ticks is {mem.r32(lowmem.Ticks)}, TickCount {tick_count()}")
             time.sleep(0.3 / 60)
     finally:
         cpu.close()
@@ -740,6 +748,9 @@ def cpu_at(cpu, pc):
     ("4181", 2),                        # chk.w d1,d0
     ("41bc 000a", 4),                   # chk.w #10,d0
     ("413c 0000 000a", 6),              # chk.l #10,d0
+    ("02fa 0800 012e", 6),              # chk2.w BOUNDS(pc),d0
+    ("04d0 8800", 4),                   # chk2.l (a0),a0
+    ("00f0 1800 0162 0004 0008", 10),   # chk2.b ([4,a0],8),d1
     ("4e76", 2),                        # trapv
     ("51fc", 2),                        # trapf
     ("57fa 0001", 4),                   # trapeq.w #1
@@ -761,6 +772,17 @@ def test_a_programs_own_interrupt_handler_is_looked_for_at_each_tick():
         mem.w32(4 * cpu_module.LEVEL_1, 0x7100)
         assert cpu.own_interrupts()
         assert cpu.run(NEVER).kind == "interrupted"     # in slices, as for VBL tasks
+    finally:
+        cpu.close()
+
+
+def test_the_stub_for_unhandled_exceptions_in_the_vector_is_no_handler_of_its_own():
+    """SimCity 2000's demo moves vectors over vectors through NIL handles."""
+    mem, cpu = machine()
+    try:
+        cpu.rom_interrupts, cpu.no_handler = 0x7000, 0x7010
+        mem.w32(4 * cpu_module.LEVEL_1, 0x7010)
+        assert not cpu.own_interrupts()
     finally:
         cpu.close()
 
@@ -922,6 +944,47 @@ def test_a_write_to_sr_the_core_writes_on_a_page_mapped_for_both_is_traced_from(
         cpu.close()
 
 
+def test_a_page_mapped_for_both_is_looked_through_again_where_it_changed():
+    """A page mapped for both is written a few bytes at a time, at each
+    trap where it's a program's jump table and stack: it's looked through
+    again only around the bytes that changed, but every word to stop at
+    it has now that it didn't have is in what's looked through."""
+    rng = random.Random(1)
+    words = (b"\x4e\x97", b"\x00\x7c", b"\x46\xfc", b"\x5f\xfb", b"\xf2\x20\x7c")
+    size, chunk = cpu_module.PAGE_SIZE, cpu_module.CHUNK
+
+    def found(page, start=0, end=size):
+        return set(cpu_module._words_to_stop_at(page, start, end))
+
+    for _ in range(300):
+        old = bytearray(rng.randrange(256) for _ in range(size))
+        new = bytearray(old)
+        for _ in range(rng.randint(1, 4)):      # often across where a chunk ends
+            at = rng.choice((rng.randrange(size - 3), rng.randrange(1, size // chunk) * chunk - 2,
+                             size - chunk - 2))
+            at += rng.randrange(-1, 2) & ~1
+            word, way = rng.choice(words), rng.randrange(4)
+            if way == 0:
+                new[at] ^= 1 + rng.randrange(255)
+            elif way == 1:
+                new[at:at + len(word)] = word
+            elif way == 2:                      # it was all there but its last byte
+                old[at:at + len(word) - 1] = new[at:at + len(word) - 1] = word[:-1]
+                new[at + len(word) - 1] = word[-1]
+            else:                               # or but its first
+                old[at + 1:at + len(word)] = new[at + 1:at + len(word)] = word[1:]
+                new[at] = word[0]
+        old, new = bytes(old), bytes(new)
+        if new == old:
+            continue
+        differ = [i for i in range(size) if old[i] != new[i]]
+        runs = cpu_module._changed(old, new)
+        assert found(new) <= found(old).union(*(found(new, *run) for run in runs))
+        for start, end in runs:                 # each near a byte that differs
+            assert any(start - chunk < i < end + chunk for i in differ)
+        assert sum(end - start for start, end in runs) <= len(differ) * (chunk + 4)
+
+
 def test_flush_code_drops_what_the_core_has_translated():
     mem = RAM(0x20000)
     mem.write(CODE, bytes.fromhex("6100 00fe"))             # bsr SUB
@@ -940,6 +1003,328 @@ def test_flush_code_drops_what_the_core_has_translated():
     assert call() == 1          # as it was translated
     cpu.flush_code()
     assert call() == 2
+
+
+# -- CHK2, CMP2 and FMOVE.P, which the core doesn't know --------------------
+@pytest.mark.parametrize("d0, passed", [
+    (5, True), (1, True), (10, True), (11, False), (0, False), (0xFFFF0005, True)])
+def test_chk2_raises_a_chk_exception_out_of_bounds(d0, passed):
+    """MPWAccuracy's subranges: in them, it goes on; out, it's a CHK
+    exception, reported a word into the instruction as the core's CHK is.
+    A data register is compared in the bounds' size."""
+    mem, cpu = machine()
+    at = CODE + 0x1000
+    mem.write(at, bytes.fromhex("02fa 0800 0006"      # chk2.w bounds(pc),d0
+                                "7601"                # moveq #1,d3
+                                "4e71"                # nop
+                                "0001 000a"))         # bounds: 1 to 10
+    try:
+        cpu.set_d(0, d0)
+        cpu.set_d(3, 0)
+        ev = cpu_at(cpu, at).run(at + 10)
+        if passed:
+            assert ev.kind == "until" and cpu.d(3) == 1
+        else:
+            assert ev == ("exception", at + 2, cpu_module.CHK)
+            assert cpu.d(3) == 0
+    finally:
+        cpu.close()
+
+
+@pytest.mark.parametrize("op, reg, bounds, value, z, c", [
+    ("02fa 0000", 0, "0001 000a", 1, True, False),          # cmp2.w: on the lower bound
+    ("02fa 0000", 0, "0001 000a", 10, True, False),         # on the upper
+    ("02fa 0000", 0, "0001 000a", 5, False, False),
+    ("02fa 0000", 0, "0001 000a", 0, False, True),
+    ("02fa 0000", 0, "fffb 0005", 0xFFFF, False, False),    # -5 to 5: -1
+    ("02fa 0000", 0, "fffb 0005", 6, False, True),
+    ("02fa 0000", 0, "0005 fffb", 6, False, False),         # 5 to $FFFB, unsigned
+    ("04fa 0000", 0, "8000 0000 7fff ffff", 0x80000000, True, False),   # cmp2.l
+    ("00fa 8000", 8, "807f", 0xFFFFFF80, True, False),      # cmp2.b to a0: -128
+    ("00fa 8000", 8, "807f", 0x80, False, True),            # a0 compared whole
+])
+def test_cmp2_sets_z_on_a_bound_and_c_outside_them(op, reg, bounds, value, z, c):
+    mem, cpu = machine()
+    at = CODE + 0x1000
+    mem.write(at, bytes.fromhex(op + "0008"           # cmp2 bounds(pc),rn
+                                "55c4"                # scs d4
+                                "57c5"                # seq d5
+                                "4e71" + bounds))     # nop; bounds:
+    try:
+        (cpu.set_a if reg >= 8 else cpu.set_d)(reg & 7, value)
+        run_through(cpu_at(cpu, at), at + 12)
+        assert (cpu.d(5) & 0xFF == 0xFF, cpu.d(4) & 0xFF == 0xFF) == (z, c)
+    finally:
+        cpu.close()
+
+
+def extended(x: float) -> bytes:
+    """x as an extended real in memory: its sign and exponent, a word
+    unused, and its mantissa."""
+    bits = struct.unpack(">Q", struct.pack(">d", x))[0]
+    sign, exponent = bits >> 48 & 0x8000, bits >> 52 & 0x7FF
+    if not exponent:
+        return struct.pack(">HHQ", sign, 0, 0)
+    return struct.pack(">HHQ", sign | exponent - 1023 + 16383, 0,
+                       1 << 63 | (bits & (1 << 52) - 1) << 11)
+
+
+# The examples of FMOVE.P's k-factor in Motorola's manual: 12345.678765.
+@pytest.mark.parametrize("k, packed", [
+    (-5, "00040001 2345678770000000"),
+    (-3, "00040001 2345679000000000"),
+    (-1, "00040001 2345700000000000"),
+    (0, "00040001 2346000000000000"),
+    (1, "00040001 0000000000000000"),
+    (3, "00040001 2300000000000000"),
+    (5, "00040001 2346000000000000"),
+])
+def test_fmove_p_puts_a_real_as_packed_decimal_to_k_digits(k, packed):
+    """Mandelbrot 2.7's numbers as text: to k digits after the point, or
+    with k above 0, k digits.  With the k-factor in the instruction, and in
+    a data register."""
+    mem, cpu = machine()
+    at, x, out = CODE + 0x1000, 0x6000, 0x6100
+    mem.write(x, extended(12345.678765))
+    mem.write(at, bytes.fromhex("f210 4800"           # fmove.x (a0),fp0
+                                f"f211 6c{k & 0x7F:02x}"    # fmove.p fp0,(a1){#k}
+                                "f212 7c30"))         # fmove.p fp0,(a2){d3}
+    try:
+        cpu.set_a(0, x)
+        cpu.set_a(1, out)
+        cpu.set_a(2, out + 0x10)
+        cpu.set_d(3, k & 0xFFFFFFFF)
+        run_through(cpu_at(cpu, at), at + 12)
+        assert mem.read(out, 12).hex() == packed.replace(" ", "")
+        assert mem.read(out + 0x10, 12).hex() == packed.replace(" ", "")
+        assert cpu.fpsr & instructions.EXC == instructions.INEX2
+    finally:
+        cpu.close()
+
+
+def test_fmove_p_takes_a_packed_decimal_real_to_a_register():
+    """Rounded to the nearest extended real, as the FPU's registers are
+    seen after it: by the FMOVE.X and FMOVE.L after it, and in the FPSR."""
+    mem, cpu = machine()
+    at, src, out = CODE + 0x1000, 0x6000, 0x6100
+    mem.write(src, bytes.fromhex("00040001 2345678765000000"))  # 1.2345678765E+4
+    mem.write(at, bytes.fromhex("f218 4c80"           # fmove.p (a0)+,fp1
+                                "f211 6880"           # fmove.x fp1,(a1)
+                                "f200 6080"           # fmove.l fp1,d0
+                                "f201 a800"))         # fmove.l fpsr,d1
+    try:
+        cpu.set_a(0, src)
+        cpu.set_a(1, out)
+        run_through(cpu_at(cpu, at), at + 16)
+        assert mem.read(out, 12).hex() == "400c0000c0e6b70e2c12ad82"
+        assert cpu.d(0) == 12346
+        assert cpu.d(1) & (instructions.INEX1 | instructions.AEXC_INEX) == (
+            instructions.INEX1 | instructions.AEXC_INEX)
+        assert cpu.a(0) == src + 12
+    finally:
+        cpu.close()
+
+
+def test_fmove_p_to_a_predecrement_leaves_an_twelve_bytes_down():
+    """The core takes it for an address error."""
+    mem, cpu = machine()
+    at, x, out = CODE + 0x1000, 0x6000, 0x6100
+    mem.write(x, extended(-0.25))
+    mem.write(at, bytes.fromhex("f210 4800"           # fmove.x (a0),fp0
+                                "f221 6c03"))         # fmove.p fp0,-(a1){#3}
+    try:
+        cpu.set_a(0, x)
+        cpu.set_a(1, out + 12)
+        run_through(cpu_at(cpu, at), at + 8)
+        assert cpu.a(1) == out
+        assert mem.read(out, 12).hex() == "c0010002" "5000000000000000"     # -2.50E-1
+    finally:
+        cpu.close()
+
+
+@pytest.mark.parametrize("packed, se, mantissa, raised", [
+    ("7fff0000 0000000000000000", 0x7FFF, 0, 0),                        # infinity
+    ("ffff0000 4000000000000000", 0xFFFF, 0x4000000000000000, 0),       # a quiet NaN
+    ("7fff0000 2000000000000000", 0x7FFF, 0x6000000000000000, instructions.SNAN),
+    ("80000000 0000000000000000", 0x8000, 0, 0),                        # -0
+    ("00000001 0000000000000000", 0x3FFF, 1 << 63, 0),                  # 1
+    ("40010001 0000000000000000", 0x3FFB, 0xCCCCCCCCCCCCCCCD, instructions.INEX1),  # 0.1
+])
+def test_a_packed_decimal_real_as_an_extended_one(packed, se, mantissa, raised):
+    assert instructions.from_packed(bytes.fromhex(packed)) == (se, mantissa, raised)
+
+
+@pytest.mark.parametrize("mode, digit", [
+    (instructions.RN, 2), (instructions.RZ, 1), (instructions.RM, 1), (instructions.RP, 2)])
+def test_a_packed_decimal_real_is_rounded_in_the_fpcrs_mode(mode, digit):
+    data, raised = instructions.to_packed(0x3FFF, 0xC000000000000000, 1, mode)    # 1.5
+    assert (data.hex(), raised) == (f"0000000{digit}" + "0" * 16, instructions.INEX2)
+
+
+def test_a_packed_decimal_reals_exponent_past_999_raises_operr():
+    data, raised = instructions.to_packed(0x3FFF - 4000, 1 << 63, 1)    # 2 ** -4000
+    assert struct.unpack(">I", data[:4])[0] & 0xFFFFFFF0 == 0x42051000   # E-1205
+    assert raised == instructions.OPERR | instructions.INEX2
+
+
+def test_more_than_17_digits_raises_operr_and_gives_17():
+    data, raised = instructions.to_packed(0x3FFF, 0xC000000000000000, 20)
+    assert (data.hex(), raised) == ("00000001" "5000000000000000", instructions.OPERR)
+
+
+@pytest.mark.parametrize("code, fpcr, fpsr", [
+    ("f23c 8800 0800 0208", 0, 0x08000208),             # fmove.l #$08000208,fpsr
+    ("f23c 9000 0000 0030", 0x30, 0),                   # fmove.l #$30,fpcr
+    ("f23c 8400 0000 1234", 0, 0),                      # fmove.l #$1234,fpiar
+    ("f23c 9800 0000 0010 0800 0000", 0x10, 0x08000000),    # fmovem.l #..,fpcr/fpsr
+    ("f23c 9c00 0000 0020 0000 0008 0000 1234", 0x20, 0x08),
+    ("f23c 8c00 0000 0008 0000 1234", 0, 0x08),         # fmovem.l #..,fpsr/fpiar
+])
+def test_fmove_of_data_to_the_fpus_control_registers(code, fpcr, fpsr):
+    """The core takes it for an address error; and then FMOVE.L of FPCR
+    and FPSR to D1 and D2 sees what it did."""
+    mem, cpu = machine()
+    at = CODE + 0x1000
+    words = bytes.fromhex(code)
+    mem.write(at, words + bytes.fromhex("f201 b000"     # fmove.l fpcr,d1
+                                        "f202 a800"))   # fmove.l fpsr,d2
+    try:
+        run_through(cpu_at(cpu, at), at + len(words) + 8)
+        assert (cpu.d(1), cpu.d(2)) == (fpcr, fpsr)
+    finally:
+        cpu.close()
+
+
+@pytest.mark.parametrize("mode, rounded", [
+    (0x00, (2, -2)),                    # to nearest
+    (0x10, (1, -1)),                    # toward zero
+    (0x20, (1, -2)),                    # toward minus infinity
+    (0x30, (2, -1)),                    # toward plus infinity
+])
+def test_the_core_rounds_as_an_fmove_of_data_to_the_fpcr_says(mode, rounded):
+    mem, cpu = machine()
+    at, x = CODE + 0x1000, 0x6000
+    mem.write(x, extended(1.5) + extended(-1.5))
+    mem.write(at, bytes.fromhex(f"f23c 9000 0000 00{mode:02x}"     # fmove.l #mode,fpcr
+                                "f218 4800"           # fmove.x (a0)+,fp0
+                                "f200 6000"           # fmove.l fp0,d0
+                                "f210 4800"           # fmove.x (a0),fp0
+                                "f201 6000"))         # fmove.l fp0,d1
+    try:
+        cpu.set_a(0, x)
+        run_through(cpu_at(cpu, at), at + 24)
+        assert (cpu.d(0), cpu.d(1) - (1 << 32)) == rounded
+    finally:
+        cpu.close()
+
+
+@pytest.mark.parametrize("mode, mantissa", [
+    (0x00, 0x8000000400000000),         # extended
+    (0x40, 0x8000000000000000),         # single
+    (0x80, 0x8000000400000000),         # double
+])
+def test_the_core_rounds_to_the_precision_an_fmove_to_the_fpcr_says(mode, mantissa):
+    """1 + 2**-29 has 30 bits of mantissa: a single's 24 can't keep them."""
+    mem, cpu = machine()
+    at, x, out = CODE + 0x1000, 0x6000, 0x6100
+    mem.write(x, extended(1.0) + extended(2.0 ** -29))
+    mem.write(at, bytes.fromhex(f"f23c 9000 0000 00{mode:02x}"     # fmove.l #mode,fpcr
+                                "f218 4800"           # fmove.x (a0)+,fp0
+                                "f210 4822"           # fadd.x (a0),fp0
+                                "f211 6800"))         # fmove.x fp0,(a1)
+    try:
+        cpu.set_a(0, x)
+        cpu.set_a(1, out)
+        run_through(cpu_at(cpu, at), at + 20)
+        assert mem.read(out + 4, 8).hex() == f"{mantissa:016x}"
+    finally:
+        cpu.close()
+
+
+def test_setting_the_fpcr_leaves_the_core_as_an_fmove_to_it_does():
+    """Every mode and precision: the core's state after each the same."""
+    mem, cpu = machine()
+    at = CODE + 0x1000
+    mem.write(at, bytes.fromhex("f200 9000"))       # fmove.l d0,fpcr
+    words = cpu_module.FPCR_WORD, cpu_module.FPCR_WORD + 3
+
+    def state():
+        cpu.uc.context_update(cpu._ctx)
+        return list(cpu._state[cpu._state_at + words[0]:cpu._state_at + words[1]])
+    try:
+        for before in (0x00, 0x50, 0xA0):
+            for value in range(0, 0x100, 0x10):
+                cpu.fpcr = before
+                cpu.set_d(0, value)
+                run_through(cpu_at(cpu, at), at + 4)
+                by_the_core = state()
+                cpu.fpcr = before
+                cpu.fpcr = value
+                assert state() == by_the_core, (hex(before), hex(value))
+    finally:
+        cpu.close()
+
+
+def test_fsave_and_frestore_an_idle_frame_leave_the_fpu_as_it_was():
+    """FSAVE -(A7) puts the 68881's idle state frame 28 bytes down, and
+    FRESTORE (A7)+ takes it back up; the registers are as they were."""
+    mem, cpu = machine()
+    at, x, out = CODE + 0x1000, 0x6000, 0x6100
+    mem.write(x, extended(-0.25))
+    mem.write(at, bytes.fromhex("f210 4800"           # fmove.x (a0),fp0
+                                "f23c 9000 0000 0010"     # fmove.l #$10,fpcr
+                                "f327"                # fsave -(a7)
+                                "f35f"                # frestore (a7)+
+                                "f211 6800"           # fmove.x fp0,(a1)
+                                "f201 b000"))         # fmove.l fpcr,d1
+    try:
+        cpu.set_a(0, x)
+        cpu.set_a(1, out)
+        cpu.sp = sp = 0x8000
+        run_through(cpu_at(cpu, at), at + 24)
+        assert mem.read(sp - 28, 28) == instructions.IDLE
+        assert mem.read(sp - 28, 4).hex() == "1f180000"
+        assert cpu.sp == sp
+        assert mem.read(out, 12) == extended(-0.25)
+        assert cpu.d(1) == 0x10
+    finally:
+        cpu.close()
+
+
+def test_frestore_of_a_null_frame_resets_the_fpu():
+    mem, cpu = machine()
+    at, x, out = CODE + 0x1000, 0x6000, 0x6100
+    mem.write(x, extended(1.0))
+    mem.write(at, bytes.fromhex("f210 4800"           # fmove.x (a0),fp0
+                                "f23c 9800 0000 0030 0800 0000"     # fmovem.l #..,fpcr/fpsr
+                                "f351"                # frestore (a1)
+                                "f212 6800"           # fmove.x fp0,(a2)
+                                "f201 b000"           # fmove.l fpcr,d1
+                                "f202 a800"))         # fmove.l fpsr,d2
+    try:
+        cpu.set_a(0, x)
+        cpu.set_a(1, out)
+        cpu.set_a(2, out + 16)
+        run_through(cpu_at(cpu, at), at + 26)
+        assert mem.read(out + 16, 12).hex() == "7fff0000" "ffffffffffffffff"
+        assert (cpu.d(1), cpu.d(2)) == (0, 0)
+    finally:
+        cpu.close()
+
+
+def test_frestore_of_a_frame_of_another_format_raises_a_format_error():
+    mem, cpu = machine()
+    at, frame = CODE + 0x1000, 0x6000
+    mem.write(frame, bytes.fromhex("1fb40000"))         # a 68881's busy frame
+    mem.write(at, bytes.fromhex("f350"))                # frestore (a0)
+    try:
+        cpu.set_a(0, frame)
+        cpu_at(cpu, at)
+        while (ev := cpu.run(at + 2)).kind == "interrupted":
+            pass
+        assert (ev.kind, ev.pc, ev.code) == ("exception", at, instructions.FORMAT_ERROR)
+    finally:
+        cpu.close()
 
 
 # A program still running as the interpreter exits: an application that

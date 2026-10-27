@@ -1,6 +1,7 @@
 """The File Manager and Standard File: the model from Python, the traps
 from 68k code, and the dialogs driven as the user would drive them."""
 
+import mmap
 import struct
 
 import machfs
@@ -234,6 +235,24 @@ def test_the_boot_volume(qapp):
     assert s.mem.r32(lowmem.FCBSPtr) == fs.fcb_buffer
 
 
+def test_a_volume_keeps_paths_to_its_extents_and_catalog_trees(qapp):
+    s = System()
+    fs = s.files
+    other = fs.dir_for(MemoryFolder([MacFile("Doc", data=b"doc")])).volume
+    fcbs = s.mem.r32(lowmem.FCBSPtr)
+    for vol in (fs.boot, other):
+        xt, ct = struct.unpack(">hh", s.mem.read(vol.vcb + fm.vcbXTRef, 4))
+        assert s.mem.r32(fcbs + xt) == fm.EXTENTS_FILE      # fcbFlNum
+        assert s.mem.r32(fcbs + ct) == fm.CATALOG_FILE
+        assert s.mem.r32(fcbs + xt + 20) == s.mem.r32(fcbs + ct + 20) == vol.vcb   # fcbVPtr
+        with pytest.raises(FileError) as e:
+            s.file_manager.write(ct, b"!")
+        assert e.value.code == fm.wrPermErr
+    system_file = s.mem.r16(lowmem.SysMap)
+    assert system_file > max(struct.unpack(">hh", s.mem.read(fs.boot.vcb + fm.vcbXTRef, 4)))
+    assert s.fcbs[system_file].node is fs.system_folder.child("System")
+
+
 def test_files_in_memory_read_and_write(qapp):
     s = System()
     folder = MemoryFolder([MacFile("Old", data=b"old data", type=b"TEXT", creator=b"ttxt")])
@@ -425,6 +444,36 @@ def test_disk_images_change_only_in_memory(qapp, tmp_path):
     assert path.read_bytes() == image
     assert bytes(files.lookup_file(0, 0, "Read Me").fork(False)) == b"Changed first"
     assert [n.name for n in vol.root.items()] == ["New", "Read Me"]
+
+
+def test_a_big_disk_image_is_mapped_and_its_forks_read_when_wanted(qapp, tmp_path, monkeypatch):
+    """A CD's image is mapped rather than read, and a file's forks are read
+    from it only when they're wanted, not when its size is (Standard File
+    asks every file's in a folder).  What's written to the disk stays in
+    memory, as in an image read in."""
+    from macrt import macfile
+    v = machfs.Volume()
+    v.name = "CD"
+    v["Folder"] = machfs.Folder()
+    f = machfs.File()
+    f.type, f.creator = b"TEXT", b"ttxt"
+    f.data, f.rsrc = b"x" * 3000, build_fork([Resource(b"STR ", 1, b"\3hi!")])
+    f.x, f.y = 100, 200                 # machfs writes them as fdLocation's v, then its h
+    v["Folder"]["Notes"] = f
+    path = tmp_path / "cd.img"
+    path.write_bytes(image := v.write(800 * 1024, desktopdb=False, bootable=False))
+    monkeypatch.setattr(macfile, "MAPPED", 0)
+    vol = macfile.load_volume(path)
+    assert isinstance(vol.disk.sectors, mmap.mmap)
+    vol.disk.sectors[:4] = b"Gone"
+    assert path.read_bytes() == image
+    s = System()
+    files = FileManager(s.files, None, s.files.dir_for(macfile.VolumeFolder(vol)))
+    notes = files.lookup_file(0, 0, "CD:Folder:Notes")
+    node = vol["Folder"]["Notes"]
+    assert node.sizes() == (3000, len(f.rsrc)) and not node._read
+    assert struct.unpack_from(">hh", notes.finfo, 10) == (100, 200)
+    assert bytes(notes.fork(False)) == b"x" * 3000 and node._read["data"] == b"x" * 3000
 
 
 def test_an_application_on_another_disk_by_its_full_pathname(qapp, tmp_path):
@@ -1769,6 +1818,12 @@ def _dialog(h, n=1):
     return h.d.file_dialogs[-1]
 
 
+def _heard(h, dlg, log, items):
+    """Wait for the hook to have been told of items, and the dialog to be
+    waiting for the user again."""
+    h.wait_until(lambda: log() == items and dlg.waiting(), what=f"the hook to hear {items}")
+
+
 def test_standard_get_file(harness, tmp_path):
     _sf_folder(tmp_path)
     a = Asm()
@@ -1960,7 +2015,7 @@ def test_an_applications_own_items_and_dialog_hook(harness, tmp_path):
         return [mem.r16s(a5 + BUF(6) + i) for i in range(0, mem.r16(a5 + COUNT), 2)]
 
     dlg = _dialog(h)
-    assert log() == [-1]                            # before the dialog's shown
+    _heard(h, dlg, log, [-1, 100])                  # before it's shown, and once it is
     entire, text_only, quick, label = (dlg._extras[n] for n in (9, 10, 11, 12))
     assert (entire.text(), text_only.text(), quick.text(), label.text()) == (
         "Entire Document", "Text Only", "Quick", "Format:")
@@ -1970,20 +2025,259 @@ def test_an_applications_own_items_and_dialog_hook(harness, tmp_path):
     assert label.geometry().top() == 0 and entire.geometry().top() == 18
 
     dlg.press(10)
-    h.wait_until(lambda: log() == [-1, 10] and text_only.isChecked(), what="the hook")
+    _heard(h, dlg, log, [-1, 100, 10])
+    h.wait_until(lambda: text_only.isChecked(), what="the radio button")
     assert not entire.isChecked()
     dlg.press(10)                                   # it's the hook that says
-    h.wait_until(lambda: log() == [-1, 10, 10], what="the hook again")
+    _heard(h, dlg, log, [-1, 100, 10, 10])
     assert text_only.isChecked()
     assert dlg.name.text() == "Untitled"            # and the dialog stays as it was
 
     dlg.name.setText("Plain")
     dlg.press(11)                                   # the hook makes it Save
     h.wait_until(lambda: mem.r16(a5 + DONE) == 1, what="SFPutFile's reply")
-    assert log() == [-1, 10, 10, 11]
+    assert log() == [-1, 100, 10, 10, 11]
     reply = a5 + BUF(0)
     assert mem.r8(reply) == 1 and mem.r_pstr(reply + 10) == b"Plain"
     assert not [w for w in proc.windows if w.dialog is not None]    # its dialog's gone
+    assert proc.runner.unimplemented_calls == {}
+
+
+def _get_dialog() -> list[Resource]:
+    """DLOG -4000 with Standard File's items and a button of its
+    application's at item 2, as Idealiner's has, and, after them, text
+    kept outside the dialog."""
+    btn, text, user = 4, 8, 0
+    items = ditl(
+        (btn, (131, 256, 149, 336), b"Open"), (btn, (156, 256, 174, 336), b"New"),
+        (btn, (181, 256, 199, 336), b"Cancel"), (user | 128, (39, 248, 59, 347), b""),
+        (btn, (67, 256, 85, 336), b"Eject"), (btn, (92, 256, 110, 336), b"Drive"),
+        (user, (39, 12, 199, 230), b""), (user, (39, 229, 199, 246), b""),
+        (user | 128, (120, 252, 121, 340), b""),
+        (text | 128, (104, 533, 205, 629), b"Kept out of sight"))
+    return [Resource(b"DLOG", -4000, dlog((0, 0, 210, 348), "", -4000, visible=False)),
+            Resource(b"DITL", -4000, items)]
+
+
+def test_an_applications_own_button_among_standard_files_items(harness, tmp_path):
+    """A control the application puts at a number Standard File's dialog
+    gives no part, SFGetFile's item 2, is the application's, shown and
+    passed to its hook; an item kept outside the dialog isn't shown."""
+    _sf_folder(tmp_path)
+    a = Asm()
+    a.push_l(0x00500050)                            # SFGetFile(where, nil, nil, -1, nil,
+    a.push_l(0)                                     # ...hook, reply)
+    a.push_l(0)
+    a.push_w(-1)
+    a.push_l(0)
+    a.lea_pc("hook", 1)
+    a.push_a(1)
+    a.pea(BUF(0))
+    a.call(0xA9EA, selector=2)
+    a.mark(DONE, 1)
+    _idle(a)
+    a.label("hook")                                 # logs the item; New cancels
+    a.w(0x4E56, -16)                                # LINK A6,#-16
+    a.w(0x302E, 12)                                 # MOVE.W 12(A6),D0: the item
+    a.w(0x3D40, 14)                                 # MOVE.W D0,14(A6): the result
+    a.w(0x41ED, BUF(6))                             # LEA BUF(6)(A5),A0
+    a.w(0x322D, COUNT)                              # MOVE.W COUNT(A5),D1
+    a.w(0x3180, 0x1000)                             # MOVE.W D0,0(A0,D1.W)
+    a.w(0x546D, COUNT)                              # ADDQ.W #2,COUNT(A5)
+    a.w(0x0C40, 2)                                  # CMPI.W #2,D0
+    a.bra("hooked", BNE)
+    a.w(0x3D7C, 3, 14)                              # MOVE.W #3,14(A6): Cancel
+    a.label("hooked")
+    a.w(0x4E5E, 0x205F, 0x5C8F, 0x4ED0)             # UNLK A6; return, popping 6 bytes
+    app = host_app(tmp_path, a, _get_dialog())
+    h = harness()
+    proc, mem, a5 = _launch(h, app)
+
+    def log():
+        return [mem.r16s(a5 + BUF(6) + i) for i in range(0, mem.r16(a5 + COUNT), 2)]
+
+    dlg = _dialog(h)
+    _heard(h, dlg, log, [-1, 100])
+    assert list(dlg._extras) == [2]
+    new = dlg._extras[2]
+    assert new.text() == "New" and new.isVisible() and new.isEnabled()
+    assert new.geometry().topLeft() == QPoint(0, 0)
+    dlg.press(2)
+    h.wait_until(lambda: mem.r16(a5 + DONE) == 1, what="SFGetFile's reply")
+    assert log() == [-1, 100, 2] and mem.r8(a5 + BUF(0)) == 0
+    assert proc.runner.unimplemented_calls == {}
+
+
+def _folder_dialog() -> list[Resource]:
+    """DLOG 128 with System 7's nine Standard File items and its
+    application's Select button, as Inside Macintosh: Files's dialog to
+    pick a folder has."""
+    btn, user = 4, 0
+    items = ditl(
+        (btn, (135, 252, 155, 332), b"Open"), (btn, (104, 252, 124, 332), b"Cancel"),
+        (user | 128, (0, 0, 0, 0), b""), (user | 128, (8, 235, 24, 337), b""),
+        (btn, (32, 252, 52, 332), b"Eject"), (btn, (60, 252, 80, 332), b"Desktop"),
+        (user, (29, 12, 159, 230), b""), (user, (6, 12, 25, 230), b""),
+        (user | 128, (91, 251, 92, 333), b""),
+        (btn, (165, 12, 185, 230), b"Select"))
+    return [Resource(b"DLOG", 128, dlog((0, 0, 194, 344), "", 128, visible=False)),
+            Resource(b"DITL", 128, items)]
+
+
+def test_a_hook_that_picks_a_folder_reads_the_selection_in_the_reply(harness, tmp_path):
+    """While System 7's dialog is up, its reply record says what's
+    selected in the list, and the hook hears sfHookNullEvent when that
+    changes; a hook that ends the dialog with Cancel leaves the reply
+    saying what was selected (Inside Macintosh: Files, "Selecting a
+    Directory")."""
+    _sf_folder(tmp_path)
+    a = Asm()
+    a.push_l(0)                                     # CustomGetFile(nil, -1, nil, reply, 128,
+    a.push_w(-1)                                    # (-1, -1), hook, nil, nil, nil, @reply)
+    a.push_l(0)
+    a.pea(BUF(0))
+    a.push_w(128)
+    a.push_l(-1)
+    a.lea_pc("hook", 1)
+    a.push_a(1)
+    a.push_l(0)
+    a.push_l(0)
+    a.push_l(0)
+    a.pea(BUF(0))
+    a.call(0xA9EA, selector=8)
+    a.mark(DONE, 1)
+    _idle(a)
+    a.label("hook")                                 # (item, dialog, data): logs the item;
+    a.w(0x4E56, 0)                                  # Select fakes a Cancel. LINK A6,#0
+    a.w(0x302E, 16)                                 # MOVE.W 16(A6),D0: the item
+    a.w(0x3D40, 18)                                 # MOVE.W D0,18(A6): the result
+    a.w(0x41ED, BUF(6))                             # LEA BUF(6)(A5),A0
+    a.w(0x322D, COUNT)                              # MOVE.W COUNT(A5),D1
+    a.w(0x3180, 0x1000)                             # MOVE.W D0,0(A0,D1.W)
+    a.w(0x546D, COUNT)                              # ADDQ.W #2,COUNT(A5)
+    a.w(0x0C40, 10)                                 # CMPI.W #10,D0
+    a.bra("hooked", BNE)
+    a.w(0x3D7C, 2, 18)                              # MOVE.W #2,18(A6): Cancel
+    a.label("hooked")
+    a.w(0x4E5E, 0x205F, 0x4FEF, 10, 0x4ED0)         # UNLK A6; return, popping 10 bytes
+    app = host_app(tmp_path, a, _folder_dialog())
+    h = harness()
+    proc, mem, a5 = _launch(h, app)
+    reply = a5 + BUF(0)
+
+    def log():
+        return [mem.r16s(a5 + BUF(6) + i) for i in range(0, mem.r16(a5 + COUNT), 2)]
+
+    def selected():
+        spec = reply + 6
+        return (mem.r8(reply + 80), mem.r8(reply + 81), mem.r_pstr(spec + 6).decode(),
+                mem.r32(spec + 2))
+
+    dlg = _dialog(h)
+    _heard(h, dlg, log, [-1, 100])                  # once it's shown
+    _, _, _, parid = selected()
+    shown = proc.files.fs.volume(mem.r16s(reply + 6)).dir(parid)
+    assert dlg.names()[dlg.list.currentRow()] == "Drafts" and shown is shown.volume.root
+    assert selected() == (1, 0, "Drafts", shown.cnid)
+    dlg.list.setCurrentRow(dlg.names().index("Letter"))
+    _heard(h, dlg, log, [-1, 100, 100])
+    assert selected() == (0, 0, "Letter", shown.cnid) and mem.read(reply + 2, 4) == b"TEXT"
+    dlg.list.setCurrentRow(-1)                      # nothing: the folder shown, here a disk
+    _heard(h, dlg, log, [-1, 100, 100, 100])
+    assert selected() == (0, 1, shown.name, fm.ROOT_PARENT)
+    dlg.list.setCurrentRow(dlg.names().index("Drafts"))
+    _heard(h, dlg, log, [-1, 100, 100, 100, 100])
+    dlg.press(10)
+    h.wait_until(lambda: mem.r16(a5 + DONE) == 1, what="CustomGetFile's reply")
+    assert log() == [-1, 100, 100, 100, 100, 10, -2]
+    assert mem.r8(reply) == 0 and selected() == (1, 0, "Drafts", shown.cnid)
+    assert proc.runner.unimplemented_calls == {}
+
+
+def test_a_hook_says_where_its_dialog_starts_and_ends_it_with_a_folder(harness, tmp_path):
+    """A hook's first answer can be sfHookChangeSelection, the dialog then
+    starting in the folder its reply record names, with the item named
+    selected; System 7's Desktop button is sfHookGoToDesktop to it; and
+    Open, the hook's answer to its own button while a folder is selected,
+    ends the dialog with that folder (Inside Macintosh: Files, "Setting
+    the Current Directory" and "Selecting a Directory").  A button pressed
+    while the hook is hearing of a new selection is pressed after it."""
+    _sf_folder(tmp_path)
+    a = Asm()
+    a.push_l(0)                                     # CustomGetFile(nil, -1, nil, reply, 128,
+    a.push_w(-1)                                    # (-1, -1), hook, nil, nil, nil, @reply)
+    a.push_l(0)
+    a.pea(BUF(0))
+    a.push_w(128)
+    a.push_l(-1)
+    a.lea_pc("hook", 1)
+    a.push_a(1)
+    a.push_l(0)
+    a.push_l(0)
+    a.push_l(0)
+    a.pea(BUF(0))
+    a.call(0xA9EA, selector=8)
+    a.mark(DONE, 1)
+    _idle(a)
+    a.label("hook")                                 # (item, dialog, data): logs the item
+    a.w(0x4E56, 0)                                  # LINK A6,#0
+    a.w(0x302E, 16)                                 # MOVE.W 16(A6),D0: the item
+    a.w(0x3D40, 18)                                 # MOVE.W D0,18(A6): the result
+    a.w(0x41ED, BUF(6))                             # LEA BUF(6)(A5),A0
+    a.w(0x322D, COUNT)                              # MOVE.W COUNT(A5),D1
+    a.w(0x3180, 0x1000)                             # MOVE.W D0,0(A0,D1.W)
+    a.w(0x546D, COUNT)                              # ADDQ.W #2,COUNT(A5)
+    a.w(0x0C40, 10)                                 # CMPI.W #10,D0
+    a.bra("first", BNE)
+    a.w(0x3D7C, 1, 18)                              # MOVE.W #1,18(A6): Select is Open
+    a.bra("hooked")
+    a.label("first")
+    a.w(0x0C40, 0xFFFF)                             # CMPI.W #sfHookFirstCall,D0
+    a.bra("hooked", BNE)
+    a.w(0x3D7C, 110, 18)                            # MOVE.W #sfHookChangeSelection,18(A6)
+    a.w(0x2B7C)                                     # MOVE.L #2,parID(reply): the disk's
+    a.long(fm.ROOT)                                 # root, Letter in it
+    a.w(BUF(0) + 8)
+    a.w(0x2B7C)                                     # MOVE.L #$064C6574,name(reply)
+    a.long(0x064C6574)
+    a.w(BUF(0) + 12)
+    a.w(0x3B7C, 0x7465, BUF(0) + 16)                # MOVE.W #'te',name+4(reply)
+    a.w(0x1B7C, 0x72, BUF(0) + 18)                  # MOVE.B #'r',name+6(reply)
+    a.label("hooked")
+    a.w(0x4E5E, 0x205F, 0x4FEF, 10, 0x4ED0)         # UNLK A6; return, popping 10 bytes
+    app = host_app(tmp_path, a, _folder_dialog())
+    h = harness()
+    proc, mem, a5 = _launch(h, app)
+    reply = a5 + BUF(0)
+
+    def log():
+        return [mem.r16s(a5 + BUF(6) + i) for i in range(0, mem.r16(a5 + COUNT), 2)]
+
+    def selected():
+        spec = reply + 6
+        return (mem.r8(reply + 80), mem.r8(reply + 81), mem.r_pstr(spec + 6).decode(),
+                mem.r32(spec + 2))
+
+    dlg = _dialog(h)
+    _heard(h, dlg, log, [-1, 100])
+    vol = proc.files.fs.volume(mem.r16s(reply + 6))
+    assert dlg.names()[dlg.list.currentRow()] == "Letter"
+    assert selected() == (0, 0, "Letter", fm.ROOT) and vol.root.child("Letter") is not None
+    dlg.desk.click()
+    _heard(h, dlg, log, [-1, 100, 105, 100])
+    assert dlg.place.desktop and vol.name in dlg.names()
+    dlg.choose(vol.name)
+    h.wait_until(lambda: log()[-2:] == [103, 100] and dlg.waiting(), what="the disk opened")
+    assert dlg.names()[dlg.list.currentRow()] == "Drafts"
+    dlg.list.setCurrentRow(dlg.names().index("Letter"))
+    _heard(h, dlg, log, log() + [100])
+    dlg.list.setCurrentRow(dlg.names().index("Drafts"))
+    dlg.press(10)                                   # before the hook's heard of Drafts
+    h.wait_until(lambda: mem.r16(a5 + DONE) == 1, what="CustomGetFile's reply")
+    assert [n for n in log() if n != 100] == [-1, 105, 103, 10, -2]
+    assert log()[-4:] == [100, 100, 10, -2]
+    assert mem.r8(reply) == 1 and selected() == (1, 0, "Drafts", fm.ROOT)
+    assert mem.r16s(reply + 6) == vol.vref
     assert proc.runner.unimplemented_calls == {}
 
 
@@ -2055,12 +2349,13 @@ def test_an_applications_edit_text_items(harness, tmp_path):
     enabled, disabled = dlg._extras[9], dlg._extras[10]
     assert (enabled.text(), disabled.text()) == ("Alpha", "Beta")
     assert enabled.isEnabled() and disabled.isEnabled()
-    assert log() == [-1] and mem.r_pstr(a5 + BUF(8)) == b"Beta"
+    _heard(h, dlg, log, [-1, 100])
+    assert mem.r_pstr(a5 + BUF(8)) == b"Beta"
     QTest.keyClicks(disabled, "X")
     h.wait_until(lambda: mem.r_pstr(a5 + BUF(8)) == b"BetaX", what="the hook")
-    assert log() == [-1, 100]
+    _heard(h, dlg, log, [-1, 100, 100])
     QTest.keyClicks(enabled, "!")
-    h.wait_until(lambda: log() == [-1, 100, 9], what="the hook again")
+    _heard(h, dlg, log, [-1, 100, 100, 9])
     assert enabled.text() == "Alpha!" and disabled.text() == "BetaX"
     dlg.press(11)
     h.wait_until(lambda: mem.r16(a5 + DONE) == 1, what="SFPutFile's reply")
@@ -2177,14 +2472,15 @@ def test_what_an_applications_own_dialog_draws(harness, tmp_path):
     assert popup.text() == "Kind:"
     assert [popup.box.itemText(i) for i in range(popup.box.count())] == [
         "Plain", "Fancy", "Both"]
-    assert popup.box.currentIndex() == 0 and log() == [-1]
+    _heard(h, dlg, log, [-1, 100])
+    assert popup.box.currentIndex() == 0
 
     dlg.pick(10, 3)
-    h.wait_until(lambda: log() == [-1, 10], what="the hook")
+    _heard(h, dlg, log, [-1, 100, 10])
     assert mem.r16(a5 + BUF(8)) == 3                # the value it was told of
     h.wait_until(lambda: popup.box.currentIndex() == 2, what="the pop-up")
     dlg.press(9)
-    h.wait_until(lambda: log() == [-1, 10, 9], what="the hook again")
+    _heard(h, dlg, log, [-1, 100, 10, 9])
     dlg.save_as("Drawn")
     h.wait_until(lambda: mem.r16(a5 + DONE) == 1, what="SFPutFile's reply")
     assert mem.r8(a5 + BUF(0)) == 1

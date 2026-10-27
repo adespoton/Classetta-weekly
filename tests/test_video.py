@@ -11,7 +11,10 @@ from macrt.toolbox.color import standard_table
 from macrt.toolbox.files import FileError
 from macrt.toolbox.gdevice import VIDEO_DRIVER, GDevice, PixMap, deref, gdDevType, read_table
 from macrt.toolbox.quickdraw import GrafPort
+from macrt.toolbox.system import CLASSIC_SCREEN, RAM_SIZE
 from macrt.toolbox.types import Rect
+
+from macrt.demo import parse_args
 
 from guest import Guest
 
@@ -168,6 +171,19 @@ def test_a_plus_has_no_video_driver(qapp):
     assert call(g, False, GetMode, page_info())[0] == glue_files.unitEmptyErr
 
 
+def test_the_system_file_says_how_the_screen_is_set_up(qapp):
+    """'scrn' 0, as the Control Panel leaves it: the one screen, the main
+    one and active, its mode, whether it's colour and its rectangle.
+    JuliaSet 5.1 looks for the main screen's mode there."""
+    for depth, mode, colour in ((8, 0x83, 1), (4, 0x82, 1), (1, 0x80, 0)):
+        g = Guest(model="ii", depth=depth)
+        data = g.contents(g.process.resources.GetResource("scrn", 0))
+        assert struct.unpack(">HhhLhHHhh4hH", data) == (
+            1, 0, 9, g.system.screen_bits.base, mode, 0x77FE, 0x8800 | colour, depth, -1,
+            0, 0, 480, 640, 0)
+    assert Guest().process.resources.GetResource("scrn", 0) == 0     # no Color QuickDraw
+
+
 def test_an_old_port_on_the_screen_draws_at_its_depth(g):
     call(g, True, SetMode, page_info(0x82))
     port = GrafPort(g.mem, g.ptr(bytes(GrafPort.SIZE)))
@@ -177,3 +193,49 @@ def test_an_old_port_on_the_screen_draws_at_its_depth(g):
     g("PaintRect", g.rect_ptr(Rect(100, 0, 101, bits.bounds.width)))
     assert g.mem.read(bits.base + 100 * bits.row_bytes, bits.row_bytes) == b"\xFF" * 320
     assert g.mem.read(bits.base + 101 * bits.row_bytes, bits.row_bytes) == below
+
+
+def test_a_screen_whose_rows_are_further_apart_than_they_need(qapp):
+    g = Guest(model="ii", depth=8, row_bytes=1024)
+    bits = g.system.screen_bits
+    assert bits.row_bytes == 1024 and g.mem.r16(lowmem.ScreenRow) == 1024
+    assert bits.base == g.mem.r32(lowmem.ScrnBase) == RAM_SIZE - 1024 * 480
+    gd, pm = main(g)
+    assert pm.row_bytes & 0x3FFF == 1024 and pm.base_addr == bits.base
+    port = GrafPort(g.mem, g.ptr(bytes(GrafPort.SIZE)))
+    g("OpenCPort", port.addr)
+    g("PaintRect", g.rect_ptr(Rect(100, 0, 101, 640)))
+    assert g.mem.read(bits.base + 100 * 1024, 1024) == b"\xFF" * 640 + bytes(384)
+
+    # At another depth they're as far apart as the same pixels' bits are,
+    # and a depth whose rows need more room than the screen has doesn't fit.
+    assert call(g, False, GetPages, page_info(0x83))[0] == 0
+    assert call(g, False, GetPages, page_info(0x84))[0] == glue_video.statusErr
+    for mode, row_bytes in ((0x80, 128), (0x81, 256), (0x82, 512)):
+        call(g, True, SetMode, page_info(mode))
+        assert g.system.screen_bits.row_bytes == g.mem.r16(lowmem.ScreenRow) == row_bytes
+        assert main(g)[1].row_bytes & 0x3FFF == g.system.screen.row_bytes == row_bytes
+    assert call(g, True, SetMode, page_info(0x84))[0] == glue_video.controlErr
+
+
+def test_a_screens_rows_are_as_far_apart_as_a_row_needs_at_least(qapp):
+    system = Guest(model="ii", depth=8, row_bytes=650).system
+    assert system.screen_bits.row_bytes == 650
+    assert [system.row_bytes_for(d) for d in (1, 2, 4)] == [82, 164, 326]
+    system = Guest(model="ii", depth=8, row_bytes=512).system
+    assert system.screen_bits.row_bytes == 640 and system.row_bytes_for(1) == 80
+    plus = Guest(screen_size=(512, 342), row_bytes=64).system
+    assert plus.screen_bits.base == CLASSIC_SCREEN and plus.alternate_screen
+    plus = Guest(screen_size=(512, 342), row_bytes=128).system
+    assert plus.screen_bits.row_bytes == 128 and plus.alternate_screen is None
+    for row_bytes in (0, 1023, 0x4000):
+        with pytest.raises(ValueError):
+            Guest(model="ii", row_bytes=row_bytes)
+
+
+def test_row_bytes_option(capsys):
+    assert parse_args(["--model", "ii", "--row-bytes", "1024", "x"]).row_bytes == 1024
+    for bad in ("1023", "0", "16384"):
+        with pytest.raises(SystemExit):
+            parse_args(["--row-bytes", bad, "x"])
+    assert "--row-bytes is an even number" in capsys.readouterr().err

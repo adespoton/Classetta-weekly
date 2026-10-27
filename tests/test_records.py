@@ -3,6 +3,7 @@ windows and menus, checked byte for byte against Inside Macintosh."""
 
 import pytest
 from guest import Guest, Processor
+from test_dialogs import NoDisplay
 
 from macrt.m68k import dispatch
 from macrt.macfile import MacFile
@@ -18,7 +19,10 @@ from macrt.toolbox.qdraw import Region, read_rgn, write_rgn
 from macrt.toolbox.quickdraw import (
     BLACK_PAT, GRAY_PAT, QD_ARROW, QD_BLACK, QD_GRAY, QD_SCREEN_BITS, GrafPort, rgn_bbox,
 )
-from macrt.toolbox.system import ALTERNATE_ROOM, RAM_SIZE, ROM_SIZE, STANDARD_DEFPROCS, System
+from macrt.toolbox.system import (
+    ALTERNATE_ROOM, CLASSIC_SCREEN, PLUS_SCREEN, PLUS_SCREENS, RAM_SIZE, ROM_SIZE,
+    STANDARD_DEFPROCS, SYS7_HEAP_END, SYS_HEAP_END, System,
+)
 from macrt.toolbox.types import Point, Rect
 from macrt.toolbox.windows import WindowRecord
 
@@ -115,6 +119,22 @@ def test_partition_layout_and_a5_world():
     assert m.r_rect(the_port + QD_SCREEN_BITS + 6) == Rect(0, 0, 480, 640)
 
 
+def system_file(version: bytes | None) -> MacFile:
+    vers = [Resource(b"vers", 1, version + b"\x80\x00\x00\x00\x00\x00")] if version else []
+    return MacFile("System", rsrc=build_fork([Resource(b"ICON", 0, bytes(128))] + vers))
+
+
+def test_a_real_system_7s_heap_has_room_to_grow():
+    """A System 7 heap grows as it's needed, and HomePublisher loads all its
+    segments into it: applications' partitions start above where it may grow to."""
+    system, proc = make(system_file=system_file(b"\x07\x55"))
+    assert system.partitions_start == proc.partition.start == SYS7_HEAP_END
+    p = system.sys_heap.new_ptr(0xA0000)
+    assert p and p + 0xA0000 > SYS_HEAP_END
+    for version in (b"\x06\x07", None):
+        assert make(system_file=system_file(version))[0].partitions_start == SYS_HEAP_END
+
+
 def test_globals_are_exactly_as_big_as_code_0_says():
     """CurStackBase is A5 minus CODE 0's size below A5, to the byte: an
     application's start-up code fills its globals from there up to A5."""
@@ -125,20 +145,60 @@ def test_globals_are_exactly_as_big_as_code_0_says():
     assert part.heap.limit <= part.stack_base
 
 
+def alternate_launch(system, name="Alt"):
+    return Process(system, name, lambda tb: None, EventQueue(lambda: (Point(0, 0), 0)),
+                   page_option=0xFFFF)
+
+
 def test_bufptr_is_the_screen_unless_launched_with_the_alternate_one():
     """Dark Castle asks for the alternate screen only while BufPtr is the
     screen's base; MacRacquetball, launched with it, launches itself again
     until BufPtr is at least $7500 over its A5."""
     system, proc = make()
     w = proc.world
-    assert w.r32(lowmem.BufPtr) == system.mem.r32(lowmem.ScrnBase)
-    alt = Process(system, "Alt", lambda tb: None, EventQueue(lambda: (Point(0, 0), 0)),
-                  page_option=0xFFFF)
+    base = system.screen_bits.base
+    assert w.r32(lowmem.BufPtr) == w.r32(lowmem.ScrnBase) == base
+    alt = alternate_launch(system)
     part, w = alt.partition, alt.world
     assert w.r16(lowmem.CurPageOption) & 0xFFFF == 0xFFFF
     assert part.end - part.start == (1 << 20) + ALTERNATE_ROOM
     assert w.r32(lowmem.BufPtr) == part.end and part.end - part.a5 >= 0x7500
-    assert proc.world.r32(lowmem.BufPtr) == system.mem.r32(lowmem.ScrnBase)   # its own
+    assert w.r32(lowmem.ScrnBase) == base
+    assert proc.world.r32(lowmem.BufPtr) == base        # its own
+
+
+def test_an_alternate_launch_with_the_classic_screen_is_under_the_plus_screens():
+    """As on a Mac Plus with 4 MB: its A5 world under the alternate screen,
+    and BufPtr and ScrnBase both the main screen over it.  Arkanoid's demo
+    stops unless BufPtr is ScrnBase; MacRacquetball wants BufPtr $7500
+    over A5.  The screens there are the classic ones."""
+    system = System((512, 342))
+    assert system.mem.physical(PLUS_SCREEN) == CLASSIC_SCREEN
+    assert system.mem.physical(PLUS_SCREEN - 0x8000) == system.alternate_screen
+    alt = alternate_launch(system)
+    part, w = alt.partition, alt.world
+    assert part.end == PLUS_SCREENS
+    assert w.r32(lowmem.ScrnBase) == w.r32(lowmem.BufPtr) == PLUS_SCREEN
+    assert PLUS_SCREEN - part.a5 >= 0x7500
+    # Its QuickDraw has the screen there too: Yeager's AFT launches itself
+    # again until its A5 is under screenBits.baseAddr less $8000.
+    assert system.screen_of(alt).base == PLUS_SCREEN
+    mem = system.mem
+    assert mem.r32(mem.r32(part.a5) + QD_SCREEN_BITS) == PLUS_SCREEN
+    win = WindowRecord.new(system, alt, alt.heap, 0, Rect(40, 40, 100, 200), "Alt", True,
+                           0, False, 0)
+    assert mem.r32(win.addr + 2) == PLUS_SCREEN
+    # One that isn't launched with it: the screen as it is.
+    proc = new_process(system, "Test")
+    assert proc.world.r32(lowmem.ScrnBase) == proc.world.r32(lowmem.BufPtr) == CLASSIC_SCREEN
+    assert system.screen_of(proc).base == CLASSIC_SCREEN
+    # Another that is, launched from the first, which has the room there:
+    # the alternate buffers on top of its partition, and the Plus's screen
+    # still over it.  The other way, Arkanoid's game stops.
+    alt2 = alternate_launch(system, "Alt 2")
+    part, w = alt2.partition, alt2.world
+    assert part.end < PLUS_SCREENS and part.end - part.a5 >= ALTERNATE_ROOM
+    assert w.r32(lowmem.ScrnBase) == w.r32(lowmem.BufPtr) == PLUS_SCREEN
 
 
 def test_partitions_are_separate_and_reused():
@@ -257,13 +317,53 @@ def test_window_record_fields():
     assert rec.local_to_global(Point(0, 0)) == Point(50, 40)
 
 
-def test_window_pic_is_the_records_window_pic():
+def test_window_pic_is_the_records_window_pic(qapp):
     g = Guest()
     rec = new_window(g.system, g.process)
     g("SetWindowPic", rec.addr, 0x123456)
     assert g.mem.r32(rec.addr + 148) == 0x123456                # windowPic
     assert g("GetWindowPic", rec.addr) == 0x123456
     assert g.mem.r32(rec.addr + 144) == 0                       # nextWindow untouched
+
+
+def test_a_window_with_a_picture_is_drawn_and_sent_no_updates(qapp):
+    """Inside Macintosh I, Window Manager (SetWindowPic, CheckUpdate): the
+    Window Manager draws a window's own picture instead of generating an
+    update event for it, and goes on to the next window that needs
+    updating.  Populous II shows its title that way."""
+    g = Guest()
+    g.tb._d = NoDisplay()
+    back = new_window(g.system, g.process, Rect(200, 40, 240, 120), proc_id=k.plainDBox)
+    front = new_window(g.system, g.process, Rect(50, 40, 90, 120), proc_id=k.plainDBox)
+    g.process.windows.insert_front(back)
+    g.process.windows.insert_front(front)
+    g.set_port(front)
+    pic = g("OpenPicture", g.rect_ptr((0, 0, 40, 80)))
+    g("PaintRect", g.rect_ptr((10, 16, 30, 64)))
+    g("ClosePicture")
+    g("SetWindowPic", front.addr, pic)
+    g.set_port(back)
+    ev = g.ptr(bytes(16))
+    assert g("CheckUpdate", ev)
+    assert g.mem.r16(ev) == k.updateEvt and g.mem.r32(ev + 2) == back.addr
+    assert not front.update_pending and back.update_pending
+    bits = g.system.screen_bits
+
+    def screen(y: int, x: int) -> bool:
+        return bool(g.mem.r8(bits.base + y * bits.row_bytes + x // 8) & 0x80 >> x % 8)
+    assert screen(70, 70) and not screen(55, 70) and not screen(70, 50)
+    assert g.mem.r32(g.mem.r32(g.process.partition.a5)) == back.addr   # thePort as it was
+    g("BeginUpdate", back.addr)
+    g("EndUpdate", back.addr)
+    g("InvalRect", g.rect_ptr((0, 0, 10, 10)))                          # in back
+    front_update = g.rect_ptr((0, 0, 40, 80))
+    g.set_port(front)
+    g("InvalRect", front_update)
+    assert g("EventAvail", k.event_mask(k.updateEvt), ev)
+    assert g.mem.r32(ev + 2) == back.addr and not front.update_pending
+    g.set_port(back)
+    g("ValidRect", g.rect_ptr((0, 0, 10, 10)))
+    assert not g("EventAvail", k.event_mask(k.updateEvt), ev)
 
 
 def test_calc_vis_gives_windows_the_menu_bar_once_it_is_desk(qapp):
@@ -283,6 +383,21 @@ def test_calc_vis_gives_windows_the_menu_bar_once_it_is_desk(qapp):
     assert read_rgn(g.mem, front.vis_rgn) == under_bar      # in front: not worked out
     g("CalcVis", front.addr)
     assert read_rgn(g.mem, front.vis_rgn) == Region.rect(front.port_rect)
+
+
+def test_a_window_too_far_off_the_screen_to_be_seen_has_an_empty_visrgn():
+    """The visRgn is what of the port "is actually visible on the screen"
+    (Inside Macintosh I, QuickDraw).  HyperCard 2.0 makes its card window
+    at (16384, 16384), and on a Plus copies the card to the screen itself,
+    clipped to the visRgn, before it moves the window onto the screen: it
+    wrote over its own globals."""
+    system, proc = make()                                       # 640 x 480
+    w = new_window(system, proc, Rect(16384, 16384, 16726, 16896))
+    assert read_rgn(system.mem, w.vis_rgn).empty
+    w.content = Rect(40, 64, 382, 576)
+    assert read_rgn(system.mem, w.vis_rgn) == Region.rect(w.port_rect)
+    w.content = Rect(900, 1200, 1242, 1712)                     # partly near enough
+    assert read_rgn(system.mem, w.vis_rgn) == Region.rect(Rect(0, 0, 60, 80))
 
 
 def test_window_follows_its_record():

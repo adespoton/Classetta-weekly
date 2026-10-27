@@ -256,3 +256,77 @@ def test_newgworld_without_the_size_of_its_arguments_in_the_selector(qapp):
                         + "7000AB1D"))                  # MOVEQ #0,D0; _QDExtensions
     assert m.missing == [] and m.cpu.sp == m.stack_top - 2
     assert m.mem.r16(m.cpu.sp) == 0 and m.mem.r32(out) != 0
+
+
+# -- basic QuickDraw ----------------------------------------------------------
+@pytest.fixture
+def plus(qapp):
+    return Guest()
+
+
+def test_on_basic_quickdraw_a_gworld_is_a_grafport_onto_1_bit_pixels(plus):
+    """Imaging With QuickDraw, Offscreen Graphics Worlds: with only basic
+    QuickDraw, NewGWorld makes a 1-bit pixel map, which GetGWorldPixMap
+    gives for LockPixels and the rest, and no GDevice; the depth may be 0
+    or 1 (Rescue! makes its worlds so on a Plus)."""
+    g = plus
+    r = Rect(0, 0, 5, 20)
+    gw = new_gworld(g, 0, r)
+    port = g.system.port_at(gw)
+    assert not port.is_color and port.port_rect == port.port_bits_bounds == r
+    assert port.port_bits_row_bytes == 4
+    pm_h = g("GetGWorldPixMap", gw)
+    pm = PixMap(g.mem, deref(g.mem, pm_h))
+    assert pm.pixel_size == 1 and pm.bounds == r and pm.row_bytes & 0x3FFF == 4
+    assert g("GetPixBaseAddr", pm_h) == pm.base_addr == port.port_bits_base
+    assert g.mem.read(pm.base_addr, 4 * 5) == bytes(20)            # white
+    assert g("LockPixels", pm_h)
+    assert g("GetGWorldDevice", gw) == g.mem.r32(lowmem.TheGDevice)
+    out = g.ptr(bytes(4))
+    assert g("NewGWorld", out, 8, g.rect_ptr(r), 0, 0, 0) == -157  # cDepthErr
+    assert g("NewGWorld", out, 1, g.rect_ptr(r), 0, 0, 0) == 0
+
+
+def test_on_basic_quickdraw_what_is_drawn_in_a_gworld_copies_to_a_port(plus):
+    g = plus
+    gw = new_gworld(g, 1, Rect(0, 0, 2, 8))
+    dst, _ = g.port(16, 3)
+    g("SetGWorld", gw, 0)
+    assert current(g)[0] == gw
+    g("PaintRect", g.rect_ptr(Rect(0, 2, 2, 4)))
+    pm_h = g("GetGWorldPixMap", gw)
+    base = g("GetPixBaseAddr", pm_h)
+    assert [g.mem.r8(base + v * 4) for v in range(2)] == [0x30, 0x30]
+    g("SetGWorld", dst.addr, 0)
+    g("CopyBits", deref(g.mem, pm_h), dst.addr + 2, g.rect_ptr(Rect(0, 0, 2, 8)),
+      g.rect_ptr(Rect(1, 4, 3, 12)), 0, 0)
+    assert g.rows(dst) == ["." * 16] + ["......##........"] * 2
+
+
+def test_on_basic_quickdraw_update_gworld_keeps_what_it_has(plus):
+    g = plus
+    gw = new_gworld(g, 0, Rect(0, 0, 2, 8))
+    g("SetGWorld", gw, 0)
+    g("PaintRect", g.rect_ptr(Rect(0, 0, 1, 2)))
+    out = g.ptr(struct.pack(">L", gw))
+    done = g("UpdateGWorld", out, 0, g.rect_ptr(Rect(0, 0, 3, 40)), 0, 0, clipPix)
+    assert done & (reallocPix | clipPix | newRowBytes) == reallocPix | clipPix | newRowBytes
+    port = g.system.port_at(g.mem.r32(out))
+    pm = PixMap(g.mem, deref(g.mem, g("GetGWorldPixMap", port.addr)))
+    assert port.port_rect == port.port_bits_bounds == pm.bounds == Rect(0, 0, 3, 40)
+    assert port.port_bits_row_bytes == pm.row_bytes & 0x3FFF == 8
+    assert port.port_bits_base == pm.base_addr
+    assert g.mem.read(pm.base_addr, 24) == b"\xC0" + bytes(23)
+    assert g("UpdateGWorld", out, 8, g.rect_ptr(Rect(0, 0, 3, 40)), 0, 0, 0) & 1 << 31
+
+
+def test_on_basic_quickdraw_dispose_gworld(plus):
+    g = plus
+    out, r = g.ptr(bytes(4)), g.rect_ptr(Rect(0, 0, 40, 40))
+    for _ in range(2):                          # the second time, from the same free memory
+        free = g.heap.free_bytes()
+        assert g("NewGWorld", out, 0, r, 0, 0, 0) == 0
+        gw = g.mem.r32(out)
+        g("DisposeGWorld", gw)
+        assert g.system.port_at(gw) is None
+    assert g.heap.free_bytes() == free

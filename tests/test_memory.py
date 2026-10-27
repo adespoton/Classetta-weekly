@@ -193,6 +193,23 @@ def test_a_locked_handle_at_the_end_grows_the_zone_for_room():
     assert h.deref(hd) == before and h.handle_size(hd) == 0x3000
 
 
+def test_a_locked_handle_grows_the_zone_past_a_handle_it_moves():
+    # Starter Accounts' BASIC runtime grows its locked program handle for
+    # its workspace with an unlocked handle after it: the zone grows for the
+    # room and for the handle it moves (Inside Macintosh II-34: only a
+    # nonrelocatable or locked block above makes a locked block's growth fail).
+    m = RAM(0x10000)
+    h = Heap(m, 0x1000, 0x2000, 0x8000)
+    hd = h.new_handle(8)
+    h.lock(hd)
+    other = h.new_handle(0x20)
+    m.write(h.deref(other), b"o" * 0x20)
+    before, end = h.deref(hd), h.end
+    assert h.set_handle_size(hd, 0x3000) and h.deref(hd) == before and h.end > end
+    assert h.deref(other) > before + 0x3000 and m.read(h.deref(other), 0x20) == b"o" * 0x20
+    assert m.r32(h.start + ZCB_FREE) == sum(n for _, n in h._free)
+
+
 def test_shrinking_frees_the_tail():
     _, h = heap()
     hd = h.new_handle(400)
@@ -398,6 +415,32 @@ def test_a_block_a_program_made_past_the_zone_and_moved_bklim_over_is_in_it():
     assert h.start < q < own and h.ptr_size(p) == 0x20
 
 
+def test_a_zone_a_program_grew_itself_ends_where_it_grew_it():
+    """PackIt III, taking a Mac II's ROM85 for an old ROM's, grows the zone
+    as programs for the 64K ROM did: a free block where the zone ended,
+    then bkLim past it.  The next block that wants room has it there, the
+    zone not growing back over it."""
+    m = RAM(0x20000)
+    ends = []
+    h = Heap(m, 0x1000, 0x2000, 0x8000, on_grow=ends.append)
+    old, new = h.end, 0x9006                # past its limit, and 2 more than a multiple of 4
+    m.w32(old, FREE << 30 | (new - old))
+    m.w32(h.start, new)
+    p = h.new_ptr(0x5000)
+    assert p and h.ptr_size(p) == 0x5000
+    assert h.end == new == m.r32(h.start) and h.room_to_grow() == 0 and ends == []
+    assert h.max_block(grow=False) > 0x2000
+
+
+def test_a_bklim_that_says_nothing_of_the_zone_is_let_be():
+    m = RAM(0x10000)
+    h = Heap(m, 0x1000, 0x2000)
+    end = h.end
+    m.w32(h.start, 0x7777)                  # past anything the zone's blocks reach
+    p = h.new_ptr(0x100)
+    assert p and h.end == end and h.ptr_size(p) == 0x100
+
+
 def test_a_68000s_blocks_are_a_multiple_of_two_bytes():
     """Macintosh Pascal checksums its code with a block's size from its
     header, which on a 68000 is its logical size and 8, made even."""
@@ -449,6 +492,49 @@ def test_a_block_grows_in_place_by_moving_the_ones_after_it():
     h.lock(lk)
     after = h.new_handle(8)
     assert h.set_handle_size(lk, 0x40) and h.deref(lk) < h.deref(after)
+
+
+def test_a_block_grows_past_a_handle_into_the_free_space_after_it():
+    """The handle in the way moves into what's free past the room the block
+    grows into: HyperCard 2.0 grows a pointer past a handle with all the
+    rest of the zone free after it."""
+    m, h = heap(0x1000)
+    h.dispose_handle(h.new_handle(4))               # the master pointers first
+    p = h.new_ptr(0x100)
+    moved = h.new_handle(0x40)
+    m.write(h.deref(moved), b"m" * 0x40)
+    assert h.set_ptr_size(p, 0x180) and h.ptr_size(p) == 0x180
+    assert m.read(h.deref(moved), 0x40) == b"m" * 0x40 and h.deref(moved) > p + 0x180
+    assert m.r32(h.start + ZCB_FREE) == sum(n for _, n in h._free)
+    assert h._walk(h.end) == (h._free, h._blocks)
+
+
+def test_an_unlocked_handle_moves_before_the_blocks_after_it_do():
+    """SetHandleSize moves an unlocked handle with no room after it, and
+    moves the blocks after it only when there's nowhere else for it: Mac'N
+    Med Engine grows its Apple menu just below a segment it's unloaded and
+    is still running in."""
+    m, h = heap(0x1000)
+    h.dispose_handle(h.new_handle(4))               # the master pointers first
+    hd = h.new_handle(16)
+    seg = h.new_handle(0x40)
+    m.write(h.deref(seg), b"s" * 0x40)
+    before = h.deref(seg)
+    assert h.set_handle_size(hd, 0x60) and h.handle_size(hd) == 0x60
+    assert h.deref(seg) == before and m.read(before, 0x40) == b"s" * 0x40
+    assert h.deref(hd) > before
+    # with no free block big enough, the ones after it make way after all
+    big = h.new_handle(0x100)
+    after = h.new_handle(0x40)
+    m.write(h.deref(after), b"a" * 0x40)
+    gap = h.new_handle(0x60)
+    h.new_handle(max(n for _, n in h._free) - 0x100)
+    h.dispose_handle(gap)
+    assert max(n for _, n in h._free) < 0x188
+    assert h.set_handle_size(big, 0x180) and h.handle_size(big) == 0x180
+    assert h.deref(after) > h.deref(big) and m.read(h.deref(after), 0x40) == b"a" * 0x40
+    assert m.r32(h.start + ZCB_FREE) == sum(n for _, n in h._free)
+    assert h._walk(h.end) == (h._free, h._blocks)
 
 
 def test_growing_a_block_reads_back_the_blocks_a_program_made_after_it():
@@ -532,6 +618,8 @@ def test_application_heap_grows_by_the_traps(qapp):
     assert heap.end < limit == heap.limit <= proc.partition.stack_base
     largest, growth = g("MaxMem", 0)
     assert growth == limit - heap.end and largest < growth
+    free = g("FreeMem", 0)                  # zcbFree: not what the zone could grow by
+    assert free == g.mem.r32(heap.start + ZCB_FREE) == heap.free_bytes(grow=False) < growth
     g("SetApplLimit", limit - 0x1000)
     assert world.r32(lowmem.ApplLimit) == heap.limit == limit - 0x1000 and g.mem_err == noErr
     g("MaxApplZone")
@@ -557,6 +645,30 @@ def test_reserve_mem_says_whether_theres_room(qapp):
     assert g.mem_err == noErr
     g("ReserveMem", 0x7FFFFF, 0)
     assert g.mem_err == memFullErr
+
+
+def test_new_rgn_sets_mem_err(qapp):
+    """The Prince quits when MemErr isn't noErr after NewRgn; a PurgeMem
+    for more than the zone has left it at memFullErr just before."""
+    g = Guest()
+    g("PurgeMem", 0x7FFFFFFF, 0)
+    assert g.mem_err == memFullErr
+    assert g("NewRgn") and g.mem_err == noErr
+
+
+def test_a_region_whose_handle_is_in_no_heap_is_left_as_it_is(qapp):
+    """MacTriv passes RectRgn the address of its rectangle, on its stack,
+    for the region, and the region for the rectangle."""
+    g = Guest()
+    rgn = g("NewRgn")
+    empty = g.contents(rgn)
+    local = g.process.heap.limit + 0x100    # where no heap is
+    rect = struct.pack(">4h", 0, 0, 40, 60)
+    g.mem.write(local, rect)
+    low = g.mem.read(0, 10)                 # where its "master pointer" points
+    g("RectRgn", local, rgn)
+    assert g.mem.read(local, 8) == rect and g.mem.read(0, 10) == low
+    assert g.contents(rgn) == empty
 
 
 def test_reserve_mem_grows_the_application_zone(qapp):
@@ -590,7 +702,7 @@ def test_world_holds_globals_until_switched_in():
     assert m.r32(lowmem.WindowList) == 0x5678
     assert a.r32(lowmem.WindowList) == 0x9999
     with pytest.raises(KeyError):
-        a.r32(lowmem.ScrnBase)                    # not a per-application global
+        a.r32(lowmem.MemTop)                      # not a per-application global
 
 
 def test_hand_to_hand_leaves_the_flags_as_d0(qapp):

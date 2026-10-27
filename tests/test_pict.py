@@ -5,6 +5,7 @@ played back, and the masked copies (CopyMask, SeedFill, CalcMask)."""
 import struct
 
 import pytest
+from PyQt6.QtGui import QImage
 
 from macrt.resfork import Resource
 from macrt.toolbox import pict
@@ -235,6 +236,34 @@ def test_direct_bits_in_32_bits(g):
     rows = g.rows(port)
     assert rows[0][:8] == rows[1][:8] == "####...."
     assert ones(rows) == 8
+
+
+@pytest.mark.parametrize("count, op, depth",
+                         [(2, 0x98, 1), (5, 0x98, 4), (40, 0x98, 8), (300, 0x9A, 32)])
+def test_a_colour_image_as_a_pixel_map_reads_back(qapp, count, op, depth):
+    """pixmap_bits: the fewest bits a pixel for the image's colours, or
+    32-bit direct pixels for more than 256 of them, read back as they
+    were drawn."""
+    width, height = 25, 12
+    img = QImage(width, height, QImage.Format.Format_RGB32)
+    for i in range(width * height):
+        n = i % count
+        img.setPixel(i % width, i // width, 0xFF000000 | n * 7 << 16 | n * 13 & 0xFF00 | n)
+    opcode, head, rows, row_bytes = pict.pixmap_bits(img)
+    r = pict.Reader.of(head + struct.pack(">hhhhh", 0, 0, height, width, srcCopy)
+                       + pict.pixel_rows(rows, row_bytes))
+    if opcode == 0x9A:
+        r.read(4)
+    assert opcode == op and r.u16() & 0x3FFF == row_bytes and r.rect() == Rect(0, 0, height, width)
+    pack_type, pixel_size, cmp_count = pict.read_pixmap(r)
+    ctab = pict.read_ctab(r) if opcode == 0x98 else None
+    assert pixel_size == depth
+    r.rect(), r.rect(), r.u16()
+    back = pict.pixel_image(pict.read_pixels(r, row_bytes, height, True, pack_type, width,
+                                             pixel_size, cmp_count),
+                            width, height, pixel_size, ctab, pack_type, cmp_count)
+    assert all(back.pixel(x, y) | 0xFF000000 == img.pixel(x, y)
+               for y in range(height) for x in range(width))
 
 
 def test_a_picture_scales_to_the_destination(g):

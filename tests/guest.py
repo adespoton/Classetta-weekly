@@ -77,8 +77,9 @@ class Guest:
     holding = True              # the machine: there's only this thread
     in_wdef = 0
 
-    def __init__(self, resources=(), **system):
-        self.system = System(**system)
+    def __init__(self, resources=(), sharing=None, **system):
+        """sharing: another Guest, for an application on its machine."""
+        self.system = sharing.system if sharing is not None else System(**system)
         self.mem = self.system.mem
         app = MacFile("Test App", rsrc=build_fork(list(resources)), type=b"APPL",
                       creator=b"TEST")
@@ -159,8 +160,8 @@ class Processor(Guest):
     """A Guest with a CPU: run() executes 68k code, and its A-line traps
     go to the dispatcher as the runtime sends them."""
 
-    def __init__(self, resources=(), **system):
-        super().__init__(resources, **system)
+    def __init__(self, resources=(), sharing=None, **system):
+        super().__init__(resources, sharing, **system)
         self.cpu = CPU(self.mem)
         self.stack_top = self.ptr(bytes(0x100)) + 0x100
         self.cpu.sp = self.stack_top

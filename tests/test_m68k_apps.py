@@ -2,6 +2,7 @@
 source) running on the emulated CPU, driven with synthetic input."""
 
 import struct
+import time
 import wave
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,7 +24,8 @@ from macrt.toolbox import constants as k
 from macrt.toolbox import lowmem
 from macrt.toolbox import qdraw
 from macrt.toolbox import textedit as te
-from macrt.toolbox.events import EventRecord
+from macrt.toolbox.events import EventRecord, tick_count
+from macrt.toolbox.system import DEFAULT_PARTITION, DEFAULT_STACK
 from macrt.toolbox.templates import btnCtrl, chkCtrl, ctrlItem, editText
 from macrt.toolbox.types import Point, Rect
 from macrt.toolbox.windows import describe_proc
@@ -129,12 +131,15 @@ def test_the_system_event_mask_says_what_is_posted(harness):
 
 
 def test_parameter_ram_has_the_timing_the_globals_do(harness):
-    """Wizardry takes its double-click time from volClik, not DoubleTime."""
+    """Wizardry takes its double-click time from volClik, not DoubleTime.
+    The printer port is configured for the Serial Driver, not AppleTalk,
+    which programs then don't try to open (JamPaint)."""
     h = harness()
     proc, _ = launch_hello(h)
     mem = proc.system.mem
     kbd_print, vol_clik = mem.r16(lowmem.SysParam + 14), mem.r16(lowmem.SysParam + 16)
     assert mem.r8(lowmem.SysParam) == 0xA8                         # valid
+    assert mem.r8(lowmem.SysParam + 3) & 0xF == 2                   # SPConfig: port B useAsync
     assert (vol_clik >> 4 & 0xF) * 4 == mem.r32(lowmem.DoubleTime)
     assert (vol_clik & 0xF) * 4 == mem.r32(lowmem.CaretTime)
     assert (kbd_print >> 12) * 4 == mem.r16(lowmem.KeyThresh)
@@ -206,6 +211,27 @@ def test_sys_error_is_a_bomb_but_for_the_alerts_with_no_buttons(harness):
     assert proc.system.mem.r16(lowmem.DSErrCode) == 4
 
 
+@pytest.mark.parametrize("model", ["plus", "ii"])
+def test_a_plus_ignores_bit_9_of_a_toolbox_trap_word_that_names_nothing(harness, model):
+    """The 128K ROM's dispatcher took a Toolbox trap number from bits 0-8:
+    Crozzle 0.8 calls NewWindow as $AB13.  A Mac II's table has more
+    entries, and the word is an unimplemented trap there."""
+    h = harness(model=model)
+    code = bytes.fromhex("42A7"         # CLR.L -(SP)
+                         "AB75"         # _TickCount, with bit 9 set
+                         "2B5F FFFC"    # MOVE.L (SP)+,-4(A5)
+                         "A9F4")        # _ExitToShell
+    app = MacFile("Ticks", rsrc=build_fork(code_resources(code, 4)), type=b"APPL",
+                  creator=b"TICK")
+    proc = h.d.launch(app.name, None, app=app)
+    h.wait_until(lambda: proc not in h.d.processes, timeout=5, what="Ticks to finish")
+    if model == "plus":
+        assert not h.d.system_errors
+        assert proc.system.mem.r32(proc.partition.a5 - 4) > 0
+    else:
+        assert h.d.system_errors[-1][:2] == ("Ticks", 12)
+
+
 def test_the_alert_outlives_the_last_app(harness):
     """With nothing else running, the display stays up until the user has
     read the alert, then closes."""
@@ -266,6 +292,51 @@ def test_an_app_chains_to_another(harness):
     h.wait_until(lambda: proc not in h.d.processes, timeout=5, what="Chainer to go")
     hello = next(p for p in h.d.processes if p.name == "Hello")
     h.wait_until(lambda: hello.windows and hello.windows[0].visible, what="Hello's window")
+
+
+def test_launch_passes_on_the_finder_information(harness):
+    """As the Finder does, starting an application with Launch: what the
+    launcher leaves in AppParmHandle is the new application's Finder
+    information (Cipher names itself there and launches PShell, its
+    interpreter, to run it).  The working directory it names the
+    document by stays open after the launcher quits."""
+    launcher = machfs.File()
+    launcher.type, launcher.creator = b"APPL", b"LNCH"
+    launcher.rsrc = build_fork(code_resources(bytes.fromhex(
+        "2078 0AEC 702C A024"   # MOVEA.L AppParmHandle,A0; MOVEQ #44,D0; _SetHandleSize
+        "2078 0AEC 2050"        # MOVEA.L AppParmHandle,A0; MOVEA.L (A0),A0
+        "20BC 00000001"         # MOVE.L #1,(A0): open, one document
+        "3178 0384 0004"        # MOVE.W DefVRefNum,4(A0)
+        "217C 54455854 0006"    # MOVE.L #'TEXT',6(A0)
+        "4268 000A"             # CLR.W 10(A0): its version
+        "217C 03446F63 000C"    # MOVE.L #$03446F63,12(A0): "Doc"
+        "4267 487A 0006 204F"   # CLR.W -(SP); PEA name(PC); MOVEA.L SP,A0
+        "A9F2"                  # _Launch
+        "09 4469 736B 3A53 7069 6E"), 0))  # name: "Disk:Spin"
+    spin = machfs.File()
+    spin.type, spin.creator = b"APPL", b"SPIN"
+    spin.rsrc = build_fork(code_resources(bytes.fromhex("60FE"), 0))     # BRA.S *
+    v = machfs.Volume()
+    v.name = "Disk"
+    v["Spin"] = spin
+    v["Tools"] = machfs.Folder()
+    v["Tools"]["Launcher"] = launcher
+    vol = load_volume(v.write(800 * 1024, desktopdb=False, bootable=False))
+    h = harness(disks=[vol])
+    app = next(a for a in volume_files(vol) if a.name == "Launcher")
+    proc = h.d.launch(app.name, None, app=app)
+    wd = proc.files.default[0]                      # the Tools folder's
+    h.wait_until(lambda: proc not in h.d.processes, timeout=5, what="Launcher to quit")
+    new = next(p for p in h.d.processes if p.name == "Spin")
+    expected = struct.pack(">hhh4sBx", 0, 1, wd, b"TEXT", 0) + b"\x03Doc"
+
+    def info():
+        hd = new.world.r32(lowmem.AppParmHandle)
+        return new.system.mem.read(new.heap.deref(hd), 16) if hd else b""
+    h.wait_until(lambda: info() == expected, what="Spin's Finder information")
+    fs = new.files.fs
+    assert wd < 0 and new.files in fs.wds[wd].owners
+    assert fs.wds[wd].dirid == fs.volume_named("Disk").root.child("Tools").cnid
 
 
 def test_launch_with_an_fsspec_and_launch_continue(harness):
@@ -365,6 +436,38 @@ def test_a_segment_unloaded_and_loaded_again_is_locked_again(harness):
     assert not state & 0x40                     # and not purgeable
 
 
+def test_load_seg_moves_an_unlocked_segment_high(harness):
+    """A segment without the resLocked attribute LoadSeg moves high with
+    MoveHHi before it locks it, out of the way of the blocks allocated low
+    (Inside Macintosh IV, The Segment Loader): HyperCard 2.0 grows a
+    pointer it has just made past where its next segment was read in."""
+    h = harness()
+    h.launch(Recorder("Other"))
+    entry = lambda seg: bytes.fromhex(f"00003F3C{seg:04X}A9F0")     # noqa: E731
+    table = entry(1) + entry(2)
+    code0 = bytes.fromhex(f"{32 + len(table):08X}00000008{len(table):08X}00000020") + table
+    main = bytes.fromhex("0000 0001"            # first entry 0, one entry
+                         "4EAD 002A"            # JSR 42(A5): entry 1, in CODE 2
+                         "42A7 2F3C 434F4445"   # CLR.L -(SP); MOVE.L #'CODE',-(SP)
+                         "3F3C 0002 A9A0"       # MOVE.W #2,-(SP); _GetResource
+                         "205F 2B50 FFFC"       # MOVEA.L (SP)+,A0; MOVE.L (A0),-4(A5)
+                         "7010 A11E"            # MOVEQ #16,D0; _NewPtr
+                         "2B48 FFF8"            # MOVE.L A0,-8(A5)
+                         "A9F4")                # _ExitToShell
+    sub = bytes.fromhex("0008 0001 4E75")       # first entry 8, one entry; RTS
+    app = MacFile("Segs", rsrc=build_fork([
+        Resource(b"CODE", 0, code0, b"", 0x20 | LOCKED_PRELOAD),
+        Resource(b"CODE", 1, main, b"Main", LOCKED_PRELOAD),
+        Resource(b"CODE", 2, sub, b"Sub", 0x20)]), type=b"APPL", creator=b"SEGS")
+    proc = h.d.launch(app.name, None, app=app)
+    mem, a5 = proc.system.mem, proc.partition.a5
+    h.wait_until(lambda: proc not in h.d.processes, timeout=5, what="Segs to quit")
+    assert not h.d.system_errors
+    master, ptr = mem.r32(a5 - 4), mem.r32(a5 - 8)
+    assert master >> 24 & 0x80                  # locked
+    assert master & 0xFFFFFF > ptr              # and above a pointer made after it
+
+
 def test_a_jump_table_entry_called_with_flags_in_its_high_byte(harness):
     """A 68000 ignores an address's high byte: Macintosh Pascal calls jump
     table entries through addresses with a master pointer's flags in it,
@@ -379,6 +482,56 @@ def test_a_jump_table_entry_called_with_flags_in_its_high_byte(harness):
                          "2008 08C0 001F 2040"  # with bit 31 set
                          "4E90"                 # JSR (A0)
                          "3B40 FFF0"            # MOVE.W D0,-16(A5)
+                         "A9F4")                # _ExitToShell
+    sub = bytes.fromhex("0008 0001 7007 4E75")  # first entry 8, one entry; MOVEQ #7,D0; RTS
+    app = MacFile("Segs", rsrc=build_fork([
+        Resource(b"CODE", 0, code0, b"", 0x20 | LOCKED_PRELOAD),
+        Resource(b"CODE", 1, main, b"Main", 0x20),
+        Resource(b"CODE", 2, sub, b"Sub", 0x20)]), type=b"APPL", creator=b"SEGS")
+    proc = h.d.launch(app.name, None, app=app)
+    mem, a5 = proc.system.mem, proc.partition.a5
+    h.wait_until(lambda: proc not in h.d.processes, timeout=5, what="Segs to quit")
+    assert not h.d.system_errors
+    assert mem.r16s(a5 - 16) == 7                   # CODE 2 ran
+
+
+def test_segment_ffff_is_code_minus_one(harness):
+    """A segment number is an INTEGER: GraphicConverter's first entry
+    loads segment $FFFF, its CODE -1."""
+    h = harness()
+    h.launch(Recorder("Other"))
+    entry = lambda seg: bytes.fromhex(f"00003F3C{seg:04X}A9F0")     # noqa: E731
+    table = entry(0xFFFF) + entry(1)
+    code0 = bytes.fromhex(f"{32 + len(table):08X}00000010{len(table):08X}00000020") + table
+    first = bytes.fromhex("0000 0001"           # first entry 0, one entry
+                          "7007 3B40 FFF0"      # MOVEQ #7,D0; MOVE.W D0,-16(A5)
+                          "A9F4")               # _ExitToShell
+    main = bytes.fromhex("0008 0001 4E75")      # first entry 8, one entry; RTS
+    app = MacFile("Segs", rsrc=build_fork([
+        Resource(b"CODE", 0, code0, b"", 0x20 | LOCKED_PRELOAD),
+        Resource(b"CODE", -1, first, b"", 0x20),
+        Resource(b"CODE", 1, main, b"Main", 0x20)]), type=b"APPL", creator=b"SEGS")
+    proc = h.d.launch(app.name, None, app=app)
+    mem, a5 = proc.system.mem, proc.partition.a5
+    h.wait_until(lambda: proc not in h.d.processes, timeout=5, what="Segs to quit")
+    assert not h.d.system_errors
+    assert mem.r16s(a5 - 16) == 7                   # CODE -1 ran
+
+
+def test_a_segment_is_read_in_while_resload_is_off(harness):
+    """LoadSeg reads in a segment that isn't in memory whatever ResLoad
+    is: SoundApp calls a routine in another segment between its
+    SetResLoad(FALSE) and SetResLoad(TRUE)."""
+    h = harness()
+    h.launch(Recorder("Other"))
+    entry = lambda seg: bytes.fromhex(f"00003F3C{seg:04X}A9F0")     # noqa: E731
+    table = entry(1) + entry(2)
+    code0 = bytes.fromhex(f"{32 + len(table):08X}00000010{len(table):08X}00000020") + table
+    main = bytes.fromhex("0000 0001"            # first entry 0, one entry
+                         "4267 A99B"            # CLR.W -(SP); _SetResLoad: FALSE
+                         "4EAD 002A"            # JSR 42(A5): entry 1, in CODE 2
+                         "3B40 FFF0"            # MOVE.W D0,-16(A5)
+                         "1F3C 0001 A99B"       # MOVE.B #1,-(SP); _SetResLoad: TRUE
                          "A9F4")                # _ExitToShell
     sub = bytes.fromhex("0008 0001 7007 4E75")  # first entry 8, one entry; MOVEQ #7,D0; RTS
     app = MacFile("Segs", rsrc=build_fork([
@@ -426,6 +579,82 @@ def test_a_trap_through_the_roms_dispatcher(harness):
     assert not h.d.system_errors
     assert mem.r32(a5 - 12) == mem.r32(0x28)
     assert mem.r32(a5 - 16) == 0xF000
+
+
+@pytest.mark.parametrize("model", ["plus", "ii"])
+def test_loadtrap_and_an_a_line_handler_of_the_programs_own(harness, model):
+    """A program's own handler in vector $28 sees every A-line trap, and
+    goes on to the ROM's dispatcher.  With LoadTrap set, _LoadSeg calls
+    _Debugger with the routine it loaded on the stack, as Crystal Paint
+    DEMO's handler expects, and goes on to it."""
+    h = harness(model=model)
+    h.launch(Recorder("Other"))
+    entry = lambda seg: bytes.fromhex(f"00003F3C{seg:04X}A9F0")     # noqa: E731
+    table = entry(1) + entry(2)
+    code0 = bytes.fromhex(f"{32 + len(table):08X}00000010{len(table):08X}00000020") + table
+    main = bytes.fromhex("0000 0001"            # first entry 0, one entry
+                         "2B78 0028 FFF8"       # MOVE.L $28.W,-8(A5): the old vector
+                         "41FA 001A 21C8 0028"  # LEA handler(PC),A0; MOVE.L A0,$28.W
+                         "50F8 012D"            # ST LoadTrap
+                         "4EAD 002A"            # JSR 42(A5): entry 2, in CODE 2
+                         "3B40 FFF0"            # MOVE.W D0,-16(A5)
+                         "21ED FFF8 0028"       # MOVE.L -8(A5),$28.W
+                         "A9F4"                 # _ExitToShell
+                         "2F08"                 # handler: MOVE.L A0,-(SP)
+                         "206F 0006"            # MOVEA.L 6(SP),A0: where the trap is
+                         "526D FFFE"            # ADDQ.W #1,-2(A5)
+                         "0C50 A9FF 6614"       # CMPI.W #_Debugger,(A0); BNE.S chain
+                         "4238 012D"            # CLR.B LoadTrap
+                         "41EF 000A"            # LEA 10(SP),A0: above a 68000's frame
+                         "4A38 012F 6702"       # TST.B CPUFlag; BEQ.S 1f
+                         "5448"                 # ADDQ.W #2,A0: above a 68020's
+                         "2B50 FFF4"            # 1: MOVE.L (A0),-12(A5)
+                         "205F"                 # chain: MOVEA.L (SP)+,A0
+                         "2F2D FFF8 4E75")      # MOVE.L -8(A5),-(SP); RTS
+    sub = bytes.fromhex("0008 0001 7007 4E75")  # first entry 8, one entry; MOVEQ #7,D0; RTS
+    app = MacFile("Segs", rsrc=build_fork([
+        Resource(b"CODE", 0, code0, b"", 0x20 | LOCKED_PRELOAD),
+        Resource(b"CODE", 1, main, b"Main", 0x20),
+        Resource(b"CODE", 2, sub, b"Sub", 0x20)]), type=b"APPL", creator=b"SEGS")
+    proc = h.d.launch(app.name, None, app=app)
+    mem, a5 = proc.system.mem, proc.partition.a5
+    h.wait_until(lambda: proc not in h.d.processes, timeout=5, what="Segs to quit")
+    assert not h.d.system_errors
+    assert mem.r16s(a5 - 16) == 7                   # CODE 2 ran
+    assert mem.r16(a5 - 2) == 2                     # _LoadSeg, then _Debugger
+    assert mem.r32(a5 - 12) == mem.r32(a5 + 44)     # the routine, as the entry has it
+    assert mem.r8(lowmem.LoadTrap) == 0
+
+
+def test_quickdraw_goes_back_to_the_a5_before_an_init_graf_on_a_frame(harness):
+    """DD Expand finds the screen's bounds by calling InitGraf with A5 on a
+    stack frame, then puts A5 back: QuickDraw's globals are at 0(A5) again,
+    and OpenPort makes its port thePort there, not in the frame."""
+    h = harness()
+    h.launch(Recorder("Other"))
+    code0 = bytes.fromhex("00000028 00000200 00000008 00000020"
+                          "0000 3F3C 0001 A9F0")
+    main = bytes.fromhex("0000 0001"            # first entry 0, one entry
+                         "486D FFFC A86E"       # PEA -4(A5); _InitGraf
+                         "4E56 FF00 2F0D"       # LINK A6,#-256; MOVE.L A5,-(SP)
+                         "4BEE FFE0"            # LEA -32(A6),A5: globals in the frame
+                         "486D FFFC A86E"       # PEA -4(A5); _InitGraf
+                         "2A5F 4E5E"            # MOVEA.L (SP)+,A5; UNLK A6
+                         "203C 0000 006C A31E"  # MOVE.L #108,D0; _NewPtr,Clear
+                         "2B48 FE10"            # MOVE.L A0,-496(A5)
+                         "2F08 A86F"            # MOVE.L A0,-(SP); _OpenPort
+                         "A9F4")                # _ExitToShell
+    app = MacFile("Expand", rsrc=build_fork([
+        Resource(b"CODE", 0, code0, b"", 0x20 | LOCKED_PRELOAD),
+        Resource(b"CODE", 1, main, b"Main", 0x20)]), type=b"APPL", creator=b"XPND")
+    proc = h.d.launch(app.name, None, app=app)
+    mem = proc.system.mem
+    h.wait_until(lambda: proc not in h.d.processes, timeout=5, what="Expand to quit")
+    assert not h.d.system_errors
+    a5 = proc.world.r32(lowmem.CurrentA5)
+    assert proc.partition.a5 == a5
+    port = mem.r32(a5 - 496)
+    assert port and mem.r32(mem.r32(a5)) == port
 
 
 def test_a_segment_is_read_through_a_patch_on_getresource(harness):
@@ -705,7 +934,8 @@ def test_vbl_tasks_run_every_tick_until_removed(harness):
     Delay, the host having the processor; then it masks interrupts, then
     removes the task, and the task doesn't run in either case.  A task
     that doesn't set its count again runs once and is taken out of the
-    queue, and can be installed again."""
+    queue, and can be installed again.  The task's word above its return
+    address lands in what the interrupt stacked, not in the spin's stack."""
     h = harness()
     h.launch(Recorder("Other"))
     f = open_application(APPS / "VBL.bin")
@@ -715,6 +945,7 @@ def test_vbl_tasks_run_every_tick_until_removed(harness):
     assert not h.d.system_errors
     assert mem.r16s(a5 - 16) >= 10                  # its runs
     assert mem.r32(a5 - 26) == 0x12345678           # the spin's D1, as it left it
+    assert mem.r32(a5 - 36) == 0xCAFEF00D           # what it had on its stack
     assert 12 <= mem.r16s(a5 - 28) <= 16            # every other tick of 30
     assert mem.r16s(a5 - 18) == 0                   # none while masked
     assert mem.r16s(a5 - 20) == 0                   # VRemove: noErr
@@ -738,6 +969,66 @@ def test_get_next_event_with_nothing_to_give_returns_at_once(harness):
     assert not h.d.system_errors
     assert mem.r32(a5 - 20) <= 45                   # a tick each, not two
     assert 25 <= mem.r32(a5 - 24) <= 45             # and no more than one a tick
+    assert proc.runner.unimplemented_calls == {}
+
+
+def test_a_program_asking_over_and_over_leaves_the_host_the_processor(harness):
+    """Spin asks TickCount over and over for a second, then Button until
+    the mouse goes down, with nothing else in its loops.  The ticks come
+    as they would and it sees the press at once, but its thread is
+    mostly waiting for them, not asking."""
+    h = harness()
+    h.launch(Recorder("Other"))
+    f = open_application(APPS / "Spin.bin")
+    proc = h.d.launch(f.name, None, app=f)
+    mem, a5 = proc.system.mem, proc.partition.a5
+    clock = time.pthread_getcpuclockid(proc.thread.ident)
+    shares = []
+    for phase, what in ((1, "Spin to ask TickCount"), (2, "a second's ticks")):
+        h.wait_until(lambda: mem.r16(a5 - 2) == phase, timeout=5, what=what)
+        used, began = time.clock_gettime(clock), time.monotonic()
+        if phase == 2:
+            h.settle(500)
+        else:
+            h.wait_until(lambda: mem.r16(a5 - 2) == 2, timeout=5, what=what)
+        shares.append((time.clock_gettime(clock) - used) / (time.monotonic() - began))
+    pressed = tick_count()
+    h.press(400, 400)
+    h.wait_until(lambda: proc not in h.d.processes, timeout=5, what="Spin to see the press")
+    h.release(400, 400)
+    assert not h.d.system_errors
+    assert 60 <= mem.r32(a5 - 10) <= 90             # the second, in ticks
+    assert mem.r32(a5 - 6) >= 60                    # asking at each of them
+    assert mem.r32(a5 - 14) - pressed <= 4          # and seeing the press
+    assert all(share < 0.5 for share in shares), shares
+    assert proc.runner.unimplemented_calls == {}
+
+
+def test_an_update_event_left_unanswered_comes_once_a_tick(harness):
+    """Unanswered never draws its window, so GetNextEvent gives it the
+    update event each time it asks, as on a Mac: but asked again in the
+    same tick, it waits for the next, so 30 calls one after another take
+    about 30 ticks.  Asking for a click after them, it sees the press at
+    once, its thread mostly waiting."""
+    h = harness()
+    h.launch(Recorder("Other"))
+    f = open_application(APPS / "Unanswered.bin")
+    proc = h.d.launch(f.name, None, app=f)
+    mem, a5 = proc.system.mem, proc.partition.a5
+    clock = time.pthread_getcpuclockid(proc.thread.ident)
+    h.wait_until(lambda: mem.r16(a5 - 228) == 2, timeout=5, what="Unanswered to ask 30 times")
+    used, began = time.clock_gettime(clock), time.monotonic()
+    h.settle(500)
+    share = (time.clock_gettime(clock) - used) / (time.monotonic() - began)
+    pressed = tick_count()
+    h.press(100, 100)
+    h.wait_until(lambda: proc not in h.d.processes, timeout=5, what="Unanswered to see the press")
+    h.release(100, 100)
+    assert not h.d.system_errors
+    assert mem.r32(a5 - 232) >= 28                  # the update, each time but the activate
+    assert 25 <= mem.r32(a5 - 236) <= 45            # once a tick
+    assert mem.r32(a5 - 240) - pressed <= 4         # and the press at once
+    assert share < 0.5, share
     assert proc.runner.unimplemented_calls == {}
 
 
@@ -785,7 +1076,10 @@ def test_an_applications_own_driver(harness):
     leaves a control call going, asynchronously, for a status call to
     finish through IODone, then synchronously, waiting while a VBL task
     makes the status call; kills one left going; closes it, writes to it
-    closed, and opens it again.  When it quits, the driver's gone."""
+    closed, and opens it again.  .Echo's open routine leaves D0 non-zero
+    and .Shy's puts openErr in ioResult: an open's result is ioResult's
+    (Inside Macintosh II, the Device Manager).  When it quits, the
+    driver's gone."""
     h = harness()
     h.launch(Recorder("Other"))
     f = open_application(APPS / "Driver.bin")
@@ -806,6 +1100,7 @@ def test_an_applications_own_driver(harness):
     assert (word(234), word(236)) == (0, -28)           # Close; notOpenErr after it
     assert (word(238), word(240)) == (0, -21)           # open again, the same unit
     assert word(242) == -43                             # .Nope: no such driver, or file
+    assert word(244) == -23                             # .Shy: openErr
     table = mem.r32(lowmem.UTableBase)
     assert mem.r32(table + 4 * 20) == 0 and machine.drivers == {}
     assert proc.runner.unimplemented_calls == {}
@@ -887,10 +1182,11 @@ def test_a_desk_accessory(harness):
 
 
 # -- Panel: a control panel -----------------------------------------------------------
-def launch_panel(h, monkeypatch, runs_here=1, extra=()):
+def launch_panel(h, monkeypatch, runs_here=1, extra=(), memory=None):
     """Panel, its 'cdev' answering macDev with runs_here, and a log of
     what the host sends it: (message, item, storage, the result).  extra
-    are resources it has as well, or instead of its own."""
+    are resources it has as well, or instead of its own; memory is its
+    file's memory size, in bytes."""
     sent = []
     send = controlpanel.Host._send
 
@@ -908,7 +1204,7 @@ def launch_panel(h, monkeypatch, runs_here=1, extra=()):
         *(Resource(e.type, e.id, bytes(code) if e.type == b"cdev" else fork.raw(e))
           for e in fork.entries if (e.type, e.id) not in replaced), *extra]))
     h.launch(Recorder("Other"))
-    return h.d.launch(f.name, None, app=f), sent
+    return h.d.launch(f.name, None, app=f, memory=memory), sent
 
 
 def test_a_control_panel(harness, monkeypatch):
@@ -963,6 +1259,31 @@ def test_a_control_panel_for_another_macintosh(harness, monkeypatch):
     proc, sent = launch_panel(h, monkeypatch, runs_here=0)
     h.wait_until(lambda: proc not in h.d.processes, timeout=10, what="Panel to finish")
     assert [m for m, *_ in sent] == [controlpanel.macDev] and not h.d.system_errors
+
+
+def test_a_control_panels_size_resource_is_not_its_partition(harness, monkeypatch):
+    """A SIZE resource in its file, and its file's memory size, are for
+    the application its CODE makes: hosted, it has the host's partition."""
+    size = struct.pack(">HII", 0, 64 << 10, 64 << 10)
+    h = harness()
+    proc, sent = launch_panel(h, monkeypatch, extra=[Resource(b"SIZE", -1, size)],
+                              memory=1024 << 10)
+    h.wait_until(lambda: proc.windows and proc.windows[0].visible and len(sent) >= 2,
+                 timeout=10, what="Panel's window")
+    assert proc.partition.end - proc.partition.start == DEFAULT_PARTITION
+    assert h.d.memory_sizes == {proc.app.key: 1024 << 10}
+    assert not h.d.system_errors
+
+
+def test_a_files_memory_size_is_for_its_later_launches(harness):
+    """As Get Info's memory size is the file's: After Dark 4.0's panel
+    launches the application in its own file, which needs it."""
+    h = harness()
+    app = MacFile("Sized", type=b"APPL", creator=b"TEST", rsrc=build_fork([]))
+    first = h.d.launch(app.name, Recorder(app.name), app=app, memory=900 << 10)
+    later = h.d.launch(app.name, Recorder(app.name), app=app)
+    for proc in (first, later):
+        assert proc.partition.end - proc.partition.start == (900 << 10) + DEFAULT_STACK
 
 
 def test_a_control_panels_text_is_in_its_finf_s_font(harness, monkeypatch):

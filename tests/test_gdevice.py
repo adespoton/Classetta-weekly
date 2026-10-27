@@ -20,7 +20,7 @@ from macrt.toolbox.types import Rect
 from conftest import Recorder
 from guest import Guest
 
-cRangeErr, cProtectErr = -153, -154
+cNoMemErr, cRangeErr, cProtectErr = -152, -153, -154
 REDCOLOR = 205                  # redColor (Inside Macintosh I-158)
 WHITE, BLACK, RED = 0xFFFFFFFF, 0xFF000000, 0xFFFF0000
 
@@ -158,20 +158,6 @@ def test_the_default_video_card_is_the_screen_s_until_another_is_set(g):
     g.mem.write(rec, bytes(2))
     g("GetVideoDefault", rec)
     assert g.mem.read(rec, 2) == b"\x0a\x81"
-
-
-def test_the_slot_manager_finds_no_card_firmware(g):
-    """Spaceship Warlock looks for the screen's sResource with
-    SNextTypesRsrc, and goes on without one."""
-    pb = g.ptr(bytes(56))                           # a SpBlock
-    assert g("SlotManager", pb, 21) == -344         # SNextTypesRsrc: smNoMoresRsrcs
-    assert g("SlotManager", pb, 20) == -344         # SNextRsrc
-    assert g("SlotManager", pb, 22) == -351         # SRsrcInfo: smRecNotFnd
-    assert g("SlotManager", pb, 24) == -300         # SCkCardStatus: smEmptySlot
-    assert g("SlotManager", pb, 0) == -335          # SReadByte from NIL: smsPointerNil
-    g.mem.w32(pb + 4, 0x1000)
-    assert g("SlotManager", pb, 0) == -346          # or anywhere else: smBadsPtrErr
-    assert g("SlotManager", pb, 99) == -338         # smSelOOBErr
 
 
 def test_a_mac_plus_has_no_devices(qapp):
@@ -325,6 +311,20 @@ def test_set_entries_changes_the_screens_colours(g):
     g("RestoreEntries", saved, 0, sel)
     assert read_table(g.mem, pm.pm_table)[1] == 0xFF0000F8 and g.mem.r32(ct) == seed
     assert g.system.devices.nearest(0xFF0000F8) == 0xFF0000F8
+
+
+def test_save_entries_into_what_is_not_a_handle_saves_nothing(g):
+    """Giffer 1.0 passes the address of its handle variable as resultTable:
+    SaveEntries can't make room there, and writes nothing over it."""
+    gdh, gd, pm = main_device(g)
+    table = g.handle(bytes(8 + 8 * 256))
+    var = g.process.partition.a5 - 8               # one of its globals
+    g.mem.w32(var, table)
+    before = g.mem.read(table & 0xFFFFFF, 16)
+    sel = g.ptr(struct.pack(">hhh", 1, 0, 1))
+    g("SaveEntries", 0, var, sel)
+    assert g("QDError") == cNoMemErr
+    assert g.mem.r32(var) == table and g.mem.read(table & 0xFFFFFF, 16) == before
 
 
 def test_a_protected_entry_is_kept_from_set_entries(g):

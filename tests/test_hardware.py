@@ -6,6 +6,7 @@ import time
 from types import SimpleNamespace
 
 import pytest
+from guest import Processor
 from PyQt6.QtCore import QEvent, QPoint, Qt
 from PyQt6.QtGui import QKeyEvent
 from PyQt6.QtTest import QTest
@@ -184,6 +185,23 @@ def test_68k_code_reads_the_via_where_low_memory_says():
             assert bool(cpu.d(0) & vSW) is not is_down
     finally:
         cpu.close()
+
+
+def test_bitset_bitclr_and_bittst_reach_the_vias_registers(qapp):
+    """Mission Starlight turns the sound on with BitSet, on the address low
+    memory's VIA holds: bit 0 is vBufB's high bit."""
+    m = Processor()
+    via = VIA()
+    via.map(m.cpu.uc)
+    via.write(vDirB, 0xFF)
+    via.write(vBufB, 0x07)
+    bit_0 = f"2F3C{VIA_BASE:08X}" "42A7"                # MOVE.L #VIA,-(SP); CLR.L -(SP)
+    m.run(bytes.fromhex(bit_0 + "A85E"                  # _BitSet
+                        + "4267" + bit_0 + "A85D3E1F"   # CLR.W -(SP); _BitTst; MOVE.W (SP)+,D7
+                        + bit_0 + "A85F"                # _BitClr
+                        + "4267" + bit_0 + "A85D3C1F"))  # ...; MOVE.W (SP)+,D6
+    assert m.cpu.d(7) & 0xFF00 == 0x0100 and m.cpu.d(6) & 0xFF00 == 0
+    assert via.regs[vBufB] == 0x07
 
 
 # -- the IWM -------------------------------------------------------------------
@@ -567,7 +585,7 @@ def test_a_512x342_screen_is_where_a_mac_512k_has_it(qapp):
     bits = system.screen_bits
     assert bits.base == CLASSIC_SCREEN == system.mem.r32(lowmem.ScrnBase)
     assert bits.row_bytes == 64
-    assert system.sys_heap.end <= CLASSIC_ALTERNATE     # clear of both screens
+    assert system.sys_heap.limit <= CLASSIC_ALTERNATE   # clear of both screens
     p = system.open_partition("Game")
     assert p.start >= CLASSIC_SCREEN + 64 * 342 or p.end <= CLASSIC_ALTERNATE
 

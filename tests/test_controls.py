@@ -296,6 +296,69 @@ def test_a_title_is_clipped_to_the_controls_rectangle(qapp):
                          for x, y in inked)
 
 
+def test_a_buttons_title_has_a_line_for_each_return(qapp):
+    """Air Traffic Controller 4.0's author's address is a button whose
+    title has three lines, each centered (Inside Macintosh IV, The Control
+    Manager)."""
+    g = Guest()
+    g.yielding = nullcontext
+    content = Rect(80, 60, 160, 260)
+    w = WindowRecord.new(g.system, g.process, g.heap, 0, content, "Lines", True,
+                         k.documentProc, True, 0)
+    img = QImage(content.width, content.height, QImage.Format.Format_RGB32)
+    img.fill(QColor(255, 255, 255))
+    g.tb.qd.surfaces[w.addr] = ImageSurface(img, w.port_rect)
+    g.set_port(w)
+    box = Rect(9, 11, 65, 186)
+    glue_controls.new_control(g, w, box, b"Walter\rRoute des Cultures\rFrance", True, 0, 0, 1,
+                              k.pushButProc, 0)
+    inside = box.inset(3, 3)
+    rows = [[x for x in range(inside.left, inside.right) if img.pixel(x, y) & 0xFFFFFF == 0]
+            for y in range(inside.top, inside.bottom)]
+    bands = []
+    for y, xs in enumerate(rows):
+        if xs and (not bands or not rows[y - 1]):
+            bands.append([])
+        if xs:
+            bands[-1] += xs
+    assert len(bands) == 3
+    middle = (box.left + box.right) / 2
+    assert all(abs((min(xs) + max(xs)) / 2 - middle) <= 2 for xs in bands)
+    assert max(bands[1]) - min(bands[1]) > max(bands[0]) - min(bands[0])
+
+
+def test_a_title_draws_chicagos_command_symbol(qapp):
+    """DoppleMaker's button "Dopple \\x11D" and ToMultiFinder's "Finder
+    \\x11F" are drawn with the symbol Chicago has at $11, as DrawString
+    draws it."""
+    g = Guest()
+    g.yielding = nullcontext
+
+    def window(name, top):
+        content = Rect(top, 60, top + 40, 260)
+        w = WindowRecord.new(g.system, g.process, g.heap, 0, content, name, True,
+                             k.documentProc, True, 0)
+        img = QImage(content.width, content.height, QImage.Format.Format_RGB32)
+        img.fill(QColor(255, 255, 255))
+        g.tb.qd.surfaces[w.addr] = ImageSurface(img, w.port_rect)
+        g.set_port(w)
+        return w, img
+
+    def ink(img, r):
+        dots = {(x, y) for y in range(r.top, r.bottom) for x in range(r.left, r.right)
+                if img.pixel(x, y) & 0xFFFFFF == 0}
+        left, top = min(x for x, _ in dots), min(y for _, y in dots)
+        return {(x - left, y - top) for x, y in dots}
+
+    w, titled = window("Button", 80)
+    box = Rect(5, 10, 27, 110)
+    glue_controls.new_control(g, w, box, b"Dopple \x11D", True, 0, 0, 1, k.pushButProc, 0)
+    _, drawn = window("String", 140)
+    g.tb.MoveTo(20, 25)
+    g.tb.DrawString("Dopple \x11D")
+    assert ink(titled, box.inset(3, 3)) == ink(drawn, Rect(0, 0, 40, 200))
+
+
 def test_a_check_box_value_or_hilite_redraws_only_its_box(qapp):
     """SetCtlValue asks for the indicator, 129, to be drawn, and
     HiliteControl for the part: a check box's box.  What's drawn over the

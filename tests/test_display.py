@@ -274,6 +274,22 @@ def test_a_window_whose_storage_has_flags_in_the_high_byte(harness):
     assert list(proc.windows) == [first] and proc.system.port_at(storage) is None
 
 
+def test_a_windows_title_width_is_its_width_in_the_system_font(harness):
+    """titleWidth, which the System's WDEF 0 centres the title by (Inside
+    Macintosh I, The Window Manager): HyperCard 2.0's card window showed
+    only the start of its "Home"."""
+    h = harness()
+    app = Recorder("App", windows=1)
+    h.launch(app)
+    w = app.tb.NewWindow(Rect.from_xywh(40, 60, 200, 100), "Sheet", True)
+    width = lambda s: app.tb.qd.text_width(None, s)      # noqa: E731
+    assert w.title_width == width("Sheet") > 0
+    app.tb.SetWTitle(w, "Home")
+    assert w.title_width == width("Home") != width("Sheet")
+    app.tb.SetWTitle(w, "")
+    assert w.title_width == 0
+
+
 # -- menus -------------------------------------------------------------------
 @pytest.mark.parametrize("menu_bar", MENUBARS)
 def test_menu_press_drag_release(harness, menu_bar):
