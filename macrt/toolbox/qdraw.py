@@ -1288,7 +1288,7 @@ class QuickDraw:
         if own is not None:
             return own
         base = port.port_bits_base & ADDRESS_MASK
-        if port.backing is not None and base == self.sys.screen_bits.base:
+        if port.backing is not None and self.mem.physical(base) == self.sys.screen_bits.base:
             self.sys.screen.look()      # what the program wrote in the screen buffer first
             return WindowSurface(port)
         if port.is_color:
@@ -1306,7 +1306,7 @@ class QuickDraw:
         rowBytes, in the BitMap's coordinates.  None for any other."""
         devices = self.sys.devices
         if (devices is None or self.sys.depth == 1
-                or base & ADDRESS_MASK != self.sys.screen_bits.base):
+                or self.mem.physical(base) != self.sys.screen_bits.base):
             return None
         pm = devices.pixmap(devices.main)
         if pm is None:
@@ -1330,8 +1330,7 @@ class QuickDraw:
         any other BitMap."""
         if port is None or port is _NoPort or port.addr in self.surfaces:
             return 1
-        if (port.backing is not None
-                and port.port_bits_base & ADDRESS_MASK == self.sys.screen_bits.base):
+        if self._window_on_screen(port):
             return self.sys.depth
         if port.is_color:
             pm = port.pixmap()
@@ -1339,22 +1338,27 @@ class QuickDraw:
         surface = self.on_screen(port.port_bits_base, port.port_bits_bounds)
         return surface.depth if surface is not None else 1
 
+    def _window_on_screen(self, port: GrafPort) -> bool:
+        """Whether port is a window's whose portBits are the screen (and
+        so draws in its Backing)."""
+        return (port.backing is not None
+                and self.mem.physical(port.port_bits_base) == self.sys.screen_bits.base)
+
     def _values(self, port: GrafPort | None) -> bool:
         """Whether port draws in pixel values as they are (in_values): a
         cGrafPort whose pixels are a PixMap of 2 to 8 bits, not a window's
         on the screen."""
         return (port is not None and port is not _NoPort and port.is_color
                 and port.addr not in self.surfaces and 1 < self.depth(port) <= 8
-                and not (port.backing is not None
-                         and port.port_bits_base & ADDRESS_MASK == self.sys.screen_bits.base))
+                and not self._window_on_screen(port))
 
     def colors(self, port: GrafPort | None, depth: int = 1,
                values: bool | None = None) -> tuple[int, int]:
         """The foreground and background colours port draws in on pixels
         of depth bits: black and white on a bitmap (port_colors); on a
-        colour screen, the nearest it has to the port's colours, a
-        cGrafPort's RGB ones, unless its pixel value is one reserved for
-        animation (PmForeColor's), which is the colour drawn in.  At 1 bit
+        colour screen, a cGrafPort's pixel values, as _device_color has
+        them (a window's on the screen, the colours the screen has for
+        them now).  At 1 bit
         a cGrafPort's are black or white, whichever is nearer; if both
         would be the same and they aren't, the foreground is the other
         (Inside Macintosh V-58).  Drawn in pixel values (values, by default
@@ -1371,8 +1375,9 @@ class QuickDraw:
                 return shown[port.fg_color & last], shown[port.bk_color & last]
             fg, bk = rgb_argb(port.rgb_fg_color), rgb_argb(port.rgb_bk_color)
             if depth > 1 and devices is not None:
-                return (self._device_color(port.fg_color, fg),
-                        self._device_color(port.bk_color, bk))
+                as_is = self._window_on_screen(port)
+                return (self._device_color(port.fg_color, fg, as_is),
+                        self._device_color(port.bk_color, bk, as_is))
             mono_fg, mono_bk = mono_argb(fg), mono_argb(bk)
             if mono_fg == mono_bk and fg != bk:
                 mono_fg ^= 0xFFFFFF
@@ -1400,15 +1405,20 @@ class QuickDraw:
             got.append(table[value] if value is not None and 0 <= value < len(table) else color)
         return got[0], got[1]
 
-    def _device_color(self, value: int, argb: int) -> int:
+    def _device_color(self, value: int, argb: int, as_is: bool = False) -> int:
         """The colour a cGrafPort's pixel value and RGB colour draw in on
-        the screen: the nearest to the RGB colour, unless the value is
-        reserved for animation, or is an entry of that same colour (one
-        of several alike, as when a program fades the screen to black).
-        Either way it's written as the value."""
+        the screen.  A window's on the screen (as_is) draws in its pixel
+        value, in whatever colour the screen has for it now: fgColor and
+        bkColor are the pixel values of the colours drawn in, and with one
+        screen QuickDraw needs no other (Inside Macintosh V, Color
+        QuickDraw); a program may write them itself (Rainbow).  Otherwise,
+        the nearest to the RGB colour, unless the value is reserved for
+        animation, or is an entry of that same colour (one of several
+        alike, as when a program fades the screen to black).  Either way
+        it's written as the value."""
         devices = self.sys.devices
         table = devices.table()
-        if value in devices.reserved and value < len(table):
+        if (as_is or value in devices.reserved) and 0 <= value < len(table):
             return table[value]
         got = devices.nearest(argb)
         if devices.depth <= 8 and devices.alike(value, got):
@@ -1971,7 +1981,7 @@ class QuickDraw:
             return
         dst, dst_port = target or self.bitmap(dst_bm, current)
         on_port = dst_port is not None and dst_port is current
-        if on_port and self._picture(dst_port, "bits", img, dst_r, mode, mask):
+        if on_port and self._picture(dst_port, "bits", img, dst_r, mode, mask, color):
             return
         if dst is None:
             return
@@ -2054,15 +2064,28 @@ class QuickDraw:
                 p.fillRect(qrect(box), brush)
         return vacated
 
-    def get_pixel(self, port: GrafPort | None, pt: Point) -> bool:
+    def _reading(self, port: GrafPort | None, pt: Point):
+        """Where GetPixel and GetCPixel read port's pixel at pt, and the
+        point there.  A window's Backing, where the window has a pixel;
+        elsewhere the screen buffer at that point.  The pixel needn't be
+        the port's, IM I's GetPixel says: another port may have drawn it.
+        MonsterPaint picks colours from its palette window at a point
+        local to its tools window."""
         surface = self.surface(port) if port is not None else None
-        return surface.pixel(pt) if surface is not None else False
+        if isinstance(surface, WindowSurface) and surface.rgb(pt) is None:
+            b = port.port_bits_bounds
+            return self.sys.screen.bits, Point(pt.v - b.top, pt.h - b.left)
+        return surface, pt
+
+    def get_pixel(self, port: GrafPort | None, pt: Point) -> bool:
+        surface, at = self._reading(port, pt)
+        return surface.pixel(at) if surface is not None else False
 
     def get_rgb(self, port: GrafPort | None, pt: Point) -> int:
         """GetCPixel: the colour of the pixel at pt, 0xAARRGGBB; white
         where there's none."""
-        surface = self.surface(port) if port is not None else None
-        rgb = surface.rgb(pt) if surface is not None else None
+        surface, at = self._reading(port, pt)
+        rgb = surface.rgb(at) if surface is not None else None
         return WHITE_RGB if rgb is None else rgb
 
     def set_rgb(self, port: GrafPort | None, pt: Point, argb: int) -> None:

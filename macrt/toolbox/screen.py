@@ -14,8 +14,8 @@ already there.  So the buffer mirrors what the windows show:
   where the window can be seen;
 - whatever a program writes in the buffer itself is drawn in the windows
   it lands on, the next time macrt looks: before QuickDraw next uses a
-  window's pixels, and once a tick (at a trap, or from the clock while
-  the program calls none);
+  window's pixels, before the windows move, and once a tick (at a trap,
+  or from the clock while the program calls none);
 - when windows move, come and go, or change order, each one's pixels are
   written where it is now, and the desk they uncover is painted in the
   desk's pattern (gray, until a program sets another), as the Window
@@ -226,28 +226,27 @@ class Screen:
     def look(self) -> None:
         """Show what's been written in the buffer since the last look, and
         lay the windows out again if they've moved.  What's been written
-        goes to the windows where they are now: a program draws where its
-        windows are when it draws, and if one has moved since, it's sent
-        an update event to draw it again."""
+        goes to the windows where they were when last laid out: the Window
+        Manager has them laid out again as it moves, shows or hides one,
+        so what's in the buffer by then was drawn before, and a window
+        shown covers what was drawn under it (the frames SnapShot zooms
+        in the screen port, drawn and undone where its window comes)."""
         with self.system.lock:
             self._recolor()
+            self._flip()
+            self._pull()
             now = time.monotonic()
-            moved, uncovered = False, Region()
             if self._stale or now - self._last >= TICK:
                 self._last = now
                 self._stale = False
                 desk = self.desk
-                moved = self._relayout()
-                uncovered = self.desk.diff(desk)
-            self._flip()
-            self._pull(uncovered)
-            if moved:
-                self._paint_desk(uncovered)
-                for w, r in self._owners:
-                    self._put(w, r)
-                self.seen[:] = self.mem.read(self.base, self.size)
-                if self.on_layout is not None:
-                    self.on_layout()
+                if self._relayout():
+                    self._paint_desk(self.desk.diff(desk))
+                    for w, r in self._owners:
+                        self._put(w, r)
+                    self.seen[:] = self.mem.read(self.base, self.size)
+                    if self.on_layout is not None:
+                        self.on_layout()
 
     def _recolor(self) -> None:
         """If the colour table has changed since the last look, show the
@@ -258,7 +257,7 @@ class Screen:
         if table is self.bits.table:
             return
         self.bits.table = table
-        self._pull(Region())
+        self._pull()
         for w, mine in self._owners:
             self._show(w, mine)
         if self.on_desk is not None:
@@ -369,19 +368,19 @@ class Screen:
             self.on_desk(changed)
 
     # -- the program's pixels into the windows -------------------------------
-    def _pull(self, uncovered: Region) -> None:
-        """uncovered is desk that was under a window until now: what was
-        written there is the window's, and it's about to be painted gray."""
+    def _pull(self) -> None:
         now = self.mem.read(self.base, self.size)
         if now == self.seen:
             return
         changed = self._changes(now, self.seen)
         self.seen[:] = now
         for w, mine in self._owners:
+            if self.system.port_at(w.addr) is not w:
+                continue                # closed since: the desk's to be painted there
             r = changed.sect(mine)
             if not r.empty:
                 self._show(w, r)
-        on_desk = changed.sect(self.desk).diff(uncovered)
+        on_desk = changed.sect(self.desk)
         shown = self.on_desk if self.shown is self.bits else None
         if not on_desk.empty:
             self.desk_drawn = True

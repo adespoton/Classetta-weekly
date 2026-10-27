@@ -20,6 +20,10 @@ V, Color QuickDraw).
 A Macintosh II with Color QuickDraw has one device here, the main
 screen, whose pixel map is the screen buffer at ScrnBase, and whose
 colour table is the standard one for its depth.
+
+    'scrn'      ScrnCount, then for each screen spDrvrHw, slot,
+                dCtlDevBase (long), mode, flagMask, flags, colorTable,
+                gammaTable, its global Rect, ctlCount and its control calls
 """
 
 from __future__ import annotations
@@ -54,9 +58,16 @@ gdDevType, ramInit, mainScreen, allInit, screenDevice, noDriver, screenActive = 
     0, 10, 11, 12, 13, 14, 15)
 DEFAULT_MODE = 0x80             # a video card's first mode: its 1-bit one
 VIDEO_DRIVER = -49              # the main screen's video driver (glue_video), its gdRefNum
+VIDEO_SLOT = 9                  # and its card's slot, the Mac II's first
+VIDEO_DR_HW = 0                 # and the card's DrHW, a number of macrt's own (glue_slots)
 ITAB_RES = 4                    # the inverse table's resolution, gdResPref
 MIN_SEED = 1024                 # colour tables' seeds start over the 'clut' IDs
 RGB_DIRECT = 16                 # pixelType: a pixel is its colour
+# The 'scrn' resource's flagMask, as Inside Macintosh V has it (Graphics
+# Device Resources), and the gdFlags bits its flags say: whether the screen
+# is colour, the main screen and active.
+SCRN_FLAG_MASK = 0x77FE
+SCRN_FLAGS = 1 << gdDevType | 1 << mainScreen | 1 << screenActive
 # patType
 oldPat, pixPat, RGBPat = 0, 1, 2
 GRAY_PAT = b"\xAA\x55" * 4
@@ -389,6 +400,24 @@ class Devices:
         self.held = set()
         self.changed()
         return True
+
+    def scrn(self) -> bytes:
+        """A 'scrn' resource for the screen as it is (Inside Macintosh V,
+        Graphics Device Resources), as the Control Panel writes one to the
+        System file when the user sets the screen's depth, and some
+        programs read to see how many colours it shows: JuliaSet 5.1
+        looks for the main screen's mode in it.  The one card, in
+        VIDEO_SLOT, whose memory starts with the screen buffer; its mode,
+        flags and rectangle, as its GDevice has them; the standard colour
+        table for the depth, the 'clut' of that ID; no gamma table, and
+        no control calls.  Its spDrvrHw is the DrHW the card's declaration
+        ROM gives (glue_slots)."""
+        gd = GDevice(self.mem, deref(self.mem, self.main))
+        r = gd.rect
+        return struct.pack(">HhhLhHHhh4hH", 1, VIDEO_DR_HW, VIDEO_SLOT,
+                           self.pixmap(self.main).base_addr,
+                           gd.mode, SCRN_FLAG_MASK, gd.flags & SCRN_FLAGS, self.depth, -1,
+                           r.top, r.left, r.bottom, r.right, 0)
 
     def pixmap(self, gdh: int) -> PixMap | None:
         p = deref(self.mem, GDevice(self.mem, deref(self.mem, gdh)).pmap) if gdh else 0

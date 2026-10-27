@@ -236,6 +236,7 @@ class GrafPort(Record):
         self.heap: Heap | None = None           # where its patterns go, a cGrafPort's
         self.gw_device = 0                      # a GWorld's GDevice (glue_gworld)
         self.gw_own_device = False              # whether the GWorld made it
+        self.gw_pix_map = 0                     # a basic-QuickDraw GWorld's 1-bit one
 
     @property
     def is_color(self) -> bool:
@@ -333,8 +334,9 @@ class GrafPort(Record):
 
     def init_color(self, heap: Heap, screen: BitMap) -> None:
         """InitCPort: the PixMap the current device's (with the device's
-        colour table), black on white, patterns of black and white, and
-        the rest of the fields as InitPort sets them."""
+        colour table), black on white (the pixel values nearest them in
+        its colours, which a program may have changed), patterns of black
+        and white, and the rest of the fields as InitPort sets them."""
         mem = self.mem
         handles = (self.port_pix_map, self.graf_vars, self.bk_pix_pat, self.pn_pix_pat,
                    self.fill_pix_pat)
@@ -353,6 +355,10 @@ class GrafPort(Record):
         self.rgb_fg_color, self.rgb_bk_color = BLACK_RGB, WHITE_RGB
         depth = mem.r16(pm + 0x20) if pm else 1
         self.fg_color, self.bk_color = black_white(depth)
+        table = gdevice.read_table(mem, mem.r32(pm + 0x2A)) if device and 1 < depth <= 8 else []
+        if table:
+            self.fg_color, self.bk_color = (gdevice.rgb_value(c, depth, table)
+                                            for c in (0xFF000000, 0xFFFFFFFF))
         self.bk_pat, self.pn_pat, self.fill_pat = WHITE_PAT, BLACK_PAT, BLACK_PAT
         gv = gdevice.deref(mem, self.graf_vars)
         if gv:

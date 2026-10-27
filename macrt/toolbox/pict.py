@@ -38,7 +38,7 @@ from PyQt6.QtGui import QImage, qGray
 from ..memory import RAM, from_mac, to_mac
 from .api import CHICAGO_SYMBOLS
 from .constants import blackColor, patCopy, srcOr, whiteColor
-from .gdevice import (PIXMAP_FLAG, ROW_BYTES_MASK, PixMap, PixPat, RGBPat, deref,
+from .gdevice import (PIXMAP_FLAG, RGB_DIRECT, ROW_BYTES_MASK, PixMap, PixPat, RGBPat, deref,
                       dispose_pix_pat, new_pix_pat, oldPat, pixPat, rgb_pat_map, set_pix_pat)
 from .masks import EXPAND
 from .qdraw import (MONO_TABLE, Region, arc_path, oval_path, read_rgn, rect_path,
@@ -772,6 +772,60 @@ def pixel_rows(rows: list[bytes], row_bytes: int) -> bytes:
     return bytes(out)
 
 
+def pixmap_bits(img: QImage) -> tuple[int, bytes, list[bytes], int]:
+    """A colour image as a version 2 picture's pixel map: the opcode
+    (PackBitsRect, or DirectBitsRect), what comes before its rectangles
+    and mode, its rows and their rowBytes.  An image of 256 colours or
+    fewer is the fewest bits a pixel that tells them apart, through a
+    colour table of them; one of more is 32-bit pixels, each row's red,
+    green and blue in turn (packType 4) when it's packed."""
+    width, height = img.width(), img.height()
+    rgb = img.convertToFormat(QImage.Format.Format_RGB32)
+    ptr = rgb.constBits()
+    ptr.setsize(rgb.sizeInBytes())
+    pixels = memoryview(bytes(ptr)).cast("I")       # 0xFFRRGGBB, a row's at a time
+    colors = sorted(set(pixels))
+    bounds = struct.pack(">hhhh", 0, 0, height, width)
+    if len(colors) > 256:
+        row_bytes = 4 * width
+        head = struct.pack(">LH", 0xFF, PIXMAP_FLAG | row_bytes) + bounds + struct.pack(
+            ">hhlllhhhhlll", 0, 4, 0, FIXED_72, FIXED_72, RGB_DIRECT, 32, 3, 8, 0, 0, 0)
+        planes = rgb.convertToFormat(QImage.Format.Format_RGB888)
+        ptr = planes.constBits()
+        ptr.setsize(planes.sizeInBytes())
+        raw, bpl = bytes(ptr), planes.bytesPerLine()
+        rows = []
+        for y in range(height):
+            row = raw[y * bpl:y * bpl + 3 * width]
+            if row_bytes < 8:                       # unpacked: each pixel xRGB
+                rows.append(b"".join(b"\0" + row[i:i + 3] for i in range(0, 3 * width, 3)))
+            else:
+                rows.append(row[0::3] + row[1::3] + row[2::3])
+        return 0x9A, head + bounds, rows, row_bytes
+    depth = next(d for d in (1, 2, 4, 8) if len(colors) <= 1 << d)
+    row_bytes = (width * depth + 15) // 16 * 2
+    index = {c: i for i, c in enumerate(colors)}
+    values = bytes(map(index.__getitem__, pixels))
+    per = 8 // depth
+    rows = []
+    for y in range(height):
+        px = values[y * width:(y + 1) * width]
+        if per == 1:
+            rows.append(px.ljust(row_bytes, b"\0"))
+            continue
+        px = px.ljust(row_bytes * per, b"\0")
+        packed = 0
+        for k in range(per):                        # each value stays in its byte
+            packed |= int.from_bytes(px[k::per], "big") << 8 - depth * (k + 1)
+        rows.append(packed.to_bytes(row_bytes, "big"))
+    table = struct.pack(">lHh", 0, 0, len(colors) - 1) + b"".join(
+        struct.pack(">HHHH", i, (c >> 16 & 0xFF) * 0x101, (c >> 8 & 0xFF) * 0x101,
+                    (c & 0xFF) * 0x101) for i, c in enumerate(colors))
+    head = struct.pack(">H", PIXMAP_FLAG | row_bytes) + bounds + struct.pack(
+        ">hhlllhhhhlll", 0, 0, 0, FIXED_72, FIXED_72, 0, depth, 1, depth, 0, 0, 0)
+    return 0x98, head + table + bounds, rows, row_bytes
+
+
 def pix_pat_record(mem: RAM, h: int) -> bytes | None:
     """A pixel or RGB PixPat as a picture has it after its opcode; None for
     an old one, or one of more than 8 bits a pixel or that makes no sense,
@@ -992,8 +1046,9 @@ class Recorder:
                 loc = loc.offset(width(chunk), 0)
 
     def bits(self, port: GrafPort, img: QImage, dst: Rect, mode: int,
-             mask: Region | None) -> None:
-        """CopyBits into the port: the bits as a 1-bit bitmap, packed
+             mask: Region | None, color: bool = False) -> None:
+        """CopyBits into the port: the bits as a 1-bit bitmap, or, colour
+        ones in a version 2 picture, as a pixel map (pixmap_bits); packed
         if its rows are 8 bytes or more."""
         width, height = img.width(), img.height()
         row_bytes = (width + 15) // 16 * 2
@@ -1006,6 +1061,12 @@ class Recorder:
             except struct.error:
                 mask_data = Region.rect(mask.bbox).to_data()
         self._sync(port)
+        if color and self.v2 and 4 * width < 0x4000:
+            op, head, rows, row_bytes = pixmap_bits(img)
+            self._op(op + (1 if mask is not None else 0))
+            self.data += head + struct.pack(">hhhhh", *dst, mode) + mask_data
+            self.data += pixel_rows(rows, row_bytes)
+            return
         mono = to_mono(img)
         bpl = mono.bytesPerLine()
         ptr = mono.constBits()

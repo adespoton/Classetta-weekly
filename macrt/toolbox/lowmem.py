@@ -26,6 +26,7 @@ HeapEnd = 0x114         # end of the application heap
 TheZone = 0x118         # the current heap zone
 UTableBase = 0x11C      # the Device Manager's unit table: a DCE handle per unit
 DskVerify = 0x12C       # nonzero: the disk driver compares what it reads with the buffer
+LoadTrap = 0x12D        # byte: nonzero, _LoadSeg calls _Debugger before the routine it loaded
 ApplLimit = 0x130       # how far the application heap may grow
 SonyVars = 0x134        # the disk driver's variables: from $12, the drive it was last used on
 PollStack = 0x13A       # the stack, as the disk driver's SetUpPoll found it
@@ -117,7 +118,7 @@ CrsrCouple = 0x8CF      # nonzero: the cursor goes where the mouse does
 JSwapFont = 0x8E0       # vector to FMSwapFont, for QuickDraw and programs that call it there
 WidthListHand = 0x8E4   # the recently used width tables
 JCrsrTask = 0x8EE       # vector to the cursor's task, which a program moving the mouse may call
-WWExist = 0x8F2         # 0 while the Window Manager's set up; a program may set it to say it isn't
+WWExist = 0x8F2         # 0 once the Window Manager's set up; a program may set it to say it isn't
 QDExist = 0x8F3         # the same for QuickDraw
 JIODone = 0x8FC         # where a driver goes when it's done with a request
 CurApRefNum = 0x900
@@ -189,6 +190,7 @@ MethodNotFound = 0xBE8  # Object Pascal's, which no manual here names: where
 ClassTable = 0xBEC      # _MethodDispatch goes for no method, and its classes
 FractEnable = 0xBF4     # nonzero: fractional character widths
 MMU32Bit = 0xCB2        # 0: 24-bit addressing
+ASCBase = 0xCC0         # the Apple Sound Chip, where there is one
 
 TheGDevice = 0xCC8      # the GDevice drawing is done on
 AuxWinHead = 0xCD0      # the auxiliary window records
@@ -202,7 +204,7 @@ LOW_MEMORY_END = 0x2000
 
 SWITCHED = {
     ApplZone: 4, TheZone: 4, ApplLimit: 4, HeapEnd: 4, CurStackBase: 4,
-    CurrentA5: 4, BufPtr: 4, CurApName: 32, CurApRefNum: 2, MemErr: 2,
+    CurrentA5: 4, BufPtr: 4, ScrnBase: 4, CurApName: 32, CurApRefNum: 2, MemErr: 2,
     WindowList: 4, GhostWindow: 4, MenuList: 4, TheMenu: 2, MBDFHndl: 4,
     TopMapHndl: 4, CurMap: 2, ResLoad: 2, ResErr: 2,
     CurJTOffset: 2, CurPageOption: 2, PrintVars: 16, AppParmHandle: 4, ApplScratch: 12,
@@ -211,6 +213,7 @@ SWITCHED = {
     ScrapSize: 16, TEScrpLength: 4, TEScrpHandle: 4,
     DefVCBPtr: 4, DefVRefNum: 2, SFSaveDisk: 2, CurDirStore: 4, FPState: 6,
     MethodNotFound: 8, TheGDevice: 4, AuxWinHead: 4, AuxCtlHead: 4, MenuCInfo: 4,
+    WWExist: 2,
 }
 
 

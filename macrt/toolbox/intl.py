@@ -162,6 +162,199 @@ def time_string(secs: int, seconds: bool, intl: bytes) -> bytes:
     return out + _packed(intl[at:at + 4])
 
 
+# StringToDate and StringToTime (Inside Macintosh: Text, Text Utilities):
+# the date or time at the start of some text, and how sure of it they are.
+longDateFound, leftOverChars, sepNotIntlSep, fieldOrderNotIntl = 1, 2, 4, 8
+extraneousStrings, tooManySeps, sepNotConsistent = 16, 32, 64
+fatalDateTime, dateTimeNotFound, dateTimeInvalid = 0x8000, 0x8400, 0x8800
+
+
+class Parsed(NamedTuple):
+    status: int
+    used: int               # how many bytes of the text it took
+    fields: tuple           # (year, month, day, dayOfWeek) or (hour, minute, second)
+
+
+def _tokens(text: bytes) -> list[tuple[str, int, int]]:
+    """(kind, start, end): a number, a word, a space or one other byte."""
+    out, i = [], 0
+    while i < len(text):
+        c = text[i:i + 1]
+        kind = ("number" if c.isdigit() else "word" if c.isalpha() or text[i] >= 0x80
+                else "space" if c in b" \t\r\n" else "sep")
+        j = i + 1
+        if kind != "sep":
+            while j < len(text) and (text[j:j + 1].isdigit() if kind == "number" else
+                                     text[j:j + 1] in b" \t\r\n" if kind == "space" else
+                                     text[j:j + 1].isalpha() or text[j] >= 0x80):
+                j += 1
+        out.append((kind, i, j))
+        i = j
+    return out
+
+
+def _names(intl1: bytes, at: int, count: int) -> list[bytes]:
+    return [intl1[at + 16 * i + 1:at + 16 * i + 1 + intl1[at + 16 * i]].lower()
+            for i in range(count)]
+
+
+def _named(word: bytes, names: list[bytes], abbr: int) -> int:
+    """Which of names word is, from 1: the whole of one, or the first
+    three or more letters of one (\"Sept\"), or its abbreviation."""
+    word = word.lower()
+    for i, name in enumerate(names):
+        if word == name or (len(word) >= min(3, len(name)) and name.startswith(word)) \
+                or (abbr and word == name[:abbr]):
+            return i + 1
+    return 0
+
+
+def _year(y: int, digits: int, this_year: int) -> int:
+    """A year of two digits is the one nearest this year, as Inside
+    Macintosh: Text has it; of three, a year after 1000."""
+    if digits <= 2 and y < 100:
+        century = this_year - this_year % 100
+        if this_year % 100 >= 90 and y <= 10:
+            century += 100
+        elif this_year % 100 <= 10 and y >= 90:
+            century -= 100
+        return century + y
+    return y + 1000 if 100 <= y < 1000 else y
+
+
+def parse_date(text: bytes, intl0: bytes, intl1: bytes, today: DateTime) -> Parsed:
+    """StringToDate: a short date in the Intl0Rec's order and separator,
+    or a long one with a month's name in the Intl1Rec (\"September 1,
+    1987\", \"1 Sept 1987\", \"1 1987 sEpT\"), a day's name allowed before
+    it.  What it doesn't give is today's."""
+    months = _names(intl1, MONTHS_AT, 12)
+    days = _names(intl1, DAYS_AT, 7)
+    abbr = intl1[ABBR_LEN]
+    date_sep = _packed(intl0[DATE_SEP:DATE_SEP + 1])
+    numbers, month, status, used, day_name = [], 0, 0, 0, False
+    seps: list[bytes] = []
+    pending_sep = 0
+    for kind, start, end in _tokens(text):
+        token = text[start:end]
+        if kind == "space":
+            continue
+        if kind == "sep":
+            if not (numbers or month or day_name):
+                break
+            pending_sep += 1
+            seps.append(token)
+            continue
+        if kind == "number" and len(numbers) < (2 if month else 3):
+            numbers.append((int(token), end - start))
+        elif kind == "word" and not month and _named(token, months, abbr):
+            month = _named(token, months, abbr)
+        elif kind == "word" and not (numbers or month or day_name) and _named(token, days, abbr):
+            day_name = True                     # a day's name, before the date
+            seps = []
+        else:
+            break
+        if pending_sep > 1:
+            status |= tooManySeps
+        pending_sep = 0
+        used = end
+        if len(numbers) + bool(month) == 3:
+            break
+    if not numbers and not month:
+        return Parsed(dateTimeNotFound, 0, ())
+    order = DATE_ORDERS[intl0[DATE_ORDER]] if intl0[DATE_ORDER] < len(DATE_ORDERS) else "mdy"
+    if month:
+        status |= longDateFound
+        order = order.replace("m", "")
+    else:
+        short = [s for s in seps if s not in b",."]
+        if any(s != date_sep for s in short):
+            status |= sepNotIntlSep
+        if len(set(short)) > 1:
+            status |= sepNotConsistent
+    if len(numbers) < len(order):           # no year: this year's
+        order = order.replace("y", "")
+    fields = dict(zip(order, numbers))
+    if "y" in fields and "d" in fields and fields["d"][1] > 2 >= fields["y"][1]:
+        fields["d"], fields["y"] = fields["y"], fields["d"]
+        status |= fieldOrderNotIntl
+    if "m" in fields and "d" in fields and fields["m"][0] > 12 >= fields["d"][0]:
+        fields["d"], fields["m"] = fields["m"], fields["d"]
+        status |= fieldOrderNotIntl
+    year, digits = fields.get("y", (today.year, 4))
+    year = _year(year, digits, today.year)
+    month = month or fields.get("m", (today.month, 0))[0]
+    day = fields.get("d", (today.day, 0))[0]
+    try:
+        d = datetime.date(year, month, day)
+    except ValueError:
+        return Parsed(dateTimeInvalid, used, ())
+    if text[used:].strip():
+        status |= leftOverChars
+    return Parsed(status, used, (year, month, day, d.isoweekday() % 7 + 1))
+
+
+def _suffixes(intl0: bytes) -> tuple[list[bytes], list[bytes]]:
+    """The morning and evening strings, as typed: without spaces or
+    full stops, either case (\"p.m.\" for \" PM\")."""
+    def plain(at: int) -> bytes:
+        return _packed(intl0[at:at + 4]).replace(b" ", b"").replace(b".", b"").lower()
+    morning = [s for s in (plain(MORN_STR), plain(TIME1_SUFF)) if s]
+    evening = [s for s in (plain(EVE_STR), plain(TIME5_SUFF)) if s]
+    return morning, evening
+
+
+def parse_time(text: bytes, intl0: bytes) -> Parsed:
+    """StringToTime: hours, minutes and seconds with the Intl0Rec's time
+    separator, then its morning or evening string if it's on a 12-hour
+    clock."""
+    time_sep = intl0[TIME_SEP:TIME_SEP + 1]
+    morning, evening = _suffixes(intl0)
+    numbers, status, used, pm = [], 0, 0, None
+    tokens = _tokens(text)
+    i = 0
+    while i < len(tokens):
+        kind, start, end = tokens[i]
+        token = text[start:end]
+        i += 1
+        if kind == "space":
+            continue
+        if kind == "number" and len(numbers) < 3 and pm is None:
+            numbers.append(int(token))
+            used = end
+            continue
+        if kind == "sep" and numbers and pm is None and len(numbers) < 3 \
+                and i < len(tokens) and tokens[i][0] == "number":
+            if token != time_sep:
+                status |= sepNotIntlSep
+            continue
+        if kind in ("word", "sep") and numbers and pm is None:
+            # The suffix and its full stops, "p.m.": the longest run of
+            # words and stops up to a space that is one.
+            run = i - 1
+            while run < len(tokens) and tokens[run][0] in ("word", "sep"):
+                run += 1
+            for j in range(run, i - 1, -1):
+                plain = text[start:tokens[j - 1][2]].replace(b".", b"").lower()
+                if plain in morning or plain in evening:
+                    pm, used, i = plain in evening, tokens[j - 1][2], j
+                    break
+            if pm is not None:
+                continue
+        break
+    if not numbers:
+        return Parsed(dateTimeNotFound, 0, ())
+    hour, minute, second = (numbers + [0, 0])[:3]
+    if pm is not None:
+        if not 1 <= hour <= 12:
+            return Parsed(dateTimeInvalid, used, ())
+        hour = hour % 12 + (12 if pm else 0)
+    if hour > 23 or minute > 59 or second > 59:
+        return Parsed(dateTimeInvalid, used, ())
+    if text[used:].strip():
+        status |= leftOverChars
+    return Parsed(status, used, (hour, minute, second))
+
+
 def is_metric(intl0: bytes) -> bool:
     return bool(intl0[METRIC_SYS])
 

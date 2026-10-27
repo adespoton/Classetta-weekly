@@ -30,8 +30,13 @@ An open fork is a file control block.  Its reference number is its offset
 in the FCB buffer (FCBSPtr), which holds each one's record as Inside
 Macintosh lays it out; the Resource Manager's open files are FCBs too, so
 the two can't hand out the same number.  Each volume has a VCB in the VCB
-queue.  Working directories are in a table of their own, numbered from
--32766 so they can't be taken for a volume reference number.
+queue, and two access paths of the system's own, to its extents and
+catalog tree files: Inside Macintosh IV, the File Manager, says
+hierarchical volumes need them, and every volume here says it's one.  The
+boot volume is mounted before anything on it is opened, so its trees take
+the first two numbers, ahead of the System file.  Working directories are
+in a table of their own, numbered from -32766 so they can't be taken for a
+volume reference number.
 
 The FileManager is the File Manager as one application sees it: its
 default volume and directory, and the files and working directories it
@@ -53,7 +58,8 @@ from typing import TYPE_CHECKING
 import machfs
 
 from ..macfile import (APPLE_DOUBLE, APPLE_SINGLE, AS_DATA, AS_FINDER_INFO, AS_NAME, AS_RSRC,
-                       BINHEX_BANNER, HostFolder, MacFile, MemoryFolder, VolumeFolder, load_file)
+                       BINHEX_BANNER, HostFolder, MacFile, MemoryFolder, OnDisk, VolumeFolder,
+                       load_file)
 from ..memory import ADDRESS_MASK, from_mac, to_mac
 from . import lowmem
 
@@ -99,11 +105,13 @@ fsCurPerm, fsRdPerm, fsWrPerm, fsRdWrPerm, fsRdWrShPerm = 0, 1, 2, 3, 4
 
 ROOT_PARENT = 1
 ROOT = 2
+EXTENTS_FILE, CATALOG_FILE = 3, 4       # their file numbers (TN1150's reserved CNIDs)
 FIRST_CNID = 16                         # below are the catalog's own files
 FCB_START = 2                           # reference numbers are offsets in the FCB buffer
 FCB_LEN = 94
 MAX_FCBS = 200
 VCB_LEN = 178
+vcbXTRef = 164                          # then vcbCTRef
 DQE_LEN = 4 + 18                        # a drive queue element and the four flag bytes before it
 WD_FIRST = -32766
 WD_LEN = 16
@@ -305,6 +313,7 @@ class Volume:
         self.finder_info = bytearray(32)    # the first long is the blessed folder's ID
         self.vcb = 0                        # its VCB in the system heap
         self.dqe = 0                        # and its drive's drive queue element
+        self.trees: list[File] = []         # its extents and catalog tree files, while open
         self.next_cnid = FIRST_CNID
         self.root = Dir(name)
         self.root.volume = self
@@ -505,6 +514,8 @@ class ImageStore(Store):
 
     def sizes(self, f: File) -> tuple[int, int]:
         item = f.ref
+        if isinstance(item, OnDisk):
+            return item.sizes()                         # without reading the forks
         return (len(item.data), len(item.rsrc)) if isinstance(item, machfs.File) else (0, 0)
 
     def save(self, f: File) -> None:
@@ -876,9 +887,21 @@ class FileSystem:
             vol.vcb = self.system.sys_heap.new_ptr(VCB_LEN, clear=True)
             self._enqueue_vcb(vol.vcb)
             self.volumes.append(vol)
+            self._open_trees(vol)
             self._write_vcb(vol)
             self._add_drive(vol)
             return vol
+
+    def _open_trees(self, vol: Volume) -> None:
+        """The access paths to the volume's extents and catalog trees,
+        which vcbXTRef and vcbCTRef give: read-only to programs, empty
+        and nameless, since the catalog is kept otherwise here."""
+        vol.trees = []
+        for cnid in (EXTENTS_FILE, CATALOG_FILE):
+            tree = File("")
+            tree.volume, tree.cnid, tree._forks = vol, cnid, [bytearray(), bytearray()]
+            self._new_path(tree, False, False, False, None)
+            vol.trees.append(tree)
 
     def unmount(self, vol: Volume) -> None:
         """UnmountVol (IM II-90): the volume flushed, the files open on it
@@ -902,6 +925,7 @@ class FileSystem:
             self.offline.remove(vol)
             self.volumes.append(vol)
             self._enqueue_vcb(vol.vcb)
+            self._open_trees(vol)
             self._write_vcb(vol)
 
     def in_drive(self, drive: int) -> Volume | None:
@@ -1034,6 +1058,9 @@ class FileSystem:
             vol.vref, 0, 0, 0, 0, 0, vol.bkdate, 0, 0, BLOCK, BLOCK,
             sum(1 for n in vol.root.items() if n.is_dir), files, dirs, bytes(vol.finder_info))
         self.mem.write(vol.vcb + 4, rec)
+        trees = [p.refnum for tree in vol.trees for p in self.paths(tree)]
+        if len(trees) == 2:
+            self.mem.write(vol.vcb + vcbXTRef, struct.pack(">hh", *trees))
 
     def update_volume(self, vol: Volume) -> None:
         vol.mddate = now()
@@ -1207,14 +1234,18 @@ class FileSystem:
             else:
                 raise FileError(paramErr)
             node.forks()
-            refnum = FCB_START
-            while refnum in self.fcbs:
-                refnum += FCB_LEN
-            if refnum >= FCB_START + FCB_LEN * MAX_FCBS:
-                raise FileError(tmfoErr)
-            p = self.fcbs[refnum] = FCB(refnum, node, rsrc, write, shared, owner)
-            self.sync(p)
-            return p
+            return self._new_path(node, rsrc, write, shared, owner)
+
+    def _new_path(self, node: File, rsrc: bool, write: bool, shared: bool,
+                  owner: FileManager | None) -> FCB:
+        refnum = FCB_START
+        while refnum in self.fcbs:
+            refnum += FCB_LEN
+        if refnum >= FCB_START + FCB_LEN * MAX_FCBS:
+            raise FileError(tmfoErr)
+        p = self.fcbs[refnum] = FCB(refnum, node, rsrc, write, shared, owner)
+        self.sync(p)
+        return p
 
     def close(self, refnum: int) -> None:
         with self.lock:
@@ -1287,6 +1318,13 @@ class FileSystem:
                     self.wds[refnum] = WD(refnum, vol, dirid, procid, {owner})
                     return refnum
             raise FileError(tmwdoErr)
+
+    def share_wd(self, refnum: int, owner: FileManager) -> None:
+        """Keep a working directory open for owner too, if refnum is one."""
+        with self.lock:
+            wd = self.wds.get(refnum)
+            if wd is not None:
+                wd.owners.add(owner)
 
 
 # ---------------------------------------------------------------------------

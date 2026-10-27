@@ -125,20 +125,27 @@ class Toolbox:
         if w is not None:
             self._gui(self._d.end_grow_preview, w)
 
-    def _next_update(self) -> WindowRecord | None:
+    def _next_update(self, picture: bool = False) -> WindowRecord | None:
         """The frontmost window with some of its update region to be seen:
         one the windows in front of it cover wholly is updated once it's
         uncovered, as on a Mac, where it has nothing that can be seen to
         draw.  King's Quest makes its status window behind its picture,
-        and shows it when it's updated."""
+        and shows it when it's updated.  One with a picture of its own
+        (SetWindowPic) isn't sent an update event: picture asks for one of
+        those, for the Window Manager to draw it (Inside Macintosh I,
+        Window Manager, CheckUpdate)."""
         with self._sys.lock:
-            covered = None
+            covered, in_front = None, []
             for w in self._p.windows:
                 if not w.visible:
                     continue
-                if w.update_pending and (covered is None or not w.update.diff(covered).empty):
-                    return w
-                covered = w.covers() if covered is None else covered.union(w.covers())
+                if w.update_pending and bool(w.window_pic) == picture:
+                    for f in in_front:      # what covers it, only once there's one to update
+                        covered = f.covers() if covered is None else covered.union(f.covers())
+                    in_front.clear()
+                    if covered is None or not w.update.diff(covered).empty:
+                        return w
+                in_front.append(w)
         return None
 
     def FlushEvents(self, mask: int = k.everyEvent, stop_mask: int = 0) -> None:
@@ -205,6 +212,7 @@ class Toolbox:
                                        proc_id, go_away, ref_con, color)
                 if rec is None:
                     return None
+                rec.title_width = self._title_width(title)
                 if rec.definition.zoom:
                     rec.std_state = self._d.standard_state(rec)
                     rec.user_state = bounds
@@ -452,8 +460,28 @@ class Toolbox:
     def SetWTitle(self, w: WindowRecord, title: str) -> None:
         def gui():
             w.title = title
+            w.title_width = self._title_width(title)
             self._d.sync(w)
         self._gui(gui)
+
+    def _title_width(self, title: str) -> int:
+        """titleWidth: the title's width in the system font and size, which
+        the System's WDEF 0 centres it by (Inside Macintosh I, The Window
+        Manager): HyperCard 2.0's card window."""
+        return self.qd.text_width(None, title.translate(CHICAGO_SYMBOLS))
+
+    def redraw_frames(self, w: WindowRecord | None) -> None:
+        """Draw a window's frame again (with None, each of the
+        application's): its colours have changed.  Without a display
+        there's none to draw."""
+        if self._d is None:
+            return
+        windows = [w] if w is not None else list(self._p.windows)
+        self._d.bridge.post(self._sync_all, windows)
+
+    def _sync_all(self, windows: list[WindowRecord]) -> None:
+        for w in windows:
+            self._d.sync(w)
 
     def GetWTitle(self, w: WindowRecord) -> str:
         return w.title
@@ -562,6 +590,7 @@ class Toolbox:
             qdraw.write_rgn(self._sys.heap_of(w.vis_rgn), w.vis_rgn,
                             vis.sect(w.update.offset(b.left, b.top)))
             w.update_pending = False
+            w.updates_begun += 1
 
     def EndUpdate(self, w: WindowRecord) -> None:
         """The visRgn as it was, moved with any SetOrigin since."""
