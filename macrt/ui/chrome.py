@@ -7,6 +7,15 @@ on plain values, not widgets: a `Frame` describes the window, and every
 function takes the structure size (w, h, shadow excluded) with the
 structure's top-left corner at (0, 0).  Drawing is done with fillRect on
 whole pixels so the output stays 1-bit crisp.
+
+On a colour Mac a window's frame is drawn in the colours of its 'wctb',
+its auxiliary record's or the default record's (Inside Macintosh V, the
+Window Manager), as the screen shows them, when they aren't the standard
+black and white.  The parts are named, not described: macrt draws the
+outline, the line under the title bar, the boxes' outlines and any shadow
+in wFrameColor, the title in wTextColor, the stripes in wHiliteColor and
+the title bar behind them in wTitleBarColor, and a dialog box's white
+band in wContentColor.  Rounded windows stay black and white.
 """
 
 from __future__ import annotations
@@ -16,18 +25,24 @@ from functools import lru_cache
 
 from PyQt6.QtCore import QRect, QRectF, Qt
 from PyQt6.QtGui import (
-    QBitmap, QBrush, QFontMetrics, QImage, QPainter, QPainterPath, QPen, QRegion,
+    QBitmap, QBrush, QColor, QFontMetrics, QImage, QPainter, QPainterPath, QPen, QRegion,
 )
 
+from ..memory import BusError
 from ..toolbox.constants import (
     wInContent, wInDrag, wInGoAway, wInGrow, wInMenuBar, wInZoomIn, wInZoomOut, wNoHit,
 )
-from ..toolbox.windows import Definition, WindowKind, WindowRecord
+from ..toolbox.qdraw import CHICAGO_SYMBOLS, rgb_argb
+from ..toolbox.windows import Definition, WindowKind, WindowRecord, window_colors
 from . import theme
 from .theme import BLACK, WHITE
 
 TITLED = (WindowKind.DOCUMENT, WindowKind.MOVABLE_DBOX)
 BOXED = (WindowKind.DBOX, WindowKind.PLAIN, WindowKind.ALT_DBOX)
+# A window's standard colours, by part: wContentColor, wFrameColor,
+# wTextColor, wHiliteColor and wTitleBarColor.
+_WHITE, _BLACK = (0xFFFF, 0xFFFF, 0xFFFF), (0, 0, 0)
+STANDARD_COLORS = (_WHITE, _BLACK, _BLACK, _BLACK, _WHITE)
 
 
 @dataclass(frozen=True)
@@ -42,6 +57,7 @@ class Frame:
     corner: int = 16
     menu_bar: bool = False      # menu bar strip under the title bar
     pressed: int = wNoHit       # box being tracked with the mouse inside it
+    colors: tuple[int, ...] | None = None   # 0xAARRGGBB by part, if not black and white
 
     @classmethod
     def for_window(cls, rec: WindowRecord, *, menu_bar: bool = False,
@@ -49,7 +65,8 @@ class Frame:
         d = definition or rec.definition
         return cls(
             kind=d.kind,
-            title=rec.title.replace("\0", ""),     # a desk accessory's name, as its title
+            # \0 starts a desk accessory's name, as its title
+            title=rec.title.replace("\0", "").translate(CHICAGO_SYMBOLS),
             hilited=rec.hilited,
             go_away=rec.go_away and d.kind in (WindowKind.DOCUMENT, WindowKind.ROUNDED),
             zoom=d.zoom,
@@ -58,7 +75,40 @@ class Frame:
             corner=d.corner,
             menu_bar=menu_bar and supports_menu_bar(d.kind),
             pressed=pressed,
+            colors=_colors(rec),
         )
+
+
+def _colors(rec: WindowRecord) -> tuple[int, ...] | None:
+    """A window's parts' colours, as the screen shows them, on a colour
+    Mac and if they aren't the standard ones: a part its table hasn't is
+    in the table's first colour."""
+    devices = rec.system.devices
+    if devices is None:
+        return None
+    try:
+        parts = window_colors(rec.mem, rec.process.world, rec.addr)
+    except BusError:
+        return None
+    if not parts:
+        return None
+    first = next(iter(parts.values()))
+    rgbs = tuple(parts.get(part, first) for part in range(len(STANDARD_COLORS)))
+    if rgbs == STANDARD_COLORS:
+        return None
+    return tuple(devices.nearest(rgb_argb(rgb)) for rgb in rgbs)
+
+
+class _Palette:
+    """What a frame is drawn in, by what macrt draws in each part."""
+
+    def __init__(self, f: Frame):
+        if f.colors is None:
+            self.content, self.frame, self.text, self.hilite, self.bar = (
+                WHITE, BLACK, BLACK, BLACK, WHITE)
+        else:
+            self.content, self.frame, self.text, self.hilite, self.bar = (
+                QColor.fromRgba(c) for c in f.colors)
 
 
 def supports_menu_bar(kind: WindowKind) -> bool:
@@ -220,29 +270,30 @@ def frame_rect(p: QPainter, x: int, y: int, w: int, h: int, c=BLACK, t: int = 1)
 
 def paint(p: QPainter, f: Frame, w: int, h: int) -> None:
     p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+    pal = _Palette(f)
     if f.kind in TITLED:
-        _paint_document(p, f, w, h)
+        _paint_document(p, f, w, h, pal)
     elif f.kind is WindowKind.ROUNDED:
         _paint_rounded(p, f, w, h)
     elif f.kind is WindowKind.DBOX:
         x = 0
         for t, c in theme.DBOX_LAYERS:
-            frame_rect(p, x, x, w - 2 * x, h - 2 * x, c, t)
+            frame_rect(p, x, x, w - 2 * x, h - 2 * x, pal.frame if c == BLACK else pal.content, t)
             x += t
     else:
-        frame_rect(p, 0, 0, w, h)
+        frame_rect(p, 0, 0, w, h, pal.frame)
     s = shadow(f)
     if s:
-        p.fillRect(w, s, s, h, BLACK)
-        p.fillRect(s, h, w, s, BLACK)
+        p.fillRect(w, s, s, h, pal.frame)
+        p.fillRect(s, h, w, s, pal.frame)
 
 
-def _paint_document(p: QPainter, f: Frame, w: int, h: int) -> None:
+def _paint_document(p: QPainter, f: Frame, w: int, h: int, pal: _Palette) -> None:
     b = theme.BORDER
     tr = title_rect(f, w)
-    p.fillRect(b, b, w - 2 * b, tr.height(), WHITE)
-    frame_rect(p, 0, 0, w, h, BLACK, b)
-    p.fillRect(b, tr.bottom() + 1, w - 2 * b, 1, BLACK)
+    p.fillRect(b, b, w - 2 * b, tr.height(), pal.bar)
+    frame_rect(p, 0, 0, w, h, pal.frame, b)
+    p.fillRect(b, tr.bottom() + 1, w - 2 * b, 1, pal.frame)
 
     cb, zb = close_box_rect(f, w), zoom_box_rect(f, w)
     title_box = _title_text_rect(f, w, tr, cb, zb)
@@ -251,22 +302,23 @@ def _paint_document(p: QPainter, f: Frame, w: int, h: int) -> None:
         x1 = tr.right() - theme.STRIPE_INSET
         y = tr.y() + 3
         while y <= tr.bottom() - 3:
-            p.fillRect(x0, y, x1 - x0 + 1, 1, BLACK)
+            p.fillRect(x0, y, x1 - x0 + 1, 1, pal.hilite)
             y += theme.PINSTRIPE_SPACING
         clear = theme.BOX_CLEARANCE
         for box in (cb, zb):
             if box is not None:
-                p.fillRect(box.adjusted(-clear, -clear, clear, clear), WHITE)
+                p.fillRect(box.adjusted(-clear, -clear, clear, clear), pal.bar)
         if title_box is not None:
             pad = theme.TITLE_CLEARANCE
             p.fillRect(title_box.x() - pad, tr.y(), title_box.width() + 2 * pad,
-                       tr.height(), WHITE)
+                       tr.height(), pal.bar)
     if cb is not None:
-        _paint_box(p, cb, pressed=f.pressed == wInGoAway)
+        _paint_box(p, cb, pressed=f.pressed == wInGoAway, fg=pal.frame, bg=pal.bar)
     if zb is not None:
-        _paint_box(p, zb, pressed=f.pressed in (wInZoomIn, wInZoomOut), zoom=True)
+        _paint_box(p, zb, pressed=f.pressed in (wInZoomIn, wInZoomOut), zoom=True,
+                   fg=pal.frame, bg=pal.bar)
     if title_box is not None:
-        _paint_title(p, f, title_box, BLACK)
+        _paint_title(p, f, title_box, pal.text)
 
 
 def _title_text_rect(f: Frame, w: int, tr: QRect, cb, zb) -> QRect | None:

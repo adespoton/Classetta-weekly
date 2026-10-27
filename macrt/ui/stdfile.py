@@ -18,6 +18,8 @@ answers each step with an action, through a Future:
     ("item", n)              the application's own item n
     ("item", n, where)       a drawn one pressed, its top left at where on the Mac screen
     ("pick", n, value)       a pop-up's item `value` chosen
+    ("select",)              a list shown, or another item in it (or none) selected
+                             (only when the dialog reports it: its application has a hook)
 
 and the application's thread answers with the next Place, or with the
 same one (resume), or closes it.  The application's own items, its
@@ -69,6 +71,7 @@ class Place:
     volume: str = ""                # the disk it's on
     writable: bool = True           # can a file or folder be made here
     message: str = ""               # what went wrong with the last step, to say
+    selected: int = -1              # the item to select, if not the first that can be
 
     @property
     def desktop(self) -> bool:
@@ -254,14 +257,19 @@ class StandardFileDialog(QDialog):
     """Open a file (put False), or name one to save (put True)."""
 
     def __init__(self, display: Display | None, put: bool, prompt: str = "", name: str = "",
-                 title: str = ""):
+                 title: str = "", ok: str = "", preview: QImage | None = None):
         parent = display.host_window if display is not None else None
         super().__init__(parent)
         self.display = display
         self.put = put
+        self.ok_title = ok or ("Save" if put else "Open")
         self.place = Place([])
         self._future: Future | None = None
         self._asking = None                         # an open replace or new-folder question
+        self.reports = False                        # does each change of selection come back
+        self._told = -2                             # the selection last asked for (state)
+        self._reporting = False                     # is the application hearing of a change
+        self._pending: tuple | None = None          # what the user did meanwhile
         self.setWindowTitle(title or ("Save" if put else "Open"))
         self.setModal(False)
         self.setStyleSheet(STYLE)
@@ -276,7 +284,7 @@ class StandardFileDialog(QDialog):
         self.list.setUniformItemSizes(True)
         self.list.setMinimumSize(220, 160)
         self.list.itemDoubleClicked.connect(lambda _: self._open_selected())
-        self.list.currentRowChanged.connect(lambda _: self._update_buttons())
+        self.list.currentRowChanged.connect(self._row_changed)
 
         self.disk = QLabel()
         self.disk_icon = QLabel()
@@ -289,7 +297,7 @@ class StandardFileDialog(QDialog):
         self.new_folder.clicked.connect(self._ask_new_folder)
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.clicked.connect(self.cancel)
-        self.ok = QPushButton("Save" if put else "Open")
+        self.ok = QPushButton(self.ok_title)
         self.ok.setDefault(True)
         self.ok.setAutoDefault(True)
         self.ok.clicked.connect(self._default)
@@ -305,6 +313,11 @@ class StandardFileDialog(QDialog):
         self.extras.hide()
         self._extras: dict[int, QWidget] = {}
         self._values: dict[int, int] = {}
+
+        self.preview = QLabel()             # what's to be published
+        self.preview.setObjectName("preview")
+        if preview is not None:
+            self.preview.setPixmap(QPixmap.fromImage(preview))
 
         left = QVBoxLayout()
         left.addWidget(self.popup, 0, Qt.AlignmentFlag.AlignLeft)
@@ -330,6 +343,9 @@ class StandardFileDialog(QDialog):
         right.addWidget(self.cancel_button)
         right.addWidget(self.ok)
         top = QHBoxLayout()
+        if preview is not None:
+            top.addWidget(self.preview, 0, Qt.AlignmentFlag.AlignTop)
+            top.addSpacing(10)
         top.addLayout(left, 1)
         top.addSpacing(10)
         top.addLayout(right)
@@ -364,14 +380,19 @@ class StandardFileDialog(QDialog):
             if not item.enabled:
                 w.setFlags(w.flags() & ~Qt.ItemFlag.ItemIsEnabled)
             self.list.addItem(w)
-        first = next((i for i, item in enumerate(place.items) if item.enabled), -1)
-        if not self.put and first >= 0:
-            self.list.setCurrentRow(first)
+        row = place.selected
+        if not (0 <= row < len(place.items) and place.items[row].enabled):
+            row = -1 if self.put else next(
+                (i for i, item in enumerate(place.items) if item.enabled), -1)
+        if row >= 0:
+            self.list.setCurrentRow(row)
+        self._told = -2                     # new to the application
+        self._reporting, self._pending = False, None    # a step in the last list is no step
         self.disk.setText(place.volume or "Desktop")
         self.disk_icon.setPixmap(icon("volume" if place.volume else "desktop").pixmap(16, 16))
         self.message.setText(place.message)
         self.message.setVisible(bool(place.message))
-        self._future = Future()
+        fut = self._future = Future()
         self._update_buttons()
         if self.put:
             self.name.setFocus()
@@ -382,7 +403,8 @@ class StandardFileDialog(QDialog):
             self.show()
             self.raise_()
             self.activateWindow()
-        return (self._future,)
+        self._report()
+        return (fut,)
 
     def resume(self, extras: list[Extra], name: str | None = None,
                message: str = "") -> tuple[Future]:
@@ -393,14 +415,21 @@ class StandardFileDialog(QDialog):
             self.name.setText(name.replace(":", "-")[:NAME_LIMIT])
         if message:
             self._tell(message)
-        self._future = Future()
+        fut = self._future = Future()
+        self._reporting = False
         self._update_buttons()
-        return (self._future,)
+        pending, self._pending = self._pending, None
+        if pending is not None:
+            self._act(*pending)
+        else:
+            self._report()
+        return (fut,)
 
     def state(self) -> tuple[int, str, dict[int, str]]:
         """The item selected (-1 for none), the name to save as, and
         what's in the application's edit text items."""
-        return self._selected(), self.name.text(), {
+        self._told = self._selected()
+        return self._told, self.name.text(), {
             n: w.text() for n, w in self._extras.items() if isinstance(w, QLineEdit)}
 
     def set_extras(self, extras: list[Extra]) -> None:
@@ -515,7 +544,8 @@ class StandardFileDialog(QDialog):
 
     def finish(self) -> None:
         """The application has its answer."""
-        self._future = None
+        self._future = self._pending = None
+        self._reporting = False
         if self._asking is not None:
             self._asking.close()
         if self.display is not None and self in self.display.file_dialogs:
@@ -528,9 +558,28 @@ class StandardFileDialog(QDialog):
     # =====================================================================
     def _act(self, *action) -> None:
         fut, self._future = self._future, None
-        if fut is not None and not fut.done():
+        if fut is None or fut.done():
+            if self._reporting and self._pending is None:
+                self._pending = action      # for when the application's heard
+            return
+        if action[0] == "select":           # the user can go on meanwhile
+            self._reporting = True
+        else:
             self._update_buttons()
-            fut.set_result(action)
+        fut.set_result(action)
+
+    def _can_act(self) -> bool:
+        return self._future is not None or self._reporting
+
+    def _row_changed(self, _row: int) -> None:
+        self._update_buttons()
+        self._report()
+
+    def _report(self) -> None:
+        """Tell the application's thread the selection has changed since
+        it last asked, if it wants to know."""
+        if self.reports and self._future is not None and self._selected() != self._told:
+            self._act("select")
 
     def _selected(self) -> int:
         row = self.list.currentRow()
@@ -543,12 +592,12 @@ class StandardFileDialog(QDialog):
         return row >= 0 and self.place.items[row].kind in ("folder", "volume")
 
     def _update_buttons(self) -> None:
-        waiting = self._future is not None
+        waiting = self._can_act()
         self.cancel_button.setEnabled(waiting)
         self.desk.setEnabled(waiting and not self.place.desktop)
         if self.put:
             folder = self._selected_folder()
-            self.ok.setText("Open" if folder else "Save")
+            self.ok.setText("Open" if folder else self.ok_title)
             self.ok.setEnabled(waiting and (folder or (bool(self.name.text().strip()) and
                                                        self.place.writable and
                                                        not self.place.desktop)))
@@ -565,7 +614,7 @@ class StandardFileDialog(QDialog):
 
     def _open_selected(self) -> None:
         row = self._selected()
-        if row >= 0 and self._future is not None:
+        if row >= 0 and self._can_act():
             if self.put and not self._selected_folder():
                 return
             self._act("open", row)
@@ -580,7 +629,7 @@ class StandardFileDialog(QDialog):
 
     def _save(self) -> None:
         name = self.name.text().replace(":", "-").strip()
-        if not name or self._future is None or not self.place.writable or self.place.desktop:
+        if not name or not self._can_act() or not self.place.writable or self.place.desktop:
             return
         existing = self._existing(name)
         if existing is None:
@@ -606,7 +655,7 @@ class StandardFileDialog(QDialog):
         box.open()
 
     def _ask_new_folder(self) -> None:
-        if self._future is None:
+        if not self._can_act():
             return
         ask = QInputDialog(self)
         ask.setWindowTitle(self.windowTitle())
@@ -643,6 +692,10 @@ class StandardFileDialog(QDialog):
     def names(self) -> list[str]:
         return [item.name for item in self.place.items]
 
+    def waiting(self) -> bool:
+        """Is it waiting for the user's next step?"""
+        return self._future is not None
+
     def choose(self, name: str) -> None:
         """Select an item by name and open it."""
         row = next(i for i, item in enumerate(self.place.items) if item.name == name)
@@ -663,10 +716,12 @@ class StandardFileDialog(QDialog):
 
 
 def open_dialog(display: Display, proc: Process, put: bool, prompt: str, name: str,
-                place: Place, extras: list[Extra] | None = None
-                ) -> tuple[StandardFileDialog, Future]:
+                place: Place, extras: list[Extra] | None = None, ok: str = "",
+                preview: QImage | None = None,
+                reports: bool = False) -> tuple[StandardFileDialog, Future]:
     """On the GUI thread: show a new dialog at place."""
-    dlg = StandardFileDialog(display, put, prompt, name, proc.name)
+    dlg = StandardFileDialog(display, put, prompt, name, proc.name, ok, preview)
+    dlg.reports = reports
     display.file_dialogs.append(dlg)
     (fut,) = dlg.show_place(place, extras)
     return dlg, fut

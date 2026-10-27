@@ -77,6 +77,7 @@ class DisplayConfig:
     speed: float | None = None                   # times a Mac Plus; None: as fast as it goes
     model: str = "plus"                          # which Mac it says it is: system.MODELS
     depth: int | None = None                     # its screen's bits a pixel; None: the model's
+    row_bytes: int | None = None                 # bytes from one row to the next; None: a row's
     disks: list = field(default_factory=list)    # disk images in the drives, in order
     sound: bool = False                          # play the Mac's sound on the host's output
     record_sound: str | None = None              # and write it to this WAV file
@@ -211,6 +212,7 @@ class Display(QObject):
         self.input = InputState()
         self.processes: list[Process] = []       # front to back
         self.launch_order: list[Process] = []
+        self.memory_sizes: dict[str, int] = {}  # files' memory sizes, as Get Info sets them
         self.views: dict[WindowRecord, MacWindowView] = {}
         self.app_bars: dict[Process, AppBarWindow] = {}
         self.tracker: Tracker | MenuTracker | None = None
@@ -227,6 +229,7 @@ class Display(QObject):
         self.print_dialogs: list = []             # Page Setup and Print, open now
         self.disk_dialogs: list = []              # which disk goes in a drive, open now
         self.color_dialogs: list = []             # the Color Picker's, open now
+        self.edition_dialogs: list = []           # the Edition Manager's options, open now
         self._router = InputRouter(self)
         QApplication.instance().installEventFilter(self._router)
         self._app_bar_timer = QTimer(self, singleShot=True, interval=250)
@@ -252,7 +255,8 @@ class Display(QObject):
                              system_file=self.config.system_file,
                              disk_system=disk_system, disk_fonts=fonts_beside(disk_system),
                              speed=self.config.speed, model=self.config.model,
-                             sound=self.sound, depth=self.config.depth)
+                             sound=self.sound, depth=self.config.depth,
+                             row_bytes=self.config.row_bytes)
         for disk in disks:
             self.system.files.mount_folder(VolumeFolder(disk))
         self.system.screen.order = lambda: self.processes
@@ -289,18 +293,27 @@ class Display(QObject):
     def launch(self, name: str, main: GuestMain | None, app: MacFile | None = None,
                folder: Folder | None = None, trace: bool = False,
                page_option: int = 0, memory: int | None = None,
-               as_panel: bool = True, code0: Layout | None = None) -> Process:
+               as_panel: bool = True, code0: Layout | None = None,
+               finder_info: bytes | None = None) -> Process:
         """Start a guest.  app is its application file, if it has one: the
         resource file GetNewWindow, GetMenu and friends read from.  With
         no Python main, app's own 68k code runs; trace logs its traps.
         page_option is Launch's, for CurPageOption.  memory, in bytes, is
-        in place of the size its SIZE resource asks for.  A control panel
-        that's an application as well is hosted as a panel unless as_panel
-        is False.  code0 is the layout of app's CODE 0, if it's been read."""
+        in place of the size its SIZE resource asks for: app's memory size,
+        as Get Info sets it, so it's the size of app's later launches too
+        (a control panel launching its own CODE as an application).  A
+        control panel that's an application as well is hosted as a panel
+        unless as_panel is False.  code0 is the layout of app's CODE 0, if
+        it's been read.  finder_info is the Finder information it's
+        launched with, if not its documents'."""
+        if app is not None:
+            if memory:
+                self.memory_sizes[app.key] = memory
+            memory = self.memory_sizes.get(app.key)
         proc = Process(self.system, name, main,
                        EventQueue(lambda: (self.input.mac_pos, self.input.modifiers)),
                        app=app, folder=folder, page_option=page_option, memory=memory,
-                       as_panel=as_panel, code0=code0)
+                       as_panel=as_panel, code0=code0, finder_info=finder_info)
         if proc.runner is not None:
             proc.runner.trace = trace
         self.launch_order.append(proc)
@@ -310,14 +323,16 @@ class Display(QObject):
         return proc
 
     def launch_application(self, app: MacFile, page_option: int = 0,
-                           code0: Layout | None = None) -> Process | str:
+                           code0: Layout | None = None,
+                           finder_info: bytes | None = None) -> Process | str:
         """Launch an application file for another application (the Launch
         trap): the new process, or why it couldn't start.  A control panel
         with an application's code runs it.  code0 is the layout of its
-        CODE 0, if the launching application has read it."""
+        CODE 0, if the launching application has read it, and finder_info
+        the Finder information it passes on."""
         try:
             return self.launch(app.name, None, app=app, page_option=page_option, as_panel=False,
-                               code0=code0)
+                               code0=code0, finder_info=finder_info)
         except (MemoryError, ValueError) as e:
             return str(e)
 
@@ -350,7 +365,8 @@ class Display(QObject):
         self._app_bar_timer.stop()
         widgets = [*self.views.values(), *self.app_bars.values(), self.global_bar,
                    self.host_window, *self._alerts, *self.file_dialogs,
-                   *self.print_dialogs, *self.disk_dialogs, *self.color_dialogs]
+                   *self.print_dialogs, *self.disk_dialogs, *self.color_dialogs,
+                   *self.edition_dialogs]
         for w in widgets:
             if w is not None:
                 w.hide()
