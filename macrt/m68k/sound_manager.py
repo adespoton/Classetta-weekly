@@ -52,6 +52,15 @@ plays the sound and waits for it, then frees the channel; SndPlay(chan,
 snd, FALSE) waits too, as does SndDisposeChannel(chan, FALSE).  The
 program waits in 68k code, so that ticks go on.
 
+SndStartFilePlay plays an AIFF or AIFF-C file, or the sampled sound of
+a 'snd ' resource, on a channel (Inside Macintosh: Sound, "Playing From
+Disk"): the samples are read from the open file at once, not through
+the program's buffer, and played as a bufferCmd's are, all of them or
+an AudioSelection's seconds of them.  SndPauseFilePlay pauses and
+resumes it, and SndStopFilePlay stops it, or waits for its end.
+SndChannelStatus reports its times.  However it ends, the program's
+completion routine is called with the channel.
+
 The samples are a Plus's, 22,254.5 a second, as the Sound Driver's are:
 a sound recorded at rate22khz plays a sample a sample.  Not done: 'snth'
 resources, as synthesizers or modifiers (those here stand in for
@@ -71,14 +80,17 @@ import math
 import struct
 
 from ..memory import ADDRESS_MASK, BusError
+from ..toolbox import sane
 from ..toolbox.files import paramErr
 from ..toolbox.memmgr import memFullErr, noErr
-from .sound import FRAME, SILENCE, SILENT_FRAME, fill
+from .sound import FRAME, SILENCE, SILENT_FRAME, fill, mix
 
 badChannel = -205
 queueFull = -203
 resProblem = -204
 badFormat = -206
+badFileFormat, channelBusy, channelNotBusy = -208, -209, -211
+siInvalidCompression = -223
 
 # Commands (IM V-482)
 nullCmd, initCmd, freeCmd, quietCmd, flushCmd = 0, 1, 2, 3, 4
@@ -149,14 +161,6 @@ def _volume(amplitude: int) -> bytes:
 
 def scaled(samples: bytes, amplitude: int) -> bytes:
     return samples if amplitude >= 255 else samples.translate(_volume(max(amplitude, 0)))
-
-
-def mix(frames: list[bytes]) -> bytes:
-    """Frames played together: their samples added, about silence."""
-    if len(frames) == 1:
-        return frames[0]
-    off = SILENCE * (len(frames) - 1)
-    return bytes(min(255, max(0, s - off)) for s in map(sum, zip(*frames)))
 
 
 # =========================================================================
@@ -241,11 +245,31 @@ class DoubleBuffer:
         return b"", False               # the Sound Manager plays it (_double)
 
 
+class FilePlay(Samples):
+    """SndStartFilePlay's samples, and what to call when they end."""
+
+    def __init__(self, data: bytes, step: float, amplitude: int, rate: float,
+                 start: float, completion: int):
+        super().__init__(data, step, amplitude)
+        self.rate = rate                # the sound's samples a second
+        self.start = start              # the selection's start, in seconds
+        self.completion = completion
+        self.paused = False
+
+    def times(self) -> tuple[float, float, float]:
+        """Its start, end and where it is, in seconds."""
+        return (self.start, self.start + len(self.data) / self.rate,
+                self.start + min(self.position, len(self.data)) / self.rate)
+
+
+_FLIP = bytes(b ^ 0x80 for b in range(256))     # two's complement to offset binary
+
+
 def mono(raw: bytes, channels: int, width: int) -> bytes:
     """Samples as offset binary bytes, one channel: 16-bit ones are two's
     complement, their high bytes kept; channels are averaged."""
     if width == 2:
-        raw = bytes(b ^ 0x80 for b in raw[0::2])
+        raw = raw[0::2].translate(_FLIP)
     if channels == 1:
         return raw
     return bytes(sum(raw[i:i + channels]) // channels for i in range(0, len(raw), channels))
@@ -304,6 +328,7 @@ class Channel:
         self.locked: list[tuple[object, int, int]] = []     # SndPlay's: heap, handle, state
         self.dispose = False            # free it once it's done
         self.sounded = False
+        self.file: FilePlay | None = None   # a play from disk, till its completion's called
 
     # -- the queue, in the record ---------------------------------------------
     def queued(self, mem) -> bool:
@@ -502,24 +527,69 @@ class SoundManager:
         ch.buffer = True
         return noErr
 
+    def play_file(self, t, ch: Channel | None, data: bytes, rate: float,
+                  selection: tuple[float, float] | None, completion: int,
+                  asynch: bool) -> int:
+        """SndStartFilePlay: ch plays the samples, offset binary bytes at
+        rate a second, from selection's start to its end, in seconds; or a
+        channel of its own does, and the program waits."""
+        start = 0.0
+        if selection is not None:
+            start = max(0.0, selection[0])
+            data = data[round(start * rate):max(0, round(selection[1] * rate))]
+        made = ch is None
+        if made:
+            addr = t.process.heap.new_ptr(CHANNEL_SIZE, clear=True)
+            if not addr:
+                return memFullErr
+            ch = self.new_channel(t, addr, sampledSynth, owned=True)
+            self.mem.w16(addr + QLENGTH, STD_QLENGTH)
+            ch.dispose = True
+        elif ch.file is not None:
+            return channelBusy
+        ch.quiet()
+        ch.held = 0
+        ch.voice = ch.file = FilePlay(data, rate / MAC_RATE * ch.rate / 0x10000, ch.amplitude,
+                                      rate, start, completion)
+        ch.buffer = True
+        if made or not asynch:
+            self.wait(t, ch)
+        return noErr
+
+    def pause_file(self, ch: Channel) -> int:
+        """SndPauseFilePlay: ch's play from disk paused, or resumed."""
+        play = ch.file
+        if play is None or ch.voice is not play:
+            return channelNotBusy
+        play.paused = not play.paused
+        return noErr
+
+    def stop_file(self, t, ch: Channel, quiet_now: bool) -> None:
+        """SndStopFilePlay: ch's play from disk stops now, or the program
+        waits for its end."""
+        play = ch.file
+        if play is None:
+            return
+        if ch.voice is play and not quiet_now:
+            play.paused = False
+            self.wait(t, ch)
+            return
+        if ch.voice is play:
+            ch.quiet()
+        self._settle(t, ch)
+
     def _double(self, t, ch: Channel, need: int) -> tuple[bytes, bool]:
         """Up to need samples of ch's double buffer, fewer if the next
         buffer isn't ready; and whether it has played the last.  The
-        program's doubleBack is called for each buffer played, while its
-        application is the one running."""
+        program's doubleBack is called for each buffer as it's played, or
+        later if another application is running then."""
         m, voice = self.mem, ch.voice
         assert isinstance(voice, DoubleBuffer)
         out: list[bytes] = []
         got = 0
         for _ in range(MAX_BUFFERS):
-            if voice.spent is not None:
-                if ch.process is not t.process:
-                    break
-                spent, voice.spent = voice.spent, None
-                if voice.proc:
-                    t.call(voice.proc, (("p", ch.addr), ("p", spent)))
-                if ch.voice is not voice:       # it played something else, or stopped
-                    break
+            if voice.spent is not None and not self._give_back(t, ch, voice):
+                break
             if voice.last:
                 return b"".join(out), True
             if got >= need:
@@ -545,12 +615,29 @@ class SoundManager:
                     voice.which ^= 1
             except BusError:                    # a buffer that isn't in memory: the end
                 return b"".join(out), True
+            if voice.spent is not None and not self._give_back(t, ch, voice):
+                break
         return b"".join(out), False
 
+    def _give_back(self, t, ch: Channel, voice: DoubleBuffer) -> bool:
+        """The program's doubleBack is called for the buffer voice has
+        played, if its application is the one running; whether ch goes on
+        playing voice."""
+        if ch.process is not t.process:
+            return False
+        spent, voice.spent = voice.spent, None
+        if voice.proc:
+            t.call(voice.proc, (("p", ch.addr), ("p", spent)))
+        return ch.voice is voice                # not if it played something else, or stopped
+
     def status(self, ch: Channel) -> bytes:
-        """An SCStatus: whether it's busy or paused."""
+        """An SCStatus: whether it's busy or paused, and a play from
+        disk's times."""
         busy = ch.busy(self.mem) or ch.voice is not None
-        return struct.pack(">3IBBBBII", 0, 0, 0, busy, 0, ch.paused, 0, 0, 0)
+        play = ch.file if ch.file is not None and ch.voice is ch.file else None
+        times = (round(x * 0x10000) & 0xFFFFFFFF for x in play.times()) if play else (0, 0, 0)
+        paused = ch.paused or bool(play and play.paused)
+        return struct.pack(">3IBBBBII", *times, busy, 0, paused, 0, 0, 0)
 
     def forget(self, t) -> None:
         """t's application is quitting: its channels go, with no word to it."""
@@ -575,7 +662,12 @@ class SoundManager:
 
     def _settle(self, t, ch: Channel) -> None:
         """If ch is done: the program waiting for it goes on, the handles
-        SndPlay locked are as they were, and if it's to be freed, it is."""
+        SndPlay locked are as they were, and if it's to be freed, it is.
+        A play from disk that has ended has its completion routine called,
+        while its application is the one running."""
+        if ch.file is not None and ch.voice is not ch.file:
+            if not self._file_done(t, ch):
+                return
         if ch.busy(self.mem):
             return
         for heap, h, state in reversed(ch.locked):
@@ -590,9 +682,30 @@ class SoundManager:
         if ch.dispose:
             self._free(t, ch)
 
+    def _file_done(self, t, ch: Channel) -> bool:
+        """ch's play from disk has ended: its completion routine called,
+        if its application is the one running; whether ch is still there."""
+        play = ch.file
+        assert play is not None
+        if play.completion and ch.process is not t.process:
+            return False
+        ch.file = None
+        if play.completion:
+            t.call(play.completion, (("p", ch.addr),))
+        return self.channels.get(ch.addr) is ch
+
     def _free(self, t, ch: Channel, call: bool = True) -> None:
-        """Free ch, its modifiers sent freeCmd if call."""
+        """Free ch, its modifiers sent freeCmd and a play from disk's
+        completion routine called, if call."""
         m = self.mem
+        play, ch.file = ch.file, None
+        if play is not None:
+            if ch.voice is play:
+                ch.quiet()
+            if call and play.completion and ch.process is t.process:
+                t.call(play.completion, (("p", ch.addr),))
+                if self.channels.get(ch.addr) is not ch:
+                    return              # the completion routine freed it
         stub = m.r32(ch.addr + FIRST_MOD) & ADDRESS_MASK
         for _ in range(64):
             if not stub:
@@ -759,6 +872,8 @@ class SoundManager:
         made no sound."""
         m = self.mem
         ch.sounded = False
+        if ch.file is not None and ch.file.paused and ch.voice is ch.file:
+            return None                 # SndPauseFilePlay's: it, and what's after it, wait
         parts = []
         need = FRAME
         for _ in range(MAX_COMMANDS):
@@ -839,3 +954,53 @@ def parse_snd(data: bytes) -> tuple[int, int, list[Command]] | None:
             commands.insert(i + 1, (cmd & dataPointerFlag | bufferCmd, p1, p2))
             break
     return synth, init, commands
+
+
+# =========================================================================
+# Sound files (Inside Macintosh: Sound, "Sound Files")
+# =========================================================================
+# AIFF-C compression types: Apple's, whose sound is silent here
+SILENT_TYPES = (b"ACE2", b"ACE8", b"MAC3", b"MAC6")
+
+
+def parse_aiff(data: bytes) -> tuple[bytes, float] | int:
+    """An AIFF or AIFF-C file's samples, as offset binary bytes, one
+    channel, and how many a second; or badFileFormat, or
+    siInvalidCompression for a compression that isn't Apple's."""
+    if len(data) < 12 or data[:4] != b"FORM" or data[8:12] not in (b"AIFF", b"AIFC"):
+        return badFileFormat
+    chunks: dict[bytes, tuple[int, int]] = {}
+    end = min(len(data), 8 + struct.unpack_from(">I", data, 4)[0])
+    at = 12
+    while at + 8 <= end:
+        kind, size = bytes(data[at:at + 4]), struct.unpack_from(">I", data, at + 4)[0]
+        chunks.setdefault(kind, (at + 8, min(size, end - at - 8)))
+        at += 8 + size + (size & 1)
+    if b"COMM" not in chunks:
+        return badFileFormat
+    comm, size = chunks[b"COMM"]
+    if size < 18:
+        return badFileFormat
+    channels, frames, bits = struct.unpack_from(">hIh", data, comm)
+    rate = sane.to_float(sane.unpack(sane.X, bytes(data[comm + 8:comm + 18])))
+    compression = b"NONE"
+    if data[8:12] == b"AIFC" and size >= 22:
+        compression = bytes(data[comm + 18:comm + 22])
+    if channels < 1 or not 1 <= bits <= 32 or not rate > 0:
+        return badFileFormat
+    if compression in SILENT_TYPES:
+        return bytes([SILENCE]) * min(frames, MAX_SAMPLES), rate
+    if compression != b"NONE":
+        return siInvalidCompression
+    width = (bits + 7) // 8
+    length = min(frames, MAX_SAMPLES) * channels * width
+    if not frames:
+        return b"", rate
+    if b"SSND" not in chunks:
+        return badFileFormat
+    ssnd, size = chunks[b"SSND"]
+    offset, = struct.unpack_from(">I", data, ssnd) if size >= 8 else (0,)
+    start = ssnd + 8 + offset
+    raw = bytes(data[start:min(start + length, ssnd + size)])
+    high = raw[0::width].translate(_FLIP)       # two's complement, the high bytes
+    return mono(high[:len(high) - len(high) % channels], channels, 1), rate

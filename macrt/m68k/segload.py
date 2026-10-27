@@ -15,10 +15,15 @@ is the routine's offset in the segment, then MOVE.W #segment,-(SP) and
 _LoadSeg; code calls an entry by JSR to its second word.  _LoadSeg reads
 CODE n, locks it, rewrites every entry of that segment as the segment
 number and a JMP to the routine, and goes back to the entry's second word
-(Inside Macintosh II, The Segment Loader).  _UnloadSeg puts them back and makes the
-segment purgeable.  It reads the segment with the GetResource trap, so a
-program that has patched GetResource sees it asked for: FullPaint's and
-Q-Sheet's patches decrypt their segments as they're read.
+(Inside Macintosh II, The Segment Loader).  A segment that isn't locked,
+read in without the resLocked attribute or in memory unlocked, it first
+moves toward the top of the heap with MoveHHi, out of the way of the
+blocks allocated low (Inside Macintosh IV, The Segment Loader): HyperCard
+2.0 grows a pointer it made just before it loads a segment.  _UnloadSeg
+puts the entries back and makes the segment purgeable.  _LoadSeg reads
+the segment with the GetResource trap, so a program that has patched
+GetResource sees it asked for: FullPaint's and Q-Sheet's patches decrypt
+their segments as they're read.
 
 The jump table _LoadSeg rewrites is the one A5 points at, CurJTOffset
 above it.  That's the application's, but code with an A5 world of its own
@@ -43,6 +48,7 @@ from ..resfork import (
     COMPRESSED_TAG, DecompressError, InvalidForkError, decompress, open_fork, resCompressed,
 )
 from ..toolbox import lowmem
+from ..toolbox.memmgr import LOCKED
 
 if TYPE_CHECKING:
     from .runtime import Runner
@@ -54,6 +60,12 @@ CODE = struct.unpack(">I", b"CODE")[0]
 JMP_ABS_L = 0x4EF9
 ENTRY = 8
 dsLoadErr = 15                  # system error: a segment couldn't be loaded
+
+
+def _code_id(seg: int) -> int:
+    """The CODE resource a segment number names: the number is an INTEGER,
+    so $FFFF is CODE -1 (GraphicConverter's first entry loads it)."""
+    return seg - 0x10000 if seg & 0x8000 else seg
 
 
 class SegmentError(ValueError):
@@ -121,6 +133,22 @@ def has_code(app: MacFile) -> bool:
     return fm.find(b"CODE", 0) is not None
 
 
+def why_no_code(app: MacFile) -> str:
+    """Why an application without CODE 0 has none, for its error message."""
+    try:
+        if open_fork(app.rsrc).find(b"cfrg", 0) is not None:
+            return "it's a PowerPC application"
+    except InvalidForkError:
+        pass
+    try:
+        if open_fork(app.data).find(b"CODE", 0) is not None:
+            # Copied by something that didn't keep the forks apart.
+            return "no CODE resources: its resource fork is in its data fork"
+    except InvalidForkError:
+        pass
+    return "no CODE resources"
+
+
 class SegmentLoader:
     def __init__(self, t: Runner, layout: Layout):
         self.t = t
@@ -157,49 +185,61 @@ class SegmentLoader:
                 # still where it was, but perhaps unloaded since: locked
                 # again all the same, for a program can unload the very
                 # segment it's running in and load it again (Habadex)
-                self._hold(h)
+                code = self._hold(h).deref(h)
+                self.loaded[seg] = (h, code, self.loaded[seg][2])
                 self._patch(seg, code)
                 return
         t = self.t
         h = self._get_code(seg)
         if not h:
-            t.system_error(dsLoadErr, f"CODE {seg} isn't in the application")
+            t.system_error(dsLoadErr, f"CODE {_code_id(seg)} isn't in the application")
         heap = self._hold(h)
         code = heap.deref(h)
         size = heap.handle_size(h)
         if size >= 2 and t.mem.r16(code) == 0xFFFF:
-            t.system_error(dsLoadErr, f"CODE {seg} uses the far code model, "
+            t.system_error(dsLoadErr, f"CODE {_code_id(seg)} uses the far code model, "
                                       "which the Segment Loader doesn't handle yet")
         self.loaded[seg] = (h, code, size)
         self._patch(seg, code)
 
     def _hold(self, h: int):
-        """Lock a segment's handle and make it unpurgeable, as LoadSeg does;
-        return its heap."""
+        """Move a segment's handle high if it isn't locked, lock it and make
+        it unpurgeable, as LoadSeg does; return its heap."""
         heap = self.t.system.heap_of(h)
+        if not self.t.mem.r8(h) & LOCKED:
+            heap.move_high(h)
         heap.lock(h)
         heap.set_purgeable(h, False)
         return heap
 
     def _get_code(self, seg: int) -> int:
         """GetResource("CODE", seg), through the program's own GetResource
-        if it has patched it."""
+        if it has patched it, and read in though the program has turned
+        ResLoad off: LoadSeg reads in a segment that isn't in memory, and
+        SoundApp calls a routine in another segment between its
+        SetResLoad(FALSE) and SetResLoad(TRUE)."""
         t = self.t
+        resources = t.process.resources
         patch = t.patches.get(GET_RESOURCE)
         if patch is not None:
-            return t.call(patch, (("l", CODE), ("h", seg)), "p") & ADDRESS_MASK
-        return t.process.resources.GetResource("CODE", seg)
+            h = t.call(patch, (("l", CODE), ("h", seg)), "p") & ADDRESS_MASK
+        else:
+            h = resources.GetResource("CODE", _code_id(seg))
+        if h and not t.mem.r32(h) & ADDRESS_MASK:
+            resources.LoadResource(h)
+        return h
 
     def _load_elsewhere(self, seg: int, table: int) -> None:
         """LoadSeg into another A5 world's jump table."""
         held = self.elsewhere.get((table, seg))
         if held is not None and self.t.mem.r32(held[0]) & 0xFFFFFF == held[1]:
-            h, code, _ = held
-            self._hold(h)
+            h, _, size = held
+            code = self._hold(h).deref(h)
+            self.elsewhere[(table, seg)] = (h, code, size)
         else:
             h = self._get_code(seg)
             if not h:
-                self.t.system_error(dsLoadErr, f"CODE {seg} isn't in any open file")
+                self.t.system_error(dsLoadErr, f"CODE {_code_id(seg)} isn't in any open file")
             heap = self._hold(h)
             code = heap.deref(h)
             self.elsewhere[(table, seg)] = (h, code, heap.handle_size(h))
@@ -273,7 +313,7 @@ class SegmentLoader:
         if not ours and a5 != self.a5 and self._entry_segment(e) == seg:
             self._load_elsewhere(seg, a5 + self.t.mem.r16(lowmem.CurJTOffset))
             if self.t.mem.r16(e + 2) == JMP_ABS_L:
-                cpu.pc = e + 2
+                self._go_on(e)
             return
         self.load(seg)
         # _LoadSeg goes back 6 bytes before where it was called from: for
@@ -285,14 +325,29 @@ class SegmentLoader:
                 self._not_in_segment(seg)
         elif self._entry_segment(e) == seg and self.t.mem.r16(e + 2) != JMP_ABS_L:
             return                  # an entry it didn't rewrite: going back would load forever
-        cpu.pc = e + 2
+        self._go_on(e)
+
+    def _go_on(self, e: int) -> None:
+        """Go on at entry e's JMP.  With LoadTrap set, by way of _Debugger,
+        the routine's address on the stack, for a debugger to stop there or
+        go on to it with an RTS (Inside Macintosh: Processes, Segment
+        Manager).  Crystal Paint DEMO's patch on _LoadSeg runs the original
+        on a stack of its own and takes the _Debugger, in its own A-line
+        handler, to get back to the application's."""
+        mem = self.t.mem
+        if mem.r8(lowmem.LoadTrap):
+            self.t.cpu.push32(mem.r32(e + 4) if mem.r16(e + 2) == JMP_ABS_L else e + 2)
+            self.t.cpu.pc = self.t.machine.load_trap
+        else:
+            self.t.cpu.pc = e + 2
 
     def _not_in_segment(self, seg: int) -> None:
         """The entry called is still _LoadSeg after loading its segment:
         going on would load it forever."""
         h, code, size = self.loaded[seg]
         if self.t.mem.read(code, 4) == b"SALN":
-            self.t.system_error(dsLoadErr, f"CODE {seg} is still compressed by AutoDoubler: "
-                                           "the application's decompressor didn't expand it")
-        self.t.system_error(dsLoadErr, f"CODE {seg} doesn't have the entry the jump table "
-                                       "points to")
+            self.t.system_error(dsLoadErr, f"CODE {_code_id(seg)} is still compressed by "
+                                           "AutoDoubler: the application's decompressor "
+                                           "didn't expand it")
+        self.t.system_error(dsLoadErr, f"CODE {_code_id(seg)} doesn't have the entry the "
+                                       "jump table points to")

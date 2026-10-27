@@ -104,7 +104,12 @@ def give_time(t) -> None:
 
 def give_event(t, event_p: int) -> bool:
     """SystemEvent, as the Event Manager calls it: True if the event was a
-    desk accessory's, and so isn't the application's."""
+    desk accessory's, and so isn't the application's.  SEvtEnb clear says
+    not to (Inside Macintosh I has it as SystemEvent returning FALSE): the
+    THINK C console clears it and calls SystemEvent itself, for its own
+    driver's console window (Burtonia), so it's this call it stops."""
+    if not t.mem.r8(lowmem.SEvtEnb):
+        return False
     called, result = _patched(t, SYSTEM_EVENT, (("p", event_p),), "b")
     return bool(result) if called else system_event(t, event_p)
 
@@ -113,7 +118,7 @@ def system_event(t, event_p: int) -> bool:
     """SystemEvent: give a desk accessory the event if it's for its window;
     True if it was, and so isn't the application's."""
     m = t.mem
-    if not event_p or not m.r8(lowmem.SEvtEnb) or not t.machine.drivers:
+    if not event_p or not t.machine.drivers:
         return False
     what, w = m.r16(event_p), None
     if what in (k.keyDown, k.autoKey) and m.r16(event_p + 14) & k.cmdKey:

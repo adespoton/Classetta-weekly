@@ -41,7 +41,7 @@ from .. import moof
 from ..memory import ADDRESS_MASK, BusError, from_mac, to_mac
 from ..toolbox import lowmem
 from ..toolbox.files import ERIK, File
-from ..toolbox.events import ProcessKilled, tick_count
+from ..toolbox.events import ProcessKilled, tick_count, to_next_tick
 from ..toolbox.menus import MenuInfo
 from ..toolbox.quickdraw import GRAY_PAT
 from ..toolbox.screen import DESK
@@ -50,7 +50,7 @@ from ..toolbox.types import Point, Rect
 from ..toolbox.windows import WindowRecord
 from . import cpu as m68k
 from . import decompressors, dispatch, timemgr, wdefs
-from .sound import SoundDriver, Speaker
+from .sound import ASC, ASC_BASE, SoundDriver, Speaker, gestaltHasASC
 from .sound_manager import SoundManager
 from .cpu import CPU
 from .cycles import RATE
@@ -72,6 +72,7 @@ RTS = 0x4E75
 RTE = 0x4E73
 TRAP_WORD = 0x4E40      # TRAP #n, with n in the low 4 bits
 EXIT_TO_SHELL = 0xA9F4
+DEBUGGER = 0xA9FF
 N_TOOLBOX = 0x400
 N_OS = 0x100
 
@@ -87,7 +88,22 @@ SYSTEM_ERRORS = {
 VBL_ADDR, VBL_COUNT = 6, 10    # in a VBLTask record
 SOUND_BUFFER = 0x300            # 370 words, rounded up as the Mac Plus's is
 FINDER_INFO_PARAM = 16          # the application parameter with the Finder information's handle
+USE_ASYNC = 2                   # a serial port's use type: the Serial Driver's, not AppleTalk's
 appOpen = 0                     # the Finder information's message: open the documents
+
+# The calls a program makes to ask how things are: EventAvail, GetMouse,
+# StillDown, Button, TickCount, GetKeys, WaitMouseUp, OSEventAvail,
+# GetOSEvent and SystemTask.  One that waits by asking over and over, a
+# call within SPIN_GAP of the last with nothing else between, as Lemmings
+# does on TickCount and Airborne! on Button, would keep the host's
+# processor all the while.  What it asks about changes at a tick or with
+# input, so after SPIN_BUDGET of that it waits for the next tick or for
+# input, letting the others run as at Delay.  The host does many ticks of
+# a Mac's work in that budget.
+POLLS = frozenset({0xA971, 0xA972, 0xA973, 0xA974, 0xA975, 0xA976, 0xA977,
+                   0xA030, 0xA031, 0xA9B4})
+SPIN_GAP = 0.0005               # seconds
+SPIN_BUDGET = 0.002
 
 # The ROM's handler for the VIA's interrupts: it calls the routine in
 # Lvl1DT for the lowest of the flags that interrupted, with A1 pointing at
@@ -214,6 +230,7 @@ def init_dispatcher(at: int, dispatcher: int) -> bytes:
 
 MAX_RETRACES = 6        # ticks a late retrace catches up on; after a longer gap, one
 MAX_TIME_TASKS = 64     # Time Manager tasks run at one tick, at most
+INTERRUPT_REGISTERS = 32  # what an interrupt handler keeps on the stack: A0-A3 and D0-D3
 
 VECTOR_ERRORS = {m68k.BUS_ERROR: 1, m68k.ADDRESS_ERROR: 2, m68k.ILLEGAL: 3,
                  m68k.ZERO_DIVIDE: 4, m68k.CHK: 5, m68k.TRAPV: 6, m68k.PRIVILEGE: 7,
@@ -243,11 +260,13 @@ def _extension(mem, at: int, ea: int, size: int) -> int:
 
 
 def after_instruction(mem, pc: int) -> int:
-    """Where the DIVU, DIVS, CHK, TRAPV or TRAPcc at pc ends: where the
-    exception it raises returns to."""
+    """Where the DIVU, DIVS, CHK, CHK2, TRAPV or TRAPcc at pc ends: where
+    the exception it raises returns to."""
     op = mem.r16(pc)
     if m68k.is_trapcc(op):
         return pc + m68k.TRAPCC_SIZES[op & 7]
+    if op & 0xF9C0 == 0x00C0:               # CHK2: an extension word, then the EA
+        return pc + 4 + _extension(mem, pc + 4, op & 0x3F, 1 << (op >> 9 & 3))
     if op & 0xFFC0 == 0x4C40:               # DIVU.L, DIVS.L: an extension word, then the EA
         return pc + 4 + _extension(mem, pc + 4, op & 0x3F, 4)
     if op & 0xF0C0 == 0x80C0 or op & 0xF140 == 0x4100:     # DIVx.W, CHK.W, CHK.L
@@ -297,8 +316,12 @@ class Machine:
         self.cpu.timers_waiting = lambda: self.owner is not None and bool(self.owner.time_tasks.due)
         self.sound = SoundDriver(self)
         self.sound_manager = SoundManager(self)
-        self.speaker = Speaker(self.mem, self.via, system.sound)
-        self.cpu.sound_waiting = lambda: (self.sound.counting() or self.speaker.on
+        self.asc: ASC | None = None
+        if system.model.hardware >> gestaltHasASC & 1:
+            self.asc = ASC()
+            self.asc.map(self.cpu.uc)
+        self.speaker = Speaker(self.mem, self.via, system.sound, self.asc)
+        self.cpu.sound_waiting = lambda: (self.sound.counting() or self.speaker.waiting
                                           or self.sound_manager.busy())
         if system.speed:
             self.cpu.rate = int(system.speed * RATE)
@@ -366,7 +389,9 @@ class Machine:
         self.address_marks = ROM_BASE + 486     # what begins and ends a sector's address field
         self.swap_font = ROM_BASE + 492     # JSwapFont's
         self.crsr_task = ROM_BASE + 512     # JCrsrTask's: the input globals do it
+        self.load_trap = ROM_BASE + 514     # _LoadSeg's _Debugger, with LoadTrap set
         self.cpu.rom_interrupts = self.level_1
+        self.cpu.no_handler = self.bomb_stub
         self.cpu.rom_level_1_routines = (self.level_1_routines,
                                          self.level_1_routines + 8 * LEVEL_1_ROUTINE)
         for at in (self.return_stub, *self.os_patch_returns):
@@ -387,6 +412,7 @@ class Machine:
             mem.w16(at, ILLEGAL_WORD)
         mem.w16(self.te_do_text, ILLEGAL_WORD)
         mem.w16(self.crsr_task, ILLEGAL_WORD)
+        mem.write(self.load_trap, struct.pack(">HH", DEBUGGER, RTS))
         mem.w16(self.a_line, ILLEGAL_WORD)
         mem.write(self.init_dispatcher, init_dispatcher(self.init_dispatcher, self.a_line))
         mem.write(self.cursor_vectors, CURSOR_VECTORS)
@@ -474,9 +500,12 @@ class Machine:
         # says the volume isn't 0.
         mem.w8(lowmem.SdVolume, volume)
         # Parameter RAM saying the same, as InitUtil leaves it: Wizardry
-        # takes its double-click time from volClik, not DoubleTime.
+        # takes its double-click time from volClik, not DoubleTime.  Its
+        # port use, SPConfig, has the printer port the Serial Driver's, so
+        # that programs that look don't open AppleTalk, which isn't here
+        # (Inside Macintosh II, the AppleTalk Manager): JamPaint.
         mem.write(lowmem.SysParam, struct.pack(
-            ">4B2HIh3H", 0xA8, 0, 0, 0,             # valid; AppleTalk node hints; port use
+            ">4B2HIh3H", 0xA8, 0, 0, USE_ASYNC,     # valid; AppleTalk node hints; port use
             0xCC0A, 0xCC0A, 0,                      # the serial ports: 9600 baud, 8N2; alarm
             ap_font - 1,
             (thresh // 4) << 12 | (rate // 2) << 8,  # kbdPrint: the printer on the printer port
@@ -500,6 +529,8 @@ class Machine:
         mem.write(lowmem.DragPattern, GRAY_PAT)
         mem.w32(lowmem.VIA, VIA_BASE)
         mem.w32(lowmem.IWM, IWM_BASE)
+        if self.asc is not None:
+            mem.w32(lowmem.ASCBase, ASC_BASE)
         mem.w32(lowmem.RdAddr, self.rd_addr)
         mem.w32(lowmem.RdData, self.rd_data)
         mem.w32(lowmem.AdrDisk, self.adr_disk)
@@ -633,6 +664,9 @@ class Runner:
         self.menu_rect = 0          # mbRect's answer while MenuSelect pulls a menu down
         self.retrace_tick = 0       # when its VBL tasks were last counted down
         self.null_tick = -1         # when GetNextEvent last had nothing for it
+        self.updated = (None, -1, 0)    # the update event it was last given: window, when, begun
+        self.polled = 0.0           # when the last of POLLS returned, if no other trap since
+        self.spun_from = 0.0        # when it started asking over and over
         self.in_gne_patch = False   # WaitNextEvent is calling a GetNextEvent patch
         self.in_patch: set[int] = set()     # traps the System is calling a patch of
         self.ticks_failed = False   # a tick while it waited went wrong
@@ -698,7 +732,9 @@ class Runner:
         cpu.push32(self.machine.exit_stub)
         entry = self.segments.install()
         documents = self._documents()
-        info = finder_information(documents)
+        info = self.process.finder_info
+        if info is None:
+            info = finder_information(documents)
         h = self.process.heap.new_handle(len(info))
         self.mem.write(self.process.heap.deref(h), info)
         world.w32(lowmem.AppParmHandle, h)
@@ -752,7 +788,10 @@ class Runner:
                 raise ProcessKilled()
             kind = ev.kind
             if kind == "trap":
-                self._trap(ev.code, ev.pc)
+                if self._own_a_line(ev.pc):
+                    cpu.take_exception(m68k.LINE_A, ev.pc)
+                else:
+                    self._trap(ev.code, ev.pc)
             elif kind == "until":
                 return
             elif kind == "interrupted":
@@ -828,7 +867,7 @@ class Runner:
         self.retrace_tick = now
         if ticks > 0 and (mem.r32(lowmem.VBLQueue + 2) or cpu.sound_waiting()):
             ctx = cpu.context()
-            cpu.sr = cpu.sr | m68k.VBL_LEVEL
+            self._interrupt_frame()
             sound, speaker = self.machine.sound, self.machine.speaker
             manager = self.machine.sound_manager
             for _ in range(ticks):
@@ -861,11 +900,21 @@ class Runner:
         if cpu.sr & m68k.INTERRUPT_MASK:
             return
         pending = self.machine.via.pending()
-        vector = self.mem.r32(4 * m68k.LEVEL_1) & ADDRESS_MASK
-        if pending and (vector not in (0, cpu.rom_interrupts)
+        if pending and (cpu.own_interrupt_handler()
                         or pending & cpu.own_level_1_routines()):
             cpu.take_exception(m68k.LEVEL_1, cpu.pc)
             cpu.sr = cpu.sr & ~m68k.INTERRUPT_MASK | m68k.VBL_LEVEL
+
+    def _interrupt_frame(self) -> None:
+        """What the interrupt stacks under the program's stack before its
+        handler calls a task: the processor's exception frame, and the
+        registers the handler keeps, A0-A3 and D0-D3 (Inside Macintosh
+        II-200), with the interrupt's priority in SR.  Factory's sound
+        callback leaves a word above its parameters, as if it were a
+        function, which mustn't land in the interrupted code's frame."""
+        cpu = self.cpu
+        cpu.sp = cpu.sp - (6 if cpu.short_frames else 8) - INTERRUPT_REGISTERS
+        cpu.sr = cpu.sr | m68k.VBL_LEVEL
 
     def _time_tasks(self) -> None:
         """Run the application's Time Manager tasks that are due, with A1
@@ -877,7 +926,7 @@ class Runner:
         cpu, mem = self.cpu, self.mem
         now = tasks.clock()
         ctx = cpu.context()
-        cpu.sr = cpu.sr | m68k.VBL_LEVEL
+        self._interrupt_frame()
         for _ in range(MAX_TIME_TASKS):
             due = tasks.next_due(now)
             if due is None:
@@ -894,8 +943,25 @@ class Runner:
                 tasks.running = None
         cpu.restore(ctx)
 
+    def _own_a_line(self, pc: int) -> bool:
+        """Whether the trap at pc goes to a handler the program has put in
+        vector $28, as every A-line instruction goes to the vector's.  Not
+        one in the stubs or the ROM's MountVol: called through its address,
+        a trap's routine is the ROM's code itself."""
+        if self.mem.r32(4 * m68k.LINE_A) & ADDRESS_MASK == self.machine.a_line:
+            return False
+        start, end = self.machine.stubs
+        pc &= ADDRESS_MASK
+        return not start <= pc < end and pc != self.machine.mount_vol
+
     def _trap(self, word: int, pc: int) -> None:
         cpu = self.cpu
+        part = self.process.partition
+        if part.left_a5 and cpu.a(5) & ADDRESS_MASK == part.left_a5:
+            # A5 is back where it was before an InitGraf at another A5, and
+            # QuickDraw's globals with it: DD Expand finds the screen's
+            # bounds through an InitGraf on a stack frame, then goes back.
+            part.a5, part.left_a5 = part.left_a5, 0
         if (self.process.frames_due and not self.in_wdef
                 and not cpu.sr & m68k.INTERRUPT_MASK):
             wdefs.refresh(self)     # windows its own WDEFs are to shape and draw
@@ -907,7 +973,17 @@ class Runner:
         via_stub = start <= (pc & ADDRESS_MASK) < end
         if pc & ADDRESS_MASK == self.machine.return_stub:
             raise SystemError68k(3, "returned through a callback that wasn't called")
+        if pc & ADDRESS_MASK == self.machine.load_trap:
+            cpu.pc = pc + 2             # no debugger to stop in: on to the routine
+            return
         key = dispatch.trap_key(word)
+        if ((word & 0x0A00) == 0x0A00 and self.system.model.toolbox_traps == 512
+                and not dispatch.assigned(key) and key not in self.patches):
+            # A word with bit 9 set that names nothing: a program for the
+            # 128K ROM, whose dispatcher ignored bit 9, may leave it set
+            # (Crozzle 0.8 calls NewWindow as $AB13).
+            word &= ~0x0200
+            key = dispatch.trap_key(word)
         if dispatch.is_toolbox(word):
             patch = None if via_stub else self.patches.get(key)
             if patch is not None:
@@ -941,6 +1017,9 @@ class Runner:
         self._trap(self.mem.r16(pc & ADDRESS_MASK), pc)
 
     def _dispatch(self, word: int, pc: int) -> None:
+        poll = dispatch.trap_key(word) in POLLS
+        if poll:
+            self._polling()
         try:
             dispatch.dispatch(self, word, pc)
         except dispatch.UnknownTrap as e:
@@ -948,6 +1027,24 @@ class Runner:
         except BusError as e:           # it passed the trap a bad pointer or handle
             raise SystemError68k(1, f"in {dispatch.trap_name(word)} at ${pc & ADDRESS_MASK:06X}: "
                                     f"{e}", pc & ADDRESS_MASK) from None
+        self.polled = time.monotonic() if poll else 0.0
+
+    def _polling(self) -> None:
+        """One of POLLS: if the program has done nothing but ask for
+        SPIN_BUDGET, it waits for the next tick or for input.  Not at a
+        tick, with interrupts masked, or paced, where the time it takes
+        is the point."""
+        now = time.monotonic()
+        if now - self.polled >= SPIN_GAP:
+            self.spun_from = now
+            return
+        if now - self.spun_from < SPIN_BUDGET:
+            return
+        if (self.holding and not self.machine.ticking() and not self.cpu.rate
+                and not self.cpu.sr & m68k.INTERRUPT_MASK):
+            with self.yielding():
+                self.process.events.nap(to_next_tick() / 60 + 2 * m68k.SETTLE)
+        self.spun_from = time.monotonic()
 
     def _call_os_patch(self, addr: int, word: int, ret: int) -> None:
         """What the OS trap dispatcher does for a patched trap, on the stack
@@ -1223,8 +1320,8 @@ class Runner:
 # Register the trap implementations.
 from . import (  # noqa: E402,F401
     glue_aevents, glue_aliases, glue_color, glue_components, glue_controls, glue_cport, glue_desk,
-    glue_devices, glue_dialogs, glue_files, glue_gworld, glue_icons, glue_intl, glue_lists,
-    glue_menucolors, glue_os, glue_palette, glue_picker, glue_pict, glue_ppc, glue_print,
-    glue_process, glue_sane, glue_scrap, glue_script, glue_sony, glue_sound, glue_stdfile,
-    glue_textedit, glue_toolbox, glue_video)
+    glue_devices, glue_dialogs, glue_editions, glue_files, glue_gworld, glue_icons, glue_intl,
+    glue_lists, glue_menucolors, glue_os, glue_palette, glue_picker, glue_pict, glue_pictinfo,
+    glue_ppc, glue_print, glue_process, glue_sane, glue_scrap, glue_script, glue_scsi, glue_slots,
+    glue_sony, glue_sound, glue_stdfile, glue_textedit, glue_toolbox, glue_video)
 from . import controlpanel  # noqa: E402 - the host for control panels, which calls the glue

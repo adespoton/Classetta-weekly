@@ -76,6 +76,11 @@ out where to go, and goes to what it pushed: the Pascal glue for an
 asynchronous file call (King's Quest's) pushes an RTS and the trap and
 JSRs to them, so that's watched for as well.
 
+Nor does it know the 68020's CHK2 and CMP2, or the 68881's packed
+decimal reals: run() does those too (see instructions).  It raises an
+exception for each, but an FMOVE.P to memory with its k-factor in a
+register it runs as some other format, so that's watched for as well.
+
 Nor does it trace: with SR's trace bit, T1, set as an instruction starts,
 the processor takes a trace exception once it's done, and FullPaint's
 loader sets it to call the routine that decrypts each segment, its
@@ -113,6 +118,7 @@ from unicorn.m68k_const import (UC_CPU_M68K_M68020, UC_M68K_REG_A0, UC_M68K_REG_
 from ..memory import ADDRESS_MASK, RAM, BusError
 from ..toolbox import lowmem
 from ..toolbox.events import tick_count, to_next_tick
+from . import instructions
 from .cycles import RATE, cycles, untaken
 
 log = logging.getLogger("macrt.cpu")
@@ -131,6 +137,7 @@ LINE_F = 11
 FORMAT_ERROR = 14
 LEVEL_1 = 25            # the autovector of the VIA's interrupts
 TRAP_0 = 32
+FP_UNIMPLEMENTED = 55   # an unimplemented data type: the core's for a packed decimal real
 RTE = 0x100             # QEMU raises these internally; with a hook installed they
 HALT = 0x101            # reach it instead of being handled, so they're emulated here
 
@@ -147,6 +154,16 @@ CCR_X, CCR_N, CCR_Z, CCR_V, CCR_C = 0x10, 0x08, 0x04, 0x02, 0x01
 # instruction, gave, for working out when they're wanted.
 CC_OP_FLAGS, CC_OP_ADD, CC_OP_SUB, CC_OP_CMP, CC_OP_LOGIC = 1, 2, 5, 8, 11
 SR_WORD, CC_WORDS = 17, 22      # in CPUM68KState, after D0-D7, A0-A7 and PC; cc_op on
+# Then, after cc_z, FP0-FP7, 16 bytes each: an extended real's mantissa, then
+# its sign and exponent, little-endian; the result of the last, and FPCR and FPSR.
+FREGS = CC_WORDS + 6
+FPCR_WORD = FREGS + 4 * 9
+# The word after the FPSR is how the core rounds, as an FMOVE to the FPCR
+# leaves it: its rounding mode in the second byte, for RN, RZ, RM and RP,
+# and its precision in the fourth, for extended, single and double (and
+# for the fourth, no change).
+CORE_ROUNDING = (0, 3, 1, 2)
+CORE_PRECISION = (80, 32, 64, None)
 SLICE = 100_000         # instructions between looks at the clock, while VBL tasks wait
 SETTLE = 0.0002         # seconds the clock waits past a tick, not to wake just before it
 VBL_COUNT, VBL_TASK_END = 10, 14    # in a VBLTask record
@@ -175,10 +192,42 @@ ORI_SR, EORI_SR = 0x007C, 0x0A7C
 # of one is a second byte of another, so one found at an odd address hides
 # none.
 WATCHED = re.compile(rb"[\x50-\x5F][\xFA-\xFC]|[\x00\x0A]\x7C|\x46[\xC0-\xFF]|\x4E\x97")
+# And FMOVE.P FPn,<ea>{Dn}, to memory with its k-factor in a register, which
+# the core runs as if it were some other format, writing what it likes.
+PACKED_DYNAMIC = re.compile(rb"\xF2[\x10-\x3F][\x7C-\x7F]")
 JSR_SP = 0x4E97
 TRAPV_WORD = 0x4E76     # which the core doesn't know: it takes an illegal instruction for it
 RTR = 0x4E77            # nor that
 VS = 9                  # TRAPV's condition, as TRAPcc's
+CHUNK = 128             # how finely _changed looks for the bytes that differ
+
+
+def _words_to_stop_at(mem, start: int, end: int):
+    """Where the words to stop at are, from start to end: at even addresses."""
+    for pattern in (WATCHED, PACKED_DYNAMIC):
+        for found in pattern.finditer(mem, start, end):
+            if not found.start() & 1:
+                yield found.start()
+
+
+def _changed(old: bytes, new: bytes) -> list[tuple[int, int]]:
+    """Where in new, a page as it is now, a word to stop at may be that
+    wasn't in old, as it was: each run of CHUNK bytes that differ, from 2
+    bytes before it to 2 after.  A program's jump table and its stack are
+    often on one page, written at every trap, a few bytes at a time and at
+    both ends of it; looking through all of it each time took MandelZot
+    most of its time."""
+    size, runs, first = len(new), [], None
+    for at in range(0, size, CHUNK):
+        if old[at:at + CHUNK] != new[at:at + CHUNK]:
+            if first is None:
+                first = at
+        elif first is not None:
+            runs.append((max(0, first - 2), at + 2))
+            first = None
+    if first is not None:
+        runs.append((max(0, first - 2), size))
+    return runs
 
 
 def _extend(value: int, size: int) -> int:
@@ -399,7 +448,7 @@ class CPU:
         self._rerun: int | None = None      # a store the core stopped at, to run again
         self._let_by: int | None = None     # the one it's running again
         self._fetched = b""                 # the words of the store as it was run
-        self._trapcc: int | None = None     # a TRAPcc, TRAPV, RTR or JSR (SP) the core stopped at
+        self._trapcc: int | None = None     # a TRAPcc, TRAPV, RTR, JSR (SP)... the core stopped at
         self._watched: set[int] = set()     # where they're watched for, and SR's writes
         self._seen: set[int] = set()        # the words found on pages mapped for both
         self._edged = False                 # the core has looked at a block it's translated
@@ -427,6 +476,7 @@ class CPU:
         self.timers_waiting: Callable[[], bool] = lambda: False    # Time Manager tasks
         self.sound_waiting: Callable[[], bool] = lambda: False     # the Sound Driver, the speaker
         self.rom_interrupts = 0         # what LEVEL_1's vector is until a program sets it
+        self.no_handler = 0             # the System's stub for an exception nobody handles
         self.rom_level_1_routines = (0, 0)      # where Lvl1DT's routines are until then
         self.short_frames = False       # a 68000's exception frames: SR and PC, no more
         self._counting = False          # whether the last run was in slices
@@ -532,6 +582,47 @@ class CPU:
         self._state_at = at
         return state
 
+    def fp(self, n: int) -> tuple[int, int]:
+        """FPn: an extended real's sign and exponent word, and mantissa."""
+        self.uc.context_update(self._ctx)
+        state, at = self._state, self._state_at + FREGS + 4 * n
+        return state[at + 2] & 0xFFFF, state[at + 1] << 32 | state[at]
+
+    def set_fp(self, n: int, se: int, mantissa: int) -> None:
+        self._set_state(FREGS + 4 * n, mantissa & 0xFFFFFFFF, mantissa >> 32, se & 0xFFFF)
+
+    @property
+    def fpcr(self) -> int:
+        self.uc.context_update(self._ctx)
+        return self._state[self._state_at + FPCR_WORD]
+
+    @fpcr.setter
+    def fpcr(self, value: int) -> None:
+        """As an FMOVE to it sets it: the core rounds as it says."""
+        self.uc.context_update(self._ctx)
+        state, at = self._state, self._state_at + FPCR_WORD
+        rounding = state[at + 2] & ~0xFF00 | CORE_ROUNDING[value >> 4 & 3] << 8
+        if (precision := CORE_PRECISION[value >> 6 & 3]) is not None:
+            rounding = rounding & 0x00FFFFFF | precision << 24
+        self._set_state(FPCR_WORD, value & 0xFFF0, state[at + 1], rounding)
+
+    @property
+    def fpsr(self) -> int:
+        self.uc.context_update(self._ctx)
+        return self._state[self._state_at + FPCR_WORD + 1]
+
+    @fpsr.setter
+    def fpsr(self, value: int) -> None:
+        self._set_state(FPCR_WORD + 1, value & 0x0FFFFFF8)
+
+    def _set_state(self, word: int, *values: int) -> None:
+        """Set words of the core's state, from word on: in a copy, put back."""
+        self.uc.context_update(self._ctx)
+        at = self._state_at + word
+        for n, value in enumerate(values):
+            self._state[at + n] = value
+        self.uc.context_restore(self._ctx)
+
     def set_cc_from_word(self, value: int) -> None:
         """TST.W: N and Z from a word, V and C clear, X kept."""
         value &= 0xFFFF
@@ -573,6 +664,29 @@ class CPU:
         sp = self.sp
         self.sp = sp + 4
         return self.mem.r32(sp)
+
+    # =====================================================================
+    # Devices
+    # =====================================================================
+    def bus_r8(self, addr: int) -> int:
+        """The byte at an address, as the processor reads it: a device's
+        register, outside RAM, as well as RAM's."""
+        try:
+            return self.mem.r8(addr)
+        except BusError:
+            try:
+                return self.uc.mem_read(addr & ADDRESS_MASK, 1)[0]
+            except UcError:
+                raise BusError(f"access to ${addr & ADDRESS_MASK:06X} is outside RAM") from None
+
+    def bus_w8(self, addr: int, value: int) -> None:
+        try:
+            self.mem.w8(addr, value)
+        except BusError:
+            try:
+                self.uc.mem_write(addr & ADDRESS_MASK, bytes([value & 0xFF]))
+            except UcError:
+                raise BusError(f"access to ${addr & ADDRESS_MASK:06X} is outside RAM") from None
 
     # =====================================================================
     # Running
@@ -647,10 +761,17 @@ class CPU:
                     self.sr = self.sr & 0xFF00 | self.mem.r16(sp & ADDRESS_MASK) & 0x1F
                     pc = self.mem.r32((sp + 2) & ADDRESS_MASK)
                     self.sp = sp + 6
-                else:
+                elif is_trapcc(op):
                     if condition(op >> 8 & 0xF, self.sr):
                         return Event("exception", at, TRAPV)
                     pc = at + TRAPCC_SIZES[op & 7]
+                else:
+                    try:
+                        pc, vector = instructions.do(self, at)
+                    except BusError:
+                        return Event("exception", at, BUS_ERROR)
+                    if vector is not None:
+                        return Event("exception", pc, vector)
                 if stepping:
                     self.pc = pc
                     break
@@ -711,8 +832,15 @@ class CPU:
         """Whether the application has put its own handler for the VIA's
         interrupts in their vector, or its own routine for one of them in
         Lvl1DT."""
+        return self.own_interrupt_handler() or bool(self.own_level_1_routines())
+
+    def own_interrupt_handler(self) -> bool:
+        """Whether the VIA's interrupts' vector holds a handler of the
+        application's own: not the System's, nor the stub for an exception
+        nobody handles, which SimCity 2000's demo moves there when it cycles
+        its colours through two NIL handles, copying vectors over vectors."""
         vector = struct.unpack_from(">I", self.mem._b, 4 * LEVEL_1)[0] & ADDRESS_MASK
-        return vector not in (0, self.rom_interrupts) or bool(self.own_level_1_routines())
+        return vector not in (0, self.rom_interrupts, self.no_handler)
 
     def own_level_1_routines(self) -> int:
         """The VIA's flags, as in its vIFR, that the application has put its
@@ -796,9 +924,21 @@ class CPU:
             self._event = Event("trap", pc, word)
         elif intno == ILLEGAL and self.mem.r16(pc & ADDRESS_MASK) in (TRAPV_WORD, RTR):
             self._trapcc = pc               # for run() to do, as a TRAPcc
+        elif intno in (ILLEGAL, ADDRESS_ERROR, FP_UNIMPLEMENTED) and self._done_here(pc):
+            self._trapcc = pc               # and these
         else:
             self._event = Event("exception", pc, intno)
         uc.emu_stop()
+
+    def _done_here(self, pc: int) -> bool:
+        """Whether the instruction at pc is one the core doesn't know, done
+        in instructions.  Its FPU's registers are reached through the core's
+        state, if that's as expected."""
+        try:
+            return (not pc & 1 and instructions.known(self.mem, pc)
+                    and (self._state is not None or self.mem.r16(pc) >> 12 != 0xF))
+        except BusError:
+            return False
 
     def _tlb_fill(self, uc, vaddr, access, entry, _data) -> bool:
         """Map a page for the core: any page may be read, written and run
@@ -893,24 +1033,24 @@ class CPU:
         writes such a word and runs it with no trap between still isn't
         seen to."""
         base = page << PAGE_BITS
-        self._both[page] = bytes(self.mem._b[base:base + PAGE_SIZE])
-        if self._new_words(page):
+        old = self._both[page]
+        self._both[page] = now = bytes(self.mem._b[base:base + PAGE_SIZE])
+        if any([self._new_words(page, *run) for run in _changed(old, now)]):    # each noted
             self.uc.ctl_remove_cache(base, base + PAGE_SIZE)
 
-    def _new_words(self, page: int) -> bool:
-        """Note the words to stop at on a page mapped for both: whether
-        there's one that wasn't seen before."""
+    def _new_words(self, page: int, start: int = 0, end: int = PAGE_SIZE) -> bool:
+        """Note the words to stop at on a page mapped for both, from start
+        to end in it: whether there's one that wasn't seen before."""
         base, seen, new = page << PAGE_BITS, self._seen, False
-        for found in WATCHED.finditer(self.mem._b, base, base + PAGE_SIZE):
-            at = found.start()
-            if not at & 1 and at not in seen:
+        for at in _words_to_stop_at(self.mem._b, base + start, base + end):
+            if at not in seen:
                 seen.add(at)
                 new = True
         return new
 
     def _translated(self, uc, tb, _prev, _data) -> None:
         """The core has translated a block of code, to run it next: if
-        there's a TRAPcc, JSR (SP) or write to SR in it that it isn't to
+        there's a TRAPcc, JSR (SP), FMOVE.P or write to SR in it that it isn't to
         stop at yet, have it stop there, and stop it now, before the block,
         for run() to have it translated afresh with the stop in it.
 
@@ -933,8 +1073,8 @@ class CPU:
         be told; otherwise each found.  Whether any was added."""
         mem = self.mem._b
         at = self.mem.physical(pc)
-        new = [found.start() - at for found in WATCHED.finditer(mem, at, at + end - pc)
-               if not found.start() & 1 and pc + found.start() - at not in self._watched]
+        new = [found - at for found in _words_to_stop_at(mem, at, at + end - pc)
+               if pc + found - at not in self._watched]
         if not new:
             return False
         if count is not None:
@@ -954,12 +1094,12 @@ class CPU:
         return bool(new)
 
     def _stop_at(self, uc, addr, _size, _data) -> None:
-        """Stop before the TRAPcc or JSR (SP) at addr, for run() to do:
-        when the core stops, it has the condition codes as of the
-        instruction, where now it may not.  Or before a write to SR that
+        """Stop before the TRAPcc, JSR (SP) or FMOVE.P with a dynamic
+        k-factor at addr, for run() to do: when the core stops, it has the
+        condition codes as of the instruction, where now it may not.  Or before a write to SR that
         sets T1, for run() to run it alone, and trace from there."""
         op = struct.unpack_from(">H", self.mem._b, addr & ADDRESS_MASK)[0]
-        if is_trapcc(op) or op == JSR_SP:
+        if is_trapcc(op) or op == JSR_SP or op >> 8 == 0xF2 and self._done_here(addr):
             self._trapcc = addr
             uc.emu_stop()
         elif (op in (ORI_SR, EORI_SR) or is_move_to_sr(op)) and not self._stepping \

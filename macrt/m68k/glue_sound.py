@@ -13,14 +13,15 @@ from __future__ import annotations
 import struct
 
 from ..memory import ADDRESS_MASK
-from ..toolbox.files import paramErr
+from ..toolbox.files import FileError, paramErr
 from ..toolbox.memmgr import memFullErr, nilHandleErr, noErr
 from ..toolbox.resources import resNotFound
 from . import sound_manager as sm
 from .dispatch import trap
-from .sound import SILENCE
+from .sound import SILENCE, gestaltHasASC
 
 badChannel = sm.badChannel
+unitTypeSeconds = 0
 SCSTATUS_SIZE = 24
 SMSTATUS_SIZE = 6
 sysBeepDisable, sysBeepEnable = 0, 1
@@ -30,7 +31,6 @@ siNoSoundInHardware, siBadSoundInDevice = -220, -221
 # there is an Apple Sound Chip, not on a Mac Plus (Inside Macintosh: Sound)
 VERSION, VERSION_3 = 0x02008000, 0x03008000
 SYSTEM_7_5 = 0x0750
-gestaltHasASC = 3
 
 
 def _command(t, cmd: int) -> sm.Command:
@@ -101,6 +101,80 @@ def SndPlay(t, chan, snd, asynch):
     if not snd:
         return sm.resProblem
     return manager.play(t, ch, snd & ADDRESS_MASK, bool(asynch))
+
+
+@trap
+def SndStartFilePlay(t, chan, f_ref_num, res_num, buffer_size, the_buffer, selection,
+                     completion, asynch):
+    """Play from disk: an AIFF or AIFF-C file the program has open, or
+    the sampled sound of a 'snd ' resource, read at once rather than
+    through the buffer the program may give.  Given no channel, the play
+    is synchronous, or badChannel."""
+    manager = t.machine.sound_manager
+    ch = None
+    if chan:
+        ch = manager.channel(chan)
+        if ch is None:
+            return badChannel
+    elif asynch:
+        return badChannel
+    seconds = None
+    if selection:
+        unit, sel_start, sel_end = struct.unpack(">Iii", t.mem.read(selection & ADDRESS_MASK, 12))
+        if unit == unitTypeSeconds:
+            if sel_start > sel_end:
+                return paramErr
+            seconds = (sel_start / 0x10000, sel_end / 0x10000)
+    if f_ref_num:
+        try:
+            sound = sm.parse_aiff(t.system.files.fcb(f_ref_num).fork)
+        except FileError as e:
+            return e.code
+    else:
+        sound = _resource_sound(t, res_num)
+    if isinstance(sound, int):
+        return sound
+    data, rate = sound
+    return manager.play_file(t, ch, data, rate, seconds, completion & ADDRESS_MASK, bool(asynch))
+
+
+def _resource_sound(t, res_num: int) -> tuple[bytes, float] | int:
+    """The sampled sound of the 'snd ' resource res_num, and its samples a
+    second; silent if it's compressed."""
+    h = t.process.resources.GetResource("snd ", res_num)
+    at = t.mem.r32(h) & ADDRESS_MASK if h else 0
+    if not at:
+        return sm.resProblem
+    parsed = sm.parse_snd(t.tb.contents(h))
+    if parsed is None:
+        return sm.badFormat
+    for cmd, _, p2 in parsed[2]:
+        if cmd & ~sm.dataPointerFlag in (sm.bufferCmd, sm.soundCmd):
+            sound = sm.read_header(t.mem, at + p2 if cmd & sm.dataPointerFlag else p2)
+            if sound is None:
+                return b"", sm.MAC_RATE
+            if not sound[1]:
+                return sm.badFormat
+            return sound[0], sound[1] / 0x10000
+    return sm.badFormat
+
+
+@trap
+def SndPauseFilePlay(t, chan):
+    """The play from disk paused, or if it is, resumed."""
+    ch = t.machine.sound_manager.channel(chan)
+    if ch is None:
+        return badChannel
+    return t.machine.sound_manager.pause_file(ch)
+
+
+@trap
+def SndStopFilePlay(t, chan, quiet_now):
+    ch = t.machine.sound_manager.channel(chan)
+    if ch is None:
+        return badChannel
+    t.machine.sound_manager.stop_file(t, ch, bool(quiet_now))
+    return noErr
 
 
 @trap

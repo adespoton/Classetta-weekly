@@ -98,13 +98,14 @@ def _finish(t, env: Env, op: int, addrs: list[int], ccr: int | None = None,
     word, vector = _env(t)
     word |= env.raised << 8
     _set_env(t, word)
-    ccr = cpu.sr & CCR if ccr is None else ccr
-    d0 = cpu.d(0) if d0 is None else d0
     halts = env.raised & word & 0x1F
     if halts and vector & ADDRESS_MASK:
-        ccr, d0 = _halt(t, vector, halts, op, addrs, ccr, d0)
-    cpu.sr = (cpu.sr & ~CCR) | (ccr & CCR)
-    cpu.set_d(0, d0 & 0xFFFFFFFF)
+        ccr, d0 = _halt(t, vector, halts, op, addrs, cpu.sr & CCR if ccr is None else ccr,
+                        cpu.d(0) if d0 is None else d0)
+    if ccr is not None:                 # else as they were, which most operations leave them
+        cpu.sr = (cpu.sr & ~CCR) | (ccr & CCR)
+    if d0 is not None:
+        cpu.set_d(0, d0 & 0xFFFFFFFF)
 
 
 def _halt(t, vector: int, halts: int, op: int, addrs: list[int], ccr: int,
@@ -147,10 +148,10 @@ def _write_decimal(t, addr: int, d: sane.Decimal) -> None:
     mem.w_pstr(addr + 4, d.sig)
 
 
-def _pop_operands(t, count: int) -> tuple[int, list[int]]:
-    """The opword and the operands' addresses, destination first; popped."""
+def _pop_operands(t, count: int, sp: int) -> tuple[int, list[int]]:
+    """The opword and the operands' addresses, destination first, popped
+    from the stack at sp."""
     cpu, mem = t.cpu, t.mem
-    sp = cpu.sp
     op = mem.r16(sp)
     addrs = [mem.r32(sp + 2 + 4 * i) for i in range(count)]
     cpu.sp = sp + 2 + 4 * count
@@ -168,12 +169,12 @@ ONE_OPERAND = {0x12: sane.sqrt, 0x14: sane.round_integral,
 
 @raw(0xA9EB)
 def FP68K(t, word):
-    mem = t.mem
-    op = mem.r16(t.cpu.sp)
+    mem, sp = t.mem, t.cpu.sp
+    op = mem.r16(sp)
     code, fmt = op & 0xFF, (op >> 11) & 7
     name = fp_name(op)
     entry = FP_OPS.get(code)
-    op, addrs = _pop_operands(t, entry[1] if entry else 2)
+    op, addrs = _pop_operands(t, entry[1] if entry else 2, sp)
     if name is None:
         t.unimplemented(f"FP68K opword ${op:04X}", word)
         return
@@ -266,12 +267,13 @@ ELEMENTARY = {
 
 @raw(0xA9EC)
 def Elems68K(t, word):
-    mem = t.mem
-    op = mem.r16(t.cpu.sp)
+    mem, sp = t.mem, t.cpu.sp
+    op = mem.r16(sp)
     code = op & 0xFF
     entry = ELEMS_OPS.get(code)
     # The opword's top bits say how many operands there are: $8000 two, $C000 three.
-    op, addrs = _pop_operands(t, entry[1] if entry else 1 + (op >> 15) + ((op >> 14) & 1))
+    op, addrs = _pop_operands(t, entry[1] if entry else 1 + (op >> 15) + ((op >> 14) & 1),
+                              sp)
     if entry is None:
         t.unimplemented(f"Elems68K opword ${op:04X}", word)
         return

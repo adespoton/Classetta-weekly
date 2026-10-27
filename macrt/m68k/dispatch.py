@@ -110,8 +110,24 @@ EXTRA_FUNCTIONS = {
     # the address is left as the result (IM IV-65; MorseTrainer).
     "Fix2X": (0xA843, None, None, "l", "p", (), None, ""),
     "Frac2X": (0xA845, None, None, "l", "p", (), None, ""),
+    # The SCSI Manager's, which the interfaces haven't: stack-based, with
+    # the routine's selector in a word pushed last (IM IV and V, The SCSI
+    # Manager).
+    "SCSIReset": (0xA815, "SCSIDispatch", 0, "", "e", (), None, ""),
+    "SCSIGet": (0xA815, "SCSIDispatch", 1, "", "e", (), None, ""),
+    "SCSISelect": (0xA815, "SCSIDispatch", 2, "h", "e", (), None, ""),
+    "SCSICmd": (0xA815, "SCSIDispatch", 3, "ph", "e", (), None, ""),
+    "SCSIComplete": (0xA815, "SCSIDispatch", 4, "ppl", "e", (), None, ""),
+    "SCSIRead": (0xA815, "SCSIDispatch", 5, "p", "e", (), None, ""),
+    "SCSIWrite": (0xA815, "SCSIDispatch", 6, "p", "e", (), None, ""),
+    "SCSIRBlind": (0xA815, "SCSIDispatch", 8, "p", "e", (), None, ""),
+    "SCSIWBlind": (0xA815, "SCSIDispatch", 9, "p", "e", (), None, ""),
+    "SCSIStat": (0xA815, "SCSIDispatch", 10, "", "h", (), None, ""),
+    "SCSISelAtn": (0xA815, "SCSIDispatch", 11, "h", "e", (), None, ""),
+    "SCSIMsgIn": (0xA815, "SCSIDispatch", 12, "p", "e", (), None, ""),
+    "SCSIMsgOut": (0xA815, "SCSIDispatch", 13, "h", "e", (), None, ""),
 }
-EXTRA_DISPATCHERS = {"MenuDispatch": (0xA825, "D0W")}
+EXTRA_DISPATCHERS = {"MenuDispatch": (0xA825, "D0W"), "SCSIDispatch": (0xA815, "StackW")}
 STD_FILTER_SELECTOR = 0x067F
 EXTRA_NAMES = {0xA02F: "PostEvent", 0xA89F: "Unimplemented", 0xA9F2: "Launch",
                0xA9EB: "FP68K", 0xA9EC: "Elems68K"}
@@ -231,6 +247,11 @@ def namer(word: int):
         NAMERS[trap_key(word)] = fn
         return fn
     return register
+
+
+def assigned(key: int) -> bool:
+    """Does the trap word name a routine, implemented or not?"""
+    return key in RAW or key in BY_TRAP or key in DISPATCHERS
 
 
 def implemented(key: int) -> bool:
@@ -395,6 +416,13 @@ def call(t, sig: Signature, word: int) -> None:
     elif "ReturnMemErr" in sig.extras:
         cpu.set_d(0, t.mem_err & 0xFFFFFFFF)
     elif "ClearD0" in sig.extras:
+        cpu.set_d(0, 0)
+    elif not sig.result and not sig.os_style and impl is not None:
+        # A Pascal routine with no result leaves D0 as it likes: stack-based
+        # traps keep only A2-A6 and D3-D7 (IM I, Using Assembly Language).
+        # macrt leaves 0 there, not what the caller had, for C functions
+        # that fall off their end after one and return whatever D0 holds
+        # (BMAPEdit's bitmap routine, ending with SetPort).
         cpu.set_d(0, 0)
     if "CCFromD0" in sig.extras:
         # HandToHand and the like are numbered as Toolbox traps but end as

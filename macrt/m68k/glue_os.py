@@ -17,6 +17,7 @@ from ..process import Process, size_resource
 from ..toolbox import lowmem, script
 from ..toolbox.events import EventRecord, ProcessKilled, tick_count
 from ..toolbox.files import File, FileError
+from ..toolbox.gdevice import VIDEO_SLOT
 from ..toolbox.memmgr import MIN_BLOCK, ZONE_HEADER, memWZErr, nilHandleErr, noErr
 from ..toolbox.system import DEFAULT_PARTITION, RAM_SIZE
 from . import decompressors, dispatch, glue_components, glue_desk, glue_sony, segload, timemgr
@@ -284,7 +285,10 @@ def PtrZone(t, p):
 
 @trap
 def FreeMem(t, sys):
-    return _zone(t, sys).free_bytes()
+    """The zone's zcbFree (Inside Macintosh: Memory, Memory Manager): its
+    free blocks, not what it could still grow by, which MaxMem reports.
+    Programs add the two (Starter Accounts' BASIC runtime, for FRE(-1))."""
+    return _zone(t, sys).free_bytes(grow=False)
 
 
 @trap
@@ -541,13 +545,16 @@ def gestalt_table(t) -> dict[int, int]:
         # played together (gestaltMultiChannels, bit 11), as Lucy's colour
         # WorldBuilder games want; mono, no sound input
         "snd ": 1 << 10 | 1 << 11,
-        # Launch can return and takes an FSSpec; temporary memory, tracked
-        "os  ": 0x7E,
-        "fs  ": 2,                  # gestaltHasFSSpecCalls
+        # The system heap grows; Launch can return and takes an FSSpec;
+        # temporary memory, tracked
+        "os  ": 0x7F,
+        # gestaltFullExtFSDispatching, all of HFSDispatch; gestaltHasFSSpecCalls
+        "fs  ": 3,
         "fold": 1,                  # gestaltFindFolderPresent
         "alis": 1,                  # gestaltAliasMgrPresent
         "stdf": 1,                  # gestaltStandardFile58: StandardGetFile and the rest
         "ditl": 1,                  # gestaltDITLExtPresent: AppendDITL, ShortenDITL, CountDITL
+        "edtn": 1,                  # gestaltEditionMgrPresent
         "evnt": 1,                  # gestaltAppleEventsPresent
         "help": 1,                  # gestaltHelpMgrPresent
         "ppc ": 0x1000,             # initialised, but nothing comes or goes on a network
@@ -701,6 +708,25 @@ def NMRemove(t, rec):
 
 
 # =========================================================================
+# The Shutdown Manager: procedures to call before the machine is turned
+# off or restarted (IM V, The Shutdown Manager).  Nothing here turns the
+# machine off, so they're only kept, each with the points it asked for
+# (sdOnPowerOff 1, sdOnRestart 2, sdOnUnmount 4, sdOnDrivers 8).
+# =========================================================================
+@trap
+def ShutDwnInstall(t, proc, flags):
+    procs = t.process.shutdown_procs
+    proc &= ADDRESS_MASK
+    procs[proc] = procs.get(proc, 0) | flags & 0xF
+
+
+@trap
+def ShutDwnRemove(t, proc):
+    """It's removed at every point it was installed for."""
+    t.process.shutdown_procs.pop(proc & ADDRESS_MASK, None)
+
+
+# =========================================================================
 # Time
 # =========================================================================
 @trap
@@ -754,9 +780,11 @@ def StripAddress(t, addr):
 @trap
 def SwapMMUMode(t, mode):
     """D0's low byte: the addressing mode wanted, 1 for 32-bit; back in
-    it, the mode there was.  macrt's addresses are all 24-bit ones, the
-    screen's too, so it stays in 24-bit mode."""
-    return None, (mode & ~0xFF) | t.mem.r8(lowmem.MMU32Bit)
+    D0, the mode there was, the rest of D0 clear: Prince of Persia 2's
+    sprite code goes on counting a row's pixels in D0's low word.  macrt's
+    addresses are all 24-bit ones, the screen's too, so it stays in
+    24-bit mode."""
+    return None, t.mem.r8(lowmem.MMU32Bit)
 
 
 # =========================================================================
@@ -871,40 +899,11 @@ def SlotVRemove(t, task, slot):
     return VRemove(t, task)
 
 
-# The Slot Manager (Inside Macintosh V, The Slot Manager): the routine's
-# selector in D0, a SpBlock in A0.  No card has a declaration ROM to read,
-# so the Slot Resource Table is empty: a search for sResources finds none
-# (Spaceship Warlock looks for the screen's), and what a slot is asked for
-# finds no card there.
-spsPointer = 4
-sReadStruct = 7                     # sReadByte to sReadStruct read from an sPointer
-sReadInfo, sReadPRAMRec, sPutPRAMRec, sReadFHeader = 16, 17, 18, 19
-sNextRsrc, sNextTypesRsrc, sRsrcInfo = 20, 21, 22
-sCkCardStatus, sReadDrvrName, sFindDevBase = 24, 25, 27
-smEmptySlot = -300
-smsPointerNil = -335
-smSelOOBErr = -338
-smNoMoresRsrcs = -344
-smBadsPtrErr = -346
-smRecNotFnd = -351
-SLOT_RESULTS = {**dict.fromkeys((sReadInfo, sReadPRAMRec, sPutPRAMRec, sReadFHeader,
-                                 sCkCardStatus, sFindDevBase), smEmptySlot),
-                sNextRsrc: smNoMoresRsrcs, sNextTypesRsrc: smNoMoresRsrcs,
-                sRsrcInfo: smRecNotFnd, sReadDrvrName: smRecNotFnd}
-
-
-@trap
-def SlotManager(t, pb, selector):
-    if 0 <= selector <= sReadStruct:
-        return smBadsPtrErr if t.mem.r32(pb + spsPointer) else smsPointerNil
-    return SLOT_RESULTS.get(selector, smSelOOBErr)
-
-
 # The Start Manager's default video device, kept in parameter RAM (Inside
 # Macintosh V, The Start Manager): which card the main screen is, a
 # DefVideoRec's sdSlot and sdsResource bytes.  The screen is the one card
 # there is, in the Mac II's first slot.
-VIDEO_DEFAULT = (9, 0x80)
+VIDEO_DEFAULT = (VIDEO_SLOT, 0x80)
 
 
 @trap
@@ -1061,7 +1060,7 @@ def Launch(t, word):
             mem.w32(pb + 24, proc.serial_number)
     else:
         name = t.str255(mem.r32(pb) & ADDRESS_MASK)
-        _start(t, _app_named(t, name), mem.r16(pb + 4), 0)
+        _start(t, _app_named(t, name), mem.r16(pb + 4), 0, _finder_information(t))
 
 
 @raw(0xA9F3)
@@ -1072,7 +1071,8 @@ def Chain(t, word):
     its own.  Skyfox's first application chains to the game, asking for
     the alternate screen."""
     mem, pb = t.mem, t.cpu.a(0)
-    _start(t, _app_named(t, t.str255(mem.r32(pb) & 0xFFFFFF)), mem.r16(pb + 4), 0)
+    _start(t, _app_named(t, t.str255(mem.r32(pb) & 0xFFFFFF)), mem.r16(pb + 4), 0,
+           _finder_information(t))
 
 
 def _app_named(t, name: str) -> MacFile | None:
@@ -1099,7 +1099,33 @@ def _app_at(t, spec: int) -> MacFile | None:
     return t.system.files.macfile_of(node) if isinstance(node, File) else None
 
 
-def _start(t, app: MacFile | None, page_option: int, flags: int) -> Process | None:
+def _finder_information(t) -> bytes | None:
+    """What this application's AppParmHandle has, for the application it
+    launches: the Finder starts an application with Launch, and "passes
+    along a list of documents" in its Finder information (Inside
+    Macintosh II, the Segment Loader), so a program that launches another
+    with documents to open puts them there first.  Cipher names itself,
+    a program for PShell, and launches PShell to run it."""
+    h, heap = t.process.world.r32(lowmem.AppParmHandle) & ADDRESS_MASK, t.process.heap
+    if not heap.is_handle(h) or heap.is_empty(h) or heap.handle_size(h) < 4:
+        return None
+    return t.mem.read(heap.deref(h), heap.handle_size(h))
+
+
+def _keep_directories(info: bytes, proc: Process) -> None:
+    """The working directories the Finder information names its documents
+    by stay open for the new application after this one quits."""
+    at, count = 4, struct.unpack_from(">h", info, 2)[0]
+    for _ in range(count):
+        if at + 9 > len(info):
+            break
+        proc.files.fs.share_wd(struct.unpack_from(">h", info, at)[0], proc.files)
+        at += 9 + info[at + 8]
+        at += at & 1
+
+
+def _start(t, app: MacFile | None, page_option: int, flags: int,
+           finder_info: bytes | None = None) -> Process | None:
     cpu = t.cpu
     if app is None:
         cpu.set_d(0, fnfErr & 0xFFFFFFFF)
@@ -1111,7 +1137,9 @@ def _start(t, app: MacFile | None, page_option: int, flags: int) -> Process | No
         code0 = None                # the launch says why
     d = t.tb._d
     with t.yielding():
-        started = d.bridge.call(d.launch_application, app, page_option, code0)
+        started = d.bridge.call(d.launch_application, app, page_option, code0, finder_info)
+        if not isinstance(started, str) and finder_info is not None:
+            _keep_directories(finder_info, started)
         if not isinstance(started, str) and not flags & launchContinue:
             # It quits from here, not after waiting for the processor,
             # which the new application may never give up.

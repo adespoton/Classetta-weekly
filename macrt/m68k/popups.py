@@ -30,7 +30,7 @@ from PyQt6.QtGui import QPainterPath
 from ..memory import ADDRESS_MASK
 from ..toolbox import constants as k
 from ..toolbox.controls import Control, Painter
-from ..toolbox.qdraw import patXor, rect_path
+from ..toolbox.qdraw import CHICAGO_SYMBOLS, patXor, rect_path
 from ..toolbox.quickdraw import BLACK_PAT, set_rect_rgn
 from ..toolbox.types import Point, Rect
 from ..ui import theme
@@ -243,7 +243,7 @@ def _draw(t, c: Control, menu) -> None:
         title, box = g.title, g.box
         if g.title_width:
             port.tx_face = g.style
-            text = _fitted(qd, port, c.title, title.width)
+            text = _fitted(qd, port, c.title.translate(CHICAGO_SYMBOLS), title.width)
             width = qd.text_width(port, text)
             h = title.left
             if g.justify == teCenter:
@@ -261,7 +261,8 @@ def _draw(t, c: Control, menu) -> None:
         it = menu.item(c.value)
         if it is not None:
             port.pn_loc = Point(g.baseline(box), text_left)
-            qd.draw_text(port, _fitted(qd, port, it.shown, arrow - 2 - text_left))
+            text = _fitted(qd, port, it.shown.translate(CHICAGO_SYMBOLS), arrow - 2 - text_left)
+            qd.draw_text(port, text)
         rows = (ARROW_WIDTH + 1) // 2
         top = box.top + (box.height - rows) // 2
         path = QPainterPath()

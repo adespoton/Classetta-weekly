@@ -19,6 +19,7 @@ from ..toolbox.qdraw import Region, srcCopy
 from ..toolbox.resources import resNotFound
 from ..toolbox.types import Rect
 from .dispatch import trap
+from .glue_controls import scratch
 from .glue_toolbox import _port, _set_rgn
 
 paramErr = -50
@@ -77,9 +78,10 @@ def PlotIcon(t, r, h):
     """CopyBits of a 32-by-32 ICON into r, srcCopy, scaled to fit."""
     try:
         data = _data(t, h)
-    except ValueError:
+    except (ValueError, KeyError):
         # The ROM only dereferences the handle: Leisure Suit Larry's is a
-        # pointer to its bits on the stack.
+        # pointer to its bits on the stack, and Icon Exchanger points the
+        # System's DSAT 2's master pointer at an icon inside it.
         data = t.mem.read(t.mem.r32(h) & ADDRESS_MASK, 128) if t.mem.r32(h) else None
     icon = bitmap_icon(data, LARGE, masked=False) if data else None
     _plot(t, t.rect(r), atNone, ttNone, icon)
@@ -146,6 +148,32 @@ def _set_suite(t, h: int, icons: dict[str, int], label: int | None = None) -> bo
 def _suite_family(t, h: int):
     icons = _suite(t, h) or {}
     return lambda kind: _data(t, icons.get(kind, 0))
+
+
+@trap
+def ForEachIconDo(t, suite, selector, action, data):
+    """The icon action function called for each type of icon the selector
+    names, with the suite's handle for it, NIL if it hasn't one; what it
+    leaves in its VAR theIcon goes in the suite.  A result other than
+    noErr stops it, and is ForEachIconDo's (More Macintosh Toolbox, Icon
+    Utilities)."""
+    if _suite(t, suite) is None:
+        return paramErr
+    with scratch(t, 4) as var:
+        for kind in ICON_TYPES:
+            if not selector & SELECTORS[kind]:
+                continue
+            h = (_suite(t, suite) or {}).get(kind, 0)
+            t.w32(var, h)
+            err = t.call(action, (("L", int.from_bytes(kind.encode("mac_roman"), "big")),
+                                  ("p", var), ("p", data)), "e")
+            icons = _suite(t, suite)
+            if icons is not None and t.mem.r32(var) != h:
+                icons[kind] = t.mem.r32(var)
+                _set_suite(t, suite, icons)
+            if err:
+                return err
+    return noErr
 
 
 @trap
