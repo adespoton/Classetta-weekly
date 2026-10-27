@@ -3,7 +3,9 @@
 | it waits in Delay, then checks that it doesn't run while interrupts are
 | masked or once it has been removed.  Then a task that doesn't set its
 | count again, which runs once and is taken out of the queue, so that it
-| can be installed again.
+| can be installed again.  The task leaves a word above its return
+| address, as Factory's sound callback does: on a Mac that's in what the
+| interrupt stacked, not in the spin's stack.
 
         .include "traps.inc"
 
@@ -16,7 +18,8 @@ KEPT            = -26           | D1 after the spin: the task's D1 mustn't show
 DELAYED         = -28           | runs during a Delay of 30 ticks
 ONCE            = -30           | the runs of the task that runs once
 GONE            = -32           | VRemove's result for it: it's out of the queue
-GLOBALS         = 32
+CANARY          = -36           | what the spin had on the stack, after it
+GLOBALS         = 36
 
 TICKS           = 0x16A
 VTYPE           = 1
@@ -32,9 +35,11 @@ start:
         clr.w   12(a0)
         _VInstall
         move.l  #0x12345678, d1
+        move.l  #0xCAFEF00D, -(sp)
 1:      cmpi.w  #10, COUNT(a5)
         blt.s   1b
         move.l  d1, KEPT(a5)
+        move.l  (sp)+, CANARY(a5)
 
         | The host has the processor while it waits, and the ticks go on.
         move.w  COUNT(a5), d1
@@ -98,6 +103,7 @@ task:
         moveq   #-1, d0
         moveq   #-1, d1
         movea.l d0, a1
+        move.w  d0, 4(sp)
         rts
 
 once:
