@@ -1,6 +1,6 @@
-# Classetta
+# Classetta (previously MacRT)
 
-A runtime for classic Mac OS (System 1–7) applications with a PyQt6 front end.
+A runtime for classic Mac OS (System 1–7) applications with a PyQt6 front end. **Weekly builds available every Wednesday!**
 
 macrt runs an application's own 68k code on an emulated CPU, catches its
 A-line traps, and answers them with a Toolbox written in Python, with Qt
