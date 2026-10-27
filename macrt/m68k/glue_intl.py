@@ -42,6 +42,11 @@ def _record(t, h: int, which: int) -> bytes:
     return t.mem.read(p, SIZES[which]) if p else intl.DEFAULTS[which]()
 
 
+def record(t, which: int) -> bytes:
+    """The Intl0Rec or Intl1Rec in use."""
+    return _record(t, intl_handle(t, which), which)
+
+
 def _date(t, secs: int, form: int, h: int) -> bytes:
     which = 0 if form == intl.shortDate else 1
     return intl.date_string(secs, form, _record(t, h or intl_handle(t, which), which))

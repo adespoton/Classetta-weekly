@@ -264,7 +264,7 @@ class Host:
                 t.mem.w32(lowmem.CurrentA5, current_a5)
                 t.process.notifications = requests[0]
                 t.process.responses_due = deque(requests[1])
-            t.process.partition.a5 = a5
+            t.process.partition.a5, t.process.partition.left_a5 = a5, 0
         # What they allocated, their patches perhaps.  The traps they patched
         # stay patched for the applications that run after, but for patches
         # in the panel's own partition, which goes when it closes.

@@ -75,6 +75,7 @@ from .glue_controls import (
     new_control,
     scratch,
 )
+from .glue_toolbox import window_pictures
 
 from . import glue_textedit as te
 
@@ -199,22 +200,45 @@ def _sound(t, n: int) -> None:
 # =========================================================================
 # The edit field
 # =========================================================================
+def _new_record(t, w) -> None:
+    """The dialog's TextEdit record, which it has from the start, with
+    editText items or not: Generate Numbers sets the font of the record
+    of its About box, which has none.  It takes the port's font, and
+    stays inactive until an item is edited with it."""
+    d = _rec(t, w)
+    with _in_port(t, w):
+        d.text_h = te.new(t, Rect(0, 0, 0, 0), Rect(0, 0, 0, 0))
+    d.edit_field = -1
+
+
+def _item_texts(t, w) -> set[int]:
+    return {item.handle & ADDRESS_MASK for item in _items(t, w) if item.is_text}
+
+
+def _own_text(t, w) -> None:
+    """Give the record a text of its own, in place of the item's it was
+    editing, before it's let go of or the item goes."""
+    d = _rec(t, w)
+    p = t.mem.r32(d.text_h) & ADDRESS_MASK
+    if t.mem.r32(p + TE_HTEXT) & ADDRESS_MASK in _item_texts(t, w):
+        t.mem.w32(p + TE_HTEXT, t.process.heap.new_handle(0))
+
+
 def _set_edit_field(t, w, item: Item) -> None:
     """Make an editText item the one being edited: TextEdit's record is
     pointed at its rectangle and its text."""
     d = _rec(t, w)
     if d.edit_field == item.number - 1 and d.text_h:
         return
-    if d.text_h:
-        te.deactivate(t, d.text_h)
-    else:
-        with _in_port(t, w):
-            d.text_h = te.new(t, item.rect, item.rect)
-        p = t.mem.r32(d.text_h) & ADDRESS_MASK
-        own = t.mem.r32(p + TE_HTEXT) & ADDRESS_MASK
-        if own:
-            t.system.heap_of(own).dispose_handle(own)
+    if not d.text_h:
+        _new_record(t, w)
+    if not d.text_h:
+        return
+    te.deactivate(t, d.text_h)
     p = t.mem.r32(d.text_h) & ADDRESS_MASK
+    own = t.mem.r32(p + TE_HTEXT) & ADDRESS_MASK
+    if own and own not in _item_texts(t, w):
+        t.system.heap_of(own).dispose_handle(own)
     t.mem.w_rect(p + TE_DEST, item.rect)
     t.mem.w_rect(p + TE_VIEW, item.rect)
     t.mem.w32(p + TE_HTEXT, item.handle)
@@ -366,7 +390,10 @@ def _copy_resource(t, rtype: str, rid: int) -> int:
 
 def _make_items(t, w, first: int = 1) -> None:
     """Fill in the item list's placeholders, from item first on; the
-    first edit text item is selected if none is."""
+    first edit text item is selected if none is.  A user item's is left
+    as it is: a program that makes its own item list can have put the
+    item's procedure there, where SetDItem would store it (LaserKey's
+    installer, whose text is all user items)."""
     heap, rm = t.process.heap, t.process.resources
     first_edit = None
     for item in _items(t, w)[first - 1:]:
@@ -391,6 +418,8 @@ def _make_items(t, w, first: int = 1) -> None:
             h = rm.GetResource("ICON", int.from_bytes(data[:2], "big", signed=True))
         elif kind == picItem:
             h = rm.GetResource("PICT", int.from_bytes(data[:2], "big", signed=True))
+        elif kind == userItem:
+            continue
         else:
             h = 0
         item.handle = h
@@ -422,6 +451,7 @@ def new_dialog(t, storage: int, bounds: Rect, title: str, visible: bool, proc_id
     w.tx_font = t.process.world.r16(lowmem.DlgFont)
     d = _rec(t, w)
     d.items, d.edit_field, d.a_def_item = item_list, -1, 1
+    _new_record(t, w)
     _make_items(t, w)
     if visible:
         t.tb.ShowWindow(w)
@@ -434,13 +464,12 @@ def set_font(t, w, font: int, face: int, size: int) -> None:
     w.tx_font, w.tx_face, w.tx_size = font, face, size
     d = _rec(t, w)
     item = _edit_item(t, w)
-    if not d.text_h or item is None:
-        return
-    p = t.mem.r32(d.text_h) & ADDRESS_MASK
-    t.mem.w32(p + TE_HTEXT, t.process.heap.new_handle(0))     # its text is the item's
-    te.dispose(t, d.text_h)
-    d.text_h, d.edit_field = 0, -1
-    _select_text(t, w, item, 0, ALL)
+    if d.text_h:
+        _own_text(t, w)
+        te.dispose(t, d.text_h)
+    _new_record(t, w)
+    if item is not None:
+        _select_text(t, w, item, 0, ALL)
 
 
 def _behind(t, p: int):
@@ -502,9 +531,7 @@ def close_dialog(t, w, dispose: bool) -> None:
     list and the record too."""
     d = _rec(t, w)
     if d.text_h:
-        # The record's text is an item's, which goes with the items.
-        p = t.mem.r32(d.text_h) & ADDRESS_MASK
-        t.mem.w32(p + TE_HTEXT, t.process.heap.new_handle(0))
+        _own_text(t, w)                 # the item's text goes with the items
         te.dispose(t, d.text_h)
     d.text_h = 0
     for item in _items(t, w):
@@ -646,7 +673,7 @@ def _select(t, w, ev: EventRecord, modal: bool) -> tuple[bool, int]:
             t.tb.EndUpdate(w)
         return False, 0
     if what == k.activateEvt:
-        if _event_window(t, ev) is w and d.text_h:
+        if _event_window(t, ev) is w and d.text_h and d.edit_field >= 0:
             (te.activate if ev.modifiers & k.activeFlag else te.deactivate)(t, d.text_h)
         return False, 0
     if what == k.mouseDown:
@@ -686,10 +713,11 @@ def _select(t, w, ev: EventRecord, modal: bool) -> tuple[bool, int]:
 
 
 def _update_wanted(t, w):
-    """ModalDialog's updates: the dialog's only."""
+    """ModalDialog's updates: the dialog's only, unless it has a picture
+    of its own (window_pictures draws that)."""
     def next_update():
         with t.system.lock:
-            return w if w.visible and w.update_pending else None
+            return w if w.visible and w.update_pending and not w.window_pic else None
     return next_update
 
 
@@ -700,6 +728,7 @@ def _modal(t, w, filter_proc: int, item_p: int) -> None:
     mask = k.everyEvent if filter_proc else k.everyEvent & ~k.highLevelEventMask
     with scratch(t, 16) as ev_p:
         while True:
+            window_pictures(t)
             with t.yielding():
                 _, ev = t.process.events.get(mask, 1, _update_wanted(t, w))
             t.write_event(ev_p, ev)
@@ -963,10 +992,9 @@ def shorten_ditl(t, w, n: int) -> None:
     for item in reversed(gone):
         h = item.handle & ADDRESS_MASK
         if d.text_h and d.edit_field == item.number - 1:
-            p = t.mem.r32(d.text_h) & ADDRESS_MASK
-            t.mem.w32(p + TE_HTEXT, t.process.heap.new_handle(0))     # its text is the item's
-            te.dispose(t, d.text_h)
-            d.text_h, d.edit_field = 0, -1
+            te.deactivate(t, d.text_h)
+            _own_text(t, w)
+            d.edit_field = -1
         if item.is_control:
             c = _ctl(t, h)
             if c is not None:

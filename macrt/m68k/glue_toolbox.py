@@ -41,7 +41,8 @@ from ..toolbox.types import Point, Rect
 from ..toolbox.windows import WindowRecord
 from ..ui import keymap
 from . import glue_desk, glue_os, glue_sony, mdefs, wdefs
-from .dispatch import RESERR_FLAGS, SIGNATURES, raw, trap
+from .cpu import SETTLE
+from .dispatch import IMPLEMENTATIONS, RESERR_FLAGS, SIGNATURES, raw, trap
 from .glue_controls import _s16, drag_outline, kill_controls, scratch
 
 EMPTY = Rect(0, 0, 0, 0)
@@ -90,12 +91,16 @@ def _custom_proc(t, port: GrafPort, offset: int, key: int) -> int:
 # =========================================================================
 @trap
 def InitGraf(t, globals_ptr):
-    init_qd_globals(t.mem, globals_ptr, t.system.screen_bits)
+    init_qd_globals(t.mem, globals_ptr, t.system.screen_of(t.process))
     # at 0(A5), the A5 the program runs with: Fokker Triplane moves its A5
     # world below $70000 before it calls this, and a desk accessory finds
-    # the globals there; the rest of QuickDraw looks for them there now too
+    # the globals there; the rest of QuickDraw looks for them there now too,
+    # until a trap comes with A5 back where it was
     a5 = t.cpu.a(5) & ADDRESS_MASK
-    t.process.partition.a5 = a5
+    part = t.process.partition
+    if a5 != part.a5 and not part.left_a5:
+        part.left_a5 = part.a5
+    part.a5 = a5
     t.mem.w32(a5, globals_ptr)
     t.mem.w8(lowmem.QDExist, 0)
 
@@ -107,7 +112,7 @@ def OpenPort(t, p):
     port = t.system.port_at(p)
     if not isinstance(port, WindowRecord):
         port = GrafPort(t.mem, p)
-    port.open(t.process.heap, t.system.screen_bits)
+    port.open(t.process.heap, t.system.screen_of(t.process))
     t.system.register(port)
     t.mem.w32(_the_port_var(t), p)
 
@@ -123,7 +128,7 @@ def init_port(t, port: GrafPort, init) -> None:
     but with the regions the port has, if it has them, set as OpenPort
     sets them, and the port the current one."""
     vis, clip = port.vis_rgn, port.clip_rgn
-    screen = t.system.screen_bits
+    screen = t.system.screen_of(t.process)
     init(t.process.heap, screen)
     try:
         heaps = (t.system.heap_of(vis), t.system.heap_of(clip)) if vis and clip else None
@@ -428,7 +433,9 @@ def _text(t, p: int, count: int) -> bytes:
 
 @trap
 def DrawString(t, p):
-    _draw(t, _text(t, p + 1, t.mem.r8(p) if p else 0), p + 1)
+    """A NIL string is the one at address 0, where NumToString puts the
+    number it's given NIL for (see NumToString)."""
+    _draw(t, _text(t, p + 1, t.mem.r8(p)), p + 1)
 
 
 @trap
@@ -443,7 +450,7 @@ def DrawText(t, p, first, count):
 
 @trap
 def StringWidth(t, p):
-    return _width(t, _text(t, p + 1, t.mem.r8(p) if p else 0), p + 1)
+    return _width(t, _text(t, p + 1, t.mem.r8(p)), p + 1)
 
 
 @trap
@@ -528,13 +535,25 @@ def _rgn(t, h: int) -> Region:
 
 
 def _set_rgn(t, h: int, rgn: Region | Rect) -> None:
-    if h:
-        write_rgn(t.system.heap_of(h), h, rgn if isinstance(rgn, Region) else Region.rect(rgn))
+    """The region h becomes rgn; one whose handle isn't in a heap is left
+    as it is: MacTriv passes RectRgn the address of its rectangle for the
+    region, and the region for the rectangle."""
+    try:
+        heap = t.system.heap_of(h) if h else None
+    except ValueError:
+        return
+    if heap is not None:
+        write_rgn(heap, h, rgn if isinstance(rgn, Region) else Region.rect(rgn))
 
 
 @trap
 def NewRgn(t):
-    return new_rgn(t.process.heap)
+    """A region handle from the Memory Manager, with MemErr set by the
+    allocation: The Prince tests MemErr after NewRgn, following a PurgeMem
+    that left it at memFullErr."""
+    h = new_rgn(t.process.heap)
+    t.set_mem_err(noErr if h else memFullErr)
+    return h
 
 
 @trap
@@ -1033,35 +1052,41 @@ def _unloaded(t):
         rm.SetResLoad(load)
 
 
-@trap
-def GetFontName(t, family, p):
+def family_name(t, family: int) -> str:
     """The family's name: its FOND's, or the name of the FONT or NFNT that
     heads it (ID family * 128), "" for a family not installed."""
     family = _family(t, family)
-    name = ""
     with _unloaded(t) as rm:
         font = font_id(family)
         for kind, rid in (("FOND", family), ("FONT", font), ("NFNT", font)):
             h = rm.GetResource(kind, rid) if rid is not None and -0x8000 <= rid < 0x8000 else 0
             if h:
-                name = rm.GetResInfo(h)[2]
-                break
-    t.set_str255(p, name)
+                return rm.GetResInfo(h)[2]
+    return ""
+
+
+def family_named(t, name: str) -> int | None:
+    """The number of the family named, in any case; None if none has it."""
+    if not name:
+        return None
+    with _unloaded(t) as rm:
+        h = rm.GetNamedResource("FOND", name)
+        if h:
+            return rm.GetResInfo(h)[0]
+        h = rm.GetNamedResource("FONT", name) or rm.GetNamedResource("NFNT", name)
+        return font_family(rm.GetResInfo(h)[0]) if h else None
+
+
+@trap
+def GetFontName(t, family, p):
+    t.set_str255(p, family_name(t, family))
 
 
 @trap
 def GetFNum(t, p, num_p):
-    """The number of the family named, in any case; 0 if none has it."""
-    name = t.str255(p)
-    num = 0
-    with _unloaded(t) as rm:
-        h = rm.GetNamedResource("FOND", name) if name else 0
-        if h:
-            num = rm.GetResInfo(h)[0]
-        elif name:
-            h = rm.GetNamedResource("FONT", name) or rm.GetNamedResource("NFNT", name)
-            num = font_family(rm.GetResInfo(h)[0]) if h else 0
-    t.w16(num_p, num)
+    """0 if no family has the name."""
+    num = family_named(t, t.str255(p))
+    t.w16(num_p, num or 0)
 
 
 @trap
@@ -1302,8 +1327,9 @@ def _host_font(t, family: int, size: int, face: int) -> int:
 # =========================================================================
 @trap
 def InitWindows(t):
-    if t.mem.r8(lowmem.WWExist):            # the program threw the last port away, as
-        t.system.open_wmgr_port()           # Rogue's start does, saying there's none
+    if not t.system.wmgr_port_kept():       # the program threw the last port away, as
+        t.system.open_wmgr_port()           # Rogue's start does
+    t.mem.w8(lowmem.WWExist, 0)
     t.mem.w32(_the_port_var(t), t.mem.r32(lowmem.WMgrPort))
     if t.system.model.color:
         # With Color QuickDraw it makes the default auxiliary window and
@@ -1549,7 +1575,33 @@ def ValidRgn(t, h):
 
 @trap
 def CheckUpdate(t, p):
-    return False
+    """Inside Macintosh I, Window Manager: the windows with pictures of
+    their own are drawn (window_pictures); the event is for the frontmost
+    other window that needs updating, if any."""
+    window_pictures(t)
+    got, ev = t.process.events.peek(k.event_mask(k.updateEvt), t.tb._next_update)
+    if got:
+        t.write_event(p, ev)
+    return got
+
+
+def window_pictures(t) -> None:
+    """Inside Macintosh I, Window Manager (SetWindowPic, CheckUpdate): a
+    window with a picture handle in its record isn't sent update events.
+    The Window Manager draws the picture in it, front to back, between
+    BeginUpdate and EndUpdate.  Populous II's title is one."""
+    draw = IMPLEMENTATIONS.get("DrawPicture")
+    while (w := t.tb._next_update(picture=True)) is not None:
+        t.tb.BeginUpdate(w)
+        saved = t.mem.r32(_the_port_var(t))
+        t.mem.w32(_the_port_var(t), w.addr)
+        try:
+            with scratch(t, 8) as rp:
+                t.set_rect(rp, w.port_rect)
+                draw(t, w.window_pic, rp)
+        finally:
+            t.mem.w32(_the_port_var(t), saved)
+            t.tb.EndUpdate(w)
 
 
 @trap
@@ -2217,6 +2269,8 @@ def WaitNextEvent(t, mask, event_p, sleep, mouse_rgn):
         return _through_patch(t, patch, mask, event_p, sleep)
     rgn = _rgn(t, mouse_rgn) if mouse_rgn else None
     _stored_activates(t)
+    window_pictures(t)
+    _unanswered(t, mask)
     with t.yielding():
         got, ev = t.tb.WaitNextEvent(mask & 0xFFFF, sleep, rgn)
     return _returned(t, event_p, got, ev)
@@ -2255,6 +2309,8 @@ def GetNextEvent(t, mask, event_p):
     glue_os.respond(t)
     glue_sony.put_back(t)
     _stored_activates(t)
+    window_pictures(t)
+    _unanswered(t, mask)
     wait = to_next_tick() if t.null_tick == tick_count() else 0
     with t.yielding():
         got, ev = t.process.events.get(mask & 0xFFFF, wait, t.tb._next_update)
@@ -2262,6 +2318,22 @@ def GetNextEvent(t, mask, event_p):
         t.null_tick = ev.when
     t.tb._end_grow_preview()
     return _returned(t, event_p, got, ev)
+
+
+def _unanswered(t, mask: int) -> None:
+    """An update event comes until the window's drawn (BeginUpdate and
+    EndUpdate) or its update region's emptied, so a program that passes
+    over it is given it each time it asks, as on a Mac.  Cap'n Magneto's
+    title screen looks only for a click, and never answers its window's.
+    Asked again in the same tick for one it was given and hasn't begun,
+    this waits for the next tick first, or for input."""
+    window, tick, begun = t.updated
+    if window is None or tick != tick_count() or window.updates_begun != begun:
+        return
+    got, ev = t.process.events.peek(mask & 0xFFFF, t.tb._next_update)
+    if got and ev.what == k.updateEvt and ev.message is window:
+        with t.yielding():
+            t.process.events.nap(to_next_tick() / 60 + SETTLE)
 
 
 def _stored_activates(t) -> None:
@@ -2282,6 +2354,9 @@ def _returned(t, event_p: int, got: bool, ev) -> bool:
     disk-inserted one, and give a desk accessory one that's its own:
     whether it's the application's."""
     t.write_event(event_p, ev)
+    t.updated = (None, -1, 0)
+    if got and ev.what == k.updateEvt and isinstance(ev.message, WindowRecord):
+        t.updated = (ev.message, ev.when, ev.message.updates_begun)
     if got and ev.what == k.diskEvt:
         from .glue_files import disk_inserted
         disk_inserted(t, event_p)
@@ -2292,6 +2367,7 @@ def _returned(t, event_p: int, got: bool, ev) -> bool:
 def EventAvail(t, mask, event_p):
     glue_sony.put_back(t)
     _stored_activates(t)
+    window_pictures(t)
     got, ev = t.process.events.peek(mask & 0xFFFF, t.tb._next_update)
     t.write_event(event_p, ev)
     return got
@@ -2529,9 +2605,9 @@ def _forward(name: str):
     return call
 
 
-for _name in ("CloseResFile", "CurResFile", "UseResFile", "HomeResFile", "ResError",
-              "UpdateResFile", "GetResFileAttrs", "SetResFileAttrs", "UniqueID", "Unique1ID",
-              "LoadResource", "ReleaseResource", "DetachResource", "GetResAttrs",
+for _name in ("CloseResFile", "CurResFile", "UseResFile", "HomeResFile", "RsrcMapEntry",
+              "ResError", "UpdateResFile", "GetResFileAttrs", "SetResFileAttrs", "UniqueID",
+              "Unique1ID", "LoadResource", "ReleaseResource", "DetachResource", "GetResAttrs",
               "SetResAttrs", "RemoveResource", "ChangedResource", "WriteResource"):
     trap(_forward(_name))
 
@@ -2736,26 +2812,28 @@ def BitShift(t, x, count):
 
 
 def _bit(p: int, n: int) -> tuple[int, int]:
-    """Bit n counting from the high bit of the byte at p, as BitTst does."""
+    """Bit n counting from the high bit of the byte at p, as BitTst does.
+    The byte may be a device's: Mission Starlight sets a bit of the VIA's
+    with BitSet."""
     return p + (n >> 3), 0x80 >> (n & 7)
 
 
 @trap
 def BitTst(t, p, n):
     at, mask = _bit(p, n)
-    return bool(t.mem.r8(at) & mask)
+    return bool(t.cpu.bus_r8(at) & mask)
 
 
 @trap
 def BitSet(t, p, n):
     at, mask = _bit(p, n)
-    t.mem.w8(at, t.mem.r8(at) | mask)
+    t.cpu.bus_w8(at, t.cpu.bus_r8(at) | mask)
 
 
 @trap
 def BitClr(t, p, n):
     at, mask = _bit(p, n)
-    t.mem.w8(at, t.mem.r8(at) & ~mask)
+    t.cpu.bus_w8(at, t.cpu.bus_r8(at) & ~mask)
 
 
 def _held(v: int) -> int:
@@ -2919,17 +2997,22 @@ def LongMul(t, a, b, p):
 
 @trap
 def NumToString(t, n, p):
-    t.set_str255(p, str(n))
+    """Writes the string wherever theString points, NIL included: SCSI
+    Evaluator converts its numbers into the string at address 0 and draws
+    them from there."""
+    t.mem.w_pstr(p, to_mac(str(n)))
 
 
 @trap
 def StringToNum(t, p):
-    s = t.str255(p).strip()
-    sign = -1 if s.startswith("-") else 1
-    digits = s.lstrip("+-")
+    """IM I-490: after a sign, each character's last four bits are a digit,
+    whatever the character (a space is a zero, 'CAT' is 314), and the
+    magnitude is taken modulo 2^32 before it's negated."""
+    s = t.mem.read(p + 1, t.mem.r8(p))
+    sign = -1 if s[:1] == b"-" else 1
     value = 0
-    for c in digits:
-        value = value * 10 + (ord(c) - 48)     # as Pack7 does: no checking
+    for c in s[1:] if s[:1] in (b"-", b"+") else s:
+        value = (value * 10 + (c & 0xF)) & 0xFFFFFFFF
     return None, (sign * value) & 0xFFFFFFFF
 
 

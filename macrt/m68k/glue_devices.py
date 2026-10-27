@@ -26,8 +26,9 @@ calls to from here, and the drivers that came on the disk a program
 started from, such as Speller Bee's speech driver, .SAY (see
 System._disk_drivers).  Not those macrt has its own of, nor AppleTalk's,
 for hardware it hasn't got (UNLOADED_DRIVERS): opening one of those fails
-as if there were no such driver.  The drivers an application opens go
-when it quits.
+as if there were no such driver.  A program can also make a device
+control entry itself, with DrvrInstall, and open it by its driver's
+name.  The drivers an application opens or installs go when it quits.
 """
 
 from __future__ import annotations
@@ -38,6 +39,7 @@ from ..memory import ADDRESS_MASK, from_mac
 from ..toolbox import lowmem
 from ..toolbox.resources import UNWRITTEN
 from ..toolbox.system import UNLOADED_DRIVERS
+from .dispatch import raw
 
 UNITS = 48                      # the unit table's length, as from the Mac Plus's ROM on
 FIRST_SPARE = 32                # where a driver goes whose own unit is taken
@@ -48,6 +50,8 @@ controlErr = -17
 statusErr = -18
 readErr = -19
 writErr = -20
+badUnitErr = -21
+dRemovErr = -25
 dInstErr = -26
 abortErr = -27
 notOpenErr = -28
@@ -292,9 +296,9 @@ def units_of(t) -> list[int]:
     return [unit for unit, process in list(t.machine.drivers.items()) if process is t.process]
 
 
-def _remove(t, unit: int) -> None:
-    """Take the driver at unit out of the table, and let its code go: it
-    can be purged once no other driver in the table runs it."""
+def _remove(t, unit: int, code: bool = True) -> None:
+    """Take the driver at unit out of the table, and, if code, let its
+    code go: it can be purged once no other driver in the table runs it."""
     m, system = t.mem, t.system
     table = m.r32(lowmem.UTableBase) & ADDRESS_MASK
     with system.lock:
@@ -308,6 +312,8 @@ def _remove(t, unit: int) -> None:
             t.machine.spare_dces.append(dh)
         else:
             system.sys_heap.dispose_handle(dh)
+        if not code:
+            return
         others = (_dce(t, u) for u in range(m.r16(lowmem.UnitNtryCnt)))
         if any(dce and m.r32(dce + dCtlDriver) & ADDRESS_MASK == h for dce in others):
             return
@@ -321,6 +327,69 @@ def _remove(t, unit: int) -> None:
         if heap.is_handle(h):
             heap.unlock(h)
             heap.set_purgeable(h, True)
+
+
+# =========================================================================
+# A program's own device control entries (Inside Macintosh: Devices,
+# Device Manager, "Writing and Installing Device Drivers")
+# =========================================================================
+@raw(0xA03D)
+def DrvrInstall(t, word):
+    """DriverInstall: a new device control entry for the driver at A0, in
+    the system heap and in the unit table at refnum D0, in place of any
+    that was there, with that refnum and dRAMBased set and nothing else:
+    the program fills in the rest and opens it.  Bit 10 of the trap
+    word, DriverInstallReserveMem's, asks for room to be made low in the
+    heap first.  Burtonia, which calls it with bit 8 set, so that A0
+    isn't restored, takes the new entry's handle from A0 afterwards;
+    it's left there for it."""
+    m, cpu, system = t.mem, t.cpu, t.system
+    refnum = _s16(cpu.d(0))
+    unit = ~refnum
+    table = m.r32(lowmem.UTableBase) & ADDRESS_MASK
+    if refnum >= 0 or not table or unit >= m.r16(lowmem.UnitNtryCnt):
+        cpu.set_d(0, badUnitErr & 0xFFFFFFFF)
+        return
+    heap = system.sys_heap
+    with system.lock:
+        if m.r32(table + 4 * unit):
+            _remove(t, unit, code=False)
+        if word & 0x400:
+            heap.reserve(DCE_SIZE)
+        dh = heap.new_handle(DCE_SIZE, clear=True)
+        if not dh:
+            cpu.set_d(0, memFullErr & 0xFFFFFFFF)
+            return
+        dce = m.r32(dh) & ADDRESS_MASK
+        m.w16(dce + dCtlFlags, dRAMBased)
+        m.w16(dce + dCtlRefNum, refnum)
+        m.w32(table + 4 * unit, dh)
+        t.machine.drivers[unit] = t.process
+    if word & 0x100:
+        cpu.set_a(0, dh)
+    cpu.set_d(0, noErr)
+
+
+@raw(0xA03E)
+def DrvrRemove(t, word):
+    """DriverRemove: take the closed driver at refnum D0 out of the unit
+    table and dispose of its device control entry; one that's open
+    stays, with dRemovErr.  Its code is let go if it's a resource, as
+    ReleaseResource would; a block of the program's own it keeps."""
+    m, cpu = t.mem, t.cpu
+    unit = ~_s16(cpu.d(0))
+    if not 0 <= unit < m.r16(lowmem.UnitNtryCnt):
+        cpu.set_d(0, badUnitErr & 0xFFFFFFFF)
+        return
+    dce = _dce(t, unit)
+    flags = m.r16(dce + dCtlFlags) if dce else 0
+    if flags & dOpened:
+        cpu.set_d(0, dRemovErr & 0xFFFFFFFF)
+        return
+    code = bool(flags & dRAMBased) and t.process.resources.is_resource(
+        m.r32(dce + dCtlDriver) & ADDRESS_MASK)
+    _remove(t, unit, code=code)
+    cpu.set_d(0, noErr)
 
 
 # =========================================================================
@@ -515,14 +584,19 @@ def io_done(t) -> None:
 # Calling a driver
 # =========================================================================
 def _call_routine(t, pb: int, w: int, dce: int, routine: int) -> int:
-    """Call one of the driver's routines on the spot: its result."""
+    """Call one of the driver's routines on the spot: its result.  An open
+    routine's is what it leaves in ioResult, noErr if nothing, not D0: the
+    Device Manager sets D0 to 0 when one returns (Inside Macintosh II, the
+    Device Manager), so RamDisk+'s leaves in it what its caller had."""
     m = t.mem
     drvr = _driver(t, dce)
     addr = drvr + m.r16(drvr + routine)
     m.w16(pb + ioTrap, w)
     m.w32(pb + ioCmdAddr, addr)
-    m.w16(pb + ioResult, 1)
-    return _s16(t.call_with(addr, a0=pb, a1=dce))
+    opening = routine == drvrOpen
+    m.w16(pb + ioResult, noErr if opening else 1)
+    d0 = _s16(t.call_with(addr, a0=pb, a1=dce))
+    return m.r16s(pb + ioResult) if opening else d0
 
 
 def done(t, pb: int, err: int) -> None:

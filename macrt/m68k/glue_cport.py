@@ -15,9 +15,10 @@ which Color QuickDraw fills in when it draws and macrt leaves empty.
 A colour window's port is a cGrafPort.  Its colours are in its
 auxiliary record, one of a list from AuxWinHead that ends with the
 default record, whose 'wctb' every window without a record of its own
-uses.  macrt draws window frames in black and white whatever their
-table says; a colour window's content is erased in its content colour
-because GetNewCWindow and SetWinColor make that its background colour.
+uses.  A window's frame is drawn in its table's colours on a colour Mac
+(macrt.ui.chrome says how it reads the parts); a colour window's content
+is erased in its content colour because NewCWindow, GetNewCWindow and
+SetWinColor make that its background colour.
 Controls have auxiliary records the same way, from AuxCtlHead, with
 'cctb's, for an application's own CDEF to draw with.
 """
@@ -36,7 +37,7 @@ from ..toolbox.quickdraw import (BLACK_PAT, DK_GRAY_PAT, GRAY_PAT, LT_GRAY_PAT, 
                                  GrafPort, PixPatRef)
 from ..toolbox.types import Point, Rect
 from ..toolbox.windows import (AUX_CTL_SIZE, AUX_WIN_SIZE, aux_wins, find_aux_win,
-                               unlink_aux_win)
+                               table_colors, unlink_aux_win)
 from . import glue_palette
 from .dispatch import trap
 from .glue_color import _argb, _qd_error, _set_argb, cNoMemErr
@@ -435,6 +436,7 @@ def SetCPixel(t, h, v, p):
 def NewCWindow(t, storage, bounds, title, visible, proc_id, behind, go_away, ref_con):
     w = t.tb.NewWindow(t.rect(bounds), t.str255(title), bool(visible), proc_id,
                        _behind(t, behind), bool(go_away), ref_con, storage, color=True)
+    _default_background(t, w)
     glue_palette.new_window(t, w)
     return w
 
@@ -447,6 +449,8 @@ def GetNewCWindow(t, window_id, storage, behind):
         ct = t.process.resources.GetResource("wctb", window_id)
         if ct and _deref(t, ct):
             _set_win_color(t, w.addr, ct)
+        else:
+            _default_background(t, w)
     w = t.tb.GetNewWindow(window_id, storage, _behind(t, behind), color=True, colored=colored)
     glue_palette.new_window(t, w, window_id)
     return w
@@ -490,16 +494,10 @@ def default_aux_records(t) -> None:
 
 
 def _table_colors(t, ct: int) -> dict[int, tuple[int, int, int]]:
-    """A window or control colour table's colours, by part."""
-    p = _deref(t, ct)
-    if not p:
+    try:
+        return table_colors(t.mem, ct)
+    except BusError:
         return {}
-    n = t.mem.r16(p + 6) + 1 & 0xFFFF
-    out = {}
-    for i in range(min(n, 64)):
-        e = p + 8 + 8 * i
-        out.setdefault(t.mem.r16(e), (t.mem.r16(e + 2), t.mem.r16(e + 4), t.mem.r16(e + 6)))
-    return out
 
 
 def _set_aux_color(t, owner: int, ct: int, head: int = lowmem.AuxWinHead) -> None:
@@ -530,14 +528,43 @@ def _set_aux_color(t, owner: int, ct: int, head: int = lowmem.AuxWinHead) -> Non
 
 
 def _set_win_color(t, window: int, ct: int) -> None:
+    """SetWinColor's work: the window's frame is drawn again in its new
+    colours (every window's, with the default's), and a colour window's
+    background is its content colour."""
     _set_aux_color(t, window, ct)
     w = t.window(window) if window else None
-    content = _table_colors(t, ct).get(wContentColor)
-    if w is not None and w.is_color and content is not None:
-        qd = t.tb.qd
-        qd.set_rgb_color(w, False, content)
-        if w.backing is not None:
-            w.backing.paper = qd.colors(w, qd.depth(w), False)[1]
+    if w is not None:
+        _set_background(t, w, ct)
+    if w is not None or not window:
+        t.tb.redraw_frames(w)
+
+
+def _set_background(t, w, ct: int) -> None:
+    """A colour window's background colour is the content colour of its
+    table, ct (Inside Macintosh V, the Window Manager)."""
+    content = _content_color(t, ct)
+    if not w.is_color or content is None:
+        return
+    qd = t.tb.qd
+    qd.set_rgb_color(w, False, content)
+    if w.backing is not None:
+        w.backing.paper = qd.colors(w, qd.depth(w), False)[1]
+
+
+def _default_background(t, w) -> None:
+    """A new colour window without a table of its own has the default
+    record's content colour as its background (a new port's is white)."""
+    default = find_aux_win(t.mem, 0)
+    p = _deref(t, default) if default else 0
+    ct = t.mem.r32(p + 8) if p else 0
+    if w is not None and _content_color(t, ct) not in (None, WHITE):
+        _set_background(t, w, ct)
+
+
+def _content_color(t, ct: int) -> tuple[int, int, int] | None:
+    """A table's content colour: its first, if it has none."""
+    colors = _table_colors(t, ct)
+    return colors.get(wContentColor, next(iter(colors.values()))) if colors else None
 
 
 def _get_aux(t, owner: int, pp: int, head: int = lowmem.AuxWinHead) -> bool:

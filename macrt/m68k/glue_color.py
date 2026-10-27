@@ -345,7 +345,10 @@ def SaveEntries(t, src, result, sel):
         return _qd_error(t, cRangeErr)
     n = t.mem.r16s(sel) + 1
     size = t.mem.r16s(sp + 6) + 1
-    heap = t.system.heap_of(result)
+    try:
+        heap = t.system.heap_of(result)
+    except ValueError:      # not a handle: Giffer passes the address of its variable
+        return _qd_error(t, cNoMemErr)
     if heap.handle_size(result) < 8 + 8 * n and not heap.set_handle_size(result, 8 + 8 * n):
         return _qd_error(t, cNoMemErr)
     rp = heap.deref(result)
@@ -407,6 +410,15 @@ def BackColor(t, color):
     port = _port(t)
     if port is not None:
         t.tb.qd.set_classic_color(port, False, color)
+
+
+@trap
+def ColorBit(t, which):
+    """The plane of a colour printer's the port draws in, its colrBit
+    (Inside Macintosh I, QuickDraw); for the screen it changes nothing."""
+    port = _port(t)
+    if port is not None:
+        port.colr_bit = which
 
 
 @trap

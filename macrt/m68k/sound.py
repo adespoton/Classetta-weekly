@@ -13,9 +13,10 @@ other programs have the Sound Driver fill it.
 The Speaker here takes the buffer at each of macrt's ticks, after the VBL
 tasks have run, and sends the frame, at its volume, to where the sound
 goes: the host's sound output (macrt.ui.audio), a WAV file (WaveFile), or
-nowhere.  macrt's ticks are 60 a second, a Mac's 60.15, so the samples go
-out at 22,200 a second: what the Sound Driver makes from waveforms is 4
-cents flat.  The alternate sound buffer isn't kept, nor does timer 1 work
+nowhere.  On a Mac II, what a program writes to the Apple Sound Chip
+(ASC below) goes with it.  macrt's ticks are 60 a second, a Mac's 60.15,
+so the samples go out at 22,200 a second: what the Sound Driver makes
+from waveforms is 4 cents flat.  The alternate sound buffer isn't kept, nor does timer 1 work
 vSndEnb itself.
 
 The Sound Driver is the device driver '.Sound', reference number -4.  A
@@ -493,30 +494,50 @@ class SpeakerSwitch:
 _VOLUMES = [bytes(SILENCE + (x - SILENCE) * v // 7 for x in range(256)) for v in range(8)]
 
 
+def mix(frames: list[bytes]) -> bytes:
+    """Frames played together: their samples added, about silence."""
+    if len(frames) == 1:
+        return frames[0]
+    off = SILENCE * (len(frames) - 1)
+    return bytes(min(255, max(0, s - off)) for s in map(sum, zip(*frames)))
+
+
 class Speaker:
     """The sound buffer, a frame a tick while vSndEnb has the speaker on,
     to each of outputs: anything with a frame(samples) method, given each
-    frame's 370 samples, unsigned bytes, at the volume."""
+    frame's 370 samples, unsigned bytes, at the volume.  With a sound
+    chip, what's written to it is added in."""
 
-    def __init__(self, mem, via, outputs=()):
+    def __init__(self, mem, via, outputs=(), chip: ASC | None = None):
         self.mem = mem
         self.via = via
         self.outputs = list(outputs)
+        self.chip = chip
 
     @property
     def on(self) -> bool:
         return bool(self.outputs) and not self.via.regs[vBufB] & vSndEnb
 
+    @property
+    def waiting(self) -> bool:
+        """Whether there's sound to play at the next tick."""
+        return self.on or bool(self.outputs) and self.chip is not None and self.chip.waiting
+
     def retrace(self) -> None:
-        if not self.on:
-            return
-        base = self.mem.r32(lowmem.SoundBase) & ADDRESS_MASK
-        frame = self.mem.read(base, 2 * FRAME)[0::2]
-        volume = self.via.regs[vBufA] & VOLUME
-        if volume != 7:
-            frame = frame.translate(_VOLUMES[volume])
-        for out in self.outputs:
-            out.frame(frame)
+        frames = []
+        if self.on:
+            base = self.mem.r32(lowmem.SoundBase) & ADDRESS_MASK
+            frame = self.mem.read(base, 2 * FRAME)[0::2]
+            volume = self.via.regs[vBufA] & VOLUME
+            if volume != 7:
+                frame = frame.translate(_VOLUMES[volume])
+            frames.append(frame)
+        if self.chip is not None and (chip := self.chip.frame()) is not None:
+            frames.append(chip)
+        if frames and self.outputs:
+            frame = mix(frames)
+            for out in self.outputs:
+                out.frame(frame)
 
 
 class WaveFile:
@@ -541,3 +562,64 @@ class WaveFile:
             if self._wav is not None:
                 self._wav.close()
                 self._wav = None
+
+
+# =========================================================================
+# The Apple Sound Chip
+# =========================================================================
+gestaltHasASC = 3       # in Gestalt's 'hdwr'
+ASC_BASE = 0xC00000     # macrt's own place for it, above the ROM's empty space
+ASC_SIZE = 0x1000
+FIFO = 0x400            # each FIFO's addresses, and the samples it keeps
+
+
+class ASC:
+    """The Apple Sound Chip, on a model whose Gestalt 'hdwr' says it has
+    one (gestaltHasASC), at ASC_BASE, which ASCBase holds.  A program that
+    makes its own sound can write its samples to it, as Digital Messiah
+    does from its VBL task, 370 a tick.  A byte written to its first 1K is
+    the next sample in the first FIFO, and to its second 1K the next in
+    the second, each keeping up to 1K of them; what's written to a full
+    one is dropped.  At each tick the speaker plays the next 370, the two
+    FIFOs' averaged while both have some, and silence after them if there
+    are fewer.  The rest of the chip, from $800, keeps what's written to
+    it, and the FIFOs read 0: what a program sets there, how loud or how
+    it plays, isn't heard."""
+
+    def __init__(self):
+        self.fifos = (bytearray(), bytearray())
+        self.regs = bytearray(ASC_SIZE - 2 * FIFO)
+
+    @property
+    def waiting(self) -> bool:
+        return any(self.fifos)
+
+    def frame(self) -> bytes | None:
+        """The next tick's samples, taken from the FIFOs; None if they're empty."""
+        taken = []
+        for fifo in self.fifos:
+            if fifo:
+                taken.append(bytes(fifo[:FRAME]).ljust(FRAME, bytes([SILENCE])))
+                del fifo[:FRAME]
+        if not taken:
+            return None
+        if len(taken) == 1:
+            return taken[0]
+        return bytes((a + b) >> 1 for a, b in zip(*taken))
+
+    def map(self, uc) -> None:
+        uc.mmio_map(ASC_BASE, ASC_SIZE, self._bus_read, None, self._bus_write, None)
+
+    def _bus_read(self, uc, offset: int, size: int, _data) -> int:
+        value = 0
+        for at in range(offset, offset + size):
+            value = value << 8 | (self.regs[at - 2 * FIFO] if at >= 2 * FIFO else 0)
+        return value
+
+    def _bus_write(self, uc, offset: int, size: int, value: int, _data) -> None:
+        data = (value & (1 << 8 * size) - 1).to_bytes(size, "big")
+        for at, byte in enumerate(data, offset):
+            if at >= 2 * FIFO:
+                self.regs[at - 2 * FIFO] = byte
+            elif len(fifo := self.fifos[at // FIFO]) < FIFO:
+                fifo.append(byte)

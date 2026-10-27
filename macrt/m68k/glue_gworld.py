@@ -30,6 +30,12 @@ or, given stretchPix, the whole image, scaled to the new; with neither,
 the new pixels are white.  A screen buffer (NewScreenBuffer) is a PixMap
 like the deepest screen's, sharing its colour table, for a program to draw
 in with a port of its own.
+
+With only basic QuickDraw (System 7 on a Plus), a world is a GrafPort whose
+portBits are its pixels, one bit a pixel, with no GDevice; GetGWorldPixMap
+gives a 1-bit pixel map of them, for LockPixels, GetPixBaseAddr and the
+rest (Inside Macintosh: Imaging With QuickDraw, "Offscreen Graphics
+Worlds").  It may be made with depth 0 or 1 and no colour table.
 """
 
 from __future__ import annotations
@@ -43,7 +49,7 @@ from ..toolbox.color import color_table, standard_table
 from ..toolbox.gdevice import (DEPTH_MODES, GDEVICE_SIZE, ITAB_RES, PIXMAP_SIZE,
                                ROW_BYTES_MASK, GDevice, PixMap, clutType, deref, directType,
                                gdDevType, make_itable, noDriver, read_table, write_pixmap)
-from ..toolbox.quickdraw import CPORT_VERSION, GrafPort, set_rect_rgn
+from ..toolbox.quickdraw import CPORT_VERSION, BitMap, GrafPort, set_rect_rgn
 from ..toolbox.types import Rect
 from .dispatch import trap
 from .glue_color import _new_colors, _qd_error, cNoMemErr, noErr
@@ -178,7 +184,13 @@ def _new_itable(t, heap, gdh: int) -> bool:
 def gworld(t, p: int) -> GrafPort | None:
     """The port at p, if it's a GWorld."""
     port = t.system.port_at(p) if p else None
-    return port if port is not None and port.gw_device else None
+    return port if port is not None and (port.gw_device or port.gw_pix_map) else None
+
+
+def _pix_map_h(port: GrafPort) -> int:
+    """A world's PixMap handle: its portPixMap, or, on basic QuickDraw, the
+    1-bit one of its portBits."""
+    return port.port_pix_map if port.is_color else port.gw_pix_map
 
 
 def _depth_and_table(t, depth: int, ct_h: int) -> tuple[int, bytes] | None:
@@ -203,9 +215,11 @@ def _world_rect(bounds: Rect, depth: int) -> Rect:
 
 @trap
 def NewGWorld(t, gw_p, depth, bounds_p, ct_h, gdh, flags):
-    if t.system.devices is None:
-        return paramErr
     bounds = _world_rect(t.mem.r_rect(bounds_p), depth)
+    if t.system.devices is None:
+        err = _new_basic_gworld(t, gw_p, depth, bounds, flags)
+        _qd_error(t, err)
+        return err
     # Given depth 0, the world is like the deepest screen, and aGDevice is
     # ignored, noNewDevice or not.
     own_device = depth == 0 or not flags & noNewDevice
@@ -274,6 +288,35 @@ def _new_gworld(t, gw_p: int, depth: int, bounds: Rect, table: bytes, device: in
     return noErr
 
 
+def _new_basic_gworld(t, gw_p: int, depth: int, bounds: Rect, flags: int) -> int:
+    """A world on basic QuickDraw: a GrafPort, as OpenPort makes one, onto
+    1-bit pixels of its own, its portRect and visRgn their bounds."""
+    if depth not in (0, 1):
+        return cDepthErr
+    if bounds.empty:
+        return paramErr
+    mem, heap = t.mem, t.process.heap
+    row_bytes = _row_bytes(bounds.width, 1)
+    pix = _new_pixels(t, row_bytes * bounds.height, flags)
+    pm_h = heap.new_handle(PIXMAP_SIZE, clear=True)
+    port_p = heap.new_ptr(GrafPort.SIZE, clear=True)
+    if not (pix and pm_h and port_p):
+        for h in (pix, pm_h):
+            if h:
+                _dispose(t, h)
+        if port_p:
+            heap.dispose_ptr(port_p)
+        return cNoMemErr
+    base = _deref(t, pix)
+    write_pixmap(mem, heap.deref(pm_h), base, row_bytes, bounds, 1, 0)
+    port = GrafPort(mem, port_p)
+    port.open(heap, BitMap(base, row_bytes, bounds))
+    port.gw_pix_map = pm_h
+    t.system.register(port)
+    t.w32(gw_p, port_p)
+    return noErr
+
+
 def _dispose_device(t, gdh: int) -> None:
     """A world's own device and its inverse table (not its PixMap, the port's)."""
     gd = GDevice(t.mem, _deref(t, gdh)) if _deref(t, gdh) else None
@@ -288,9 +331,10 @@ def DisposeGWorld(t, gw):
     if port is None:
         return
     mem = t.mem
-    if mem.r32(lowmem.TheGDevice) & ADDRESS_MASK == port.gw_device & ADDRESS_MASK:
+    if (port.gw_device
+            and mem.r32(lowmem.TheGDevice) & ADDRESS_MASK == port.gw_device & ADDRESS_MASK):
         mem.w32(lowmem.TheGDevice, t.system.devices.main)
-    pm_h = port.port_pix_map
+    pm_h = _pix_map_h(port)
     p = _deref(t, pm_h)
     if p:
         pm = PixMap(mem, p)
@@ -299,11 +343,12 @@ def DisposeGWorld(t, gw):
     if port.gw_own_device:
         _dispose_device(t, port.gw_device)
     _dispose(t, pm_h)
-    port.port_pix_map = 0
+    if port.is_color:
+        port.port_pix_map = 0
     heap = _heap_of(t, gw) or t.process.heap
     port.close((_heap_of(t, port.vis_rgn) or heap) if port.vis_rgn else heap)
     t.system.unregister(port)
-    port.gw_device = 0
+    port.gw_device = port.gw_pix_map = 0
     if heap.contains(gw & ADDRESS_MASK):
         heap.dispose_ptr(gw & ADDRESS_MASK)
 
@@ -339,8 +384,11 @@ def SetGWorld(t, p, gdh):
 
 @trap
 def GetGWorldDevice(t, gw):
+    """A world's device; for another port, or a world on basic QuickDraw,
+    which has none, the current one."""
     port = gworld(t, gw)
-    return port.gw_device if port is not None else t.mem.r32(lowmem.TheGDevice)
+    return port.gw_device if port is not None and port.gw_device else t.mem.r32(
+        lowmem.TheGDevice)
 
 
 @trap
@@ -349,7 +397,7 @@ def GetGWorldPixMap(t, gw):
         return 0
     port = t.system.port_at(gw)
     if port is not None:
-        return port.port_pix_map if port.is_color else 0
+        return _pix_map_h(port)
     return t.mem.r32(gw + 2) if t.mem.r16(gw + 6) & CPORT_VERSION == CPORT_VERSION else 0
 
 
@@ -363,13 +411,18 @@ def UpdateGWorld(t, gw_p, depth, bounds_p, ct_h, gdh, flags):
     if port is None:
         _qd_error(t, paramErr)
         return gwFlagErr
-    pm = PixMap(mem, _deref(t, port.port_pix_map))
+    pm = PixMap(mem, _deref(t, _pix_map_h(port)))
     old_depth, old_bounds = pm.pixel_size, pm.bounds
     old_rb, old_table = pm.row_bytes & ROW_BYTES_MASK, read_table(mem, pm.pm_table)
     old_data = _deref(t, pm.pm_table)
     old_ct = mem.read(old_data, 8 + 8 * (max(0, mem.r16s(old_data + 6)) + 1)) if old_data else b""
     bounds = _world_rect(mem.r_rect(bounds_p), depth)
-    if depth == 0 or ct_h or depth != old_depth:
+    if not port.is_color:                       # basic QuickDraw's: 1 bit, no table
+        if depth not in (0, 1):
+            _qd_error(t, cDepthErr)
+            return gwFlagErr
+        depth, table = 1, old_ct
+    elif depth == 0 or ct_h or depth != old_depth:
         got = _depth_and_table(t, depth, ct_h)
         if got is None:
             _qd_error(t, cDepthErr)
@@ -396,13 +449,14 @@ def UpdateGWorld(t, gw_p, depth, bounds_p, ct_h, gdh, flags):
     old_image = pixels.decode(mem.read(pm.base_addr & ADDRESS_MASK, old_rb * old_bounds.height),
                               old_bounds.width, old_bounds.height, old_rb, old_depth,
                               old_table).convertToFormat(QImage.Format.Format_ARGB32)
-    heap = _heap_of(t, pm.pm_table) or t.process.heap
-    if not heap.set_handle_size(pm.pm_table, len(table)):
-        _dispose(t, pix)
-        _qd_error(t, cNoMemErr)
-        return gwFlagErr
-    mem.write(heap.deref(pm.pm_table), table)
-    pm = PixMap(mem, _deref(t, port.port_pix_map))
+    if pm.pm_table:
+        heap = _heap_of(t, pm.pm_table) or t.process.heap
+        if not heap.set_handle_size(pm.pm_table, len(table)):
+            _dispose(t, pix)
+            _qd_error(t, cNoMemErr)
+            return gwFlagErr
+        mem.write(heap.deref(pm.pm_table), table)
+    pm = PixMap(mem, _deref(t, _pix_map_h(port)))
     write_pixmap(mem, pm.addr, _deref(t, pix), row_bytes, bounds, depth, pm.pm_table)
     done = reallocPix
     if depth != old_depth:
@@ -430,9 +484,15 @@ def UpdateGWorld(t, gw_p, depth, bounds_p, ct_h, gdh, flags):
 
 
 def _move(t, port: GrafPort, bounds: Rect) -> None:
-    """A world's rectangle: its portRect, visRgn, PixMap's and device's."""
+    """A world's rectangle: its portRect, visRgn, PixMap's and device's;
+    on basic QuickDraw, its portBits, the PixMap's pixels."""
     mem = t.mem
-    PixMap(mem, _deref(t, port.port_pix_map)).bounds = bounds
+    pm = PixMap(mem, _deref(t, _pix_map_h(port)))
+    pm.bounds = bounds
+    if not port.is_color:
+        port.port_bits_base = pm.base_addr
+        port.port_bits_row_bytes = pm.row_bytes & ROW_BYTES_MASK
+        port.port_bits_bounds = bounds
     port.port_rect = bounds
     heap = _heap_of(t, port.vis_rgn)
     if heap is not None:
@@ -448,9 +508,12 @@ def _redraw(t, pm: PixMap, img: QImage, old: Rect, keep: int) -> None:
     mem = t.mem
     b, depth, rb = pm.bounds, pm.pixel_size, pm.row_bytes & ROW_BYTES_MASK
     table = read_table(mem, pm.pm_table) if depth <= 8 else None
-    out = pixels.decode(bytes(rb * b.height), b.width, b.height, rb, depth,
+    # Whole rows, so that what's encoded has no padding of Qt's in it,
+    # which it leaves as it finds it.
+    out = pixels.decode(bytes(rb * b.height), rb * 8 // depth, b.height, rb, depth,
                         table).convertToFormat(QImage.Format.Format_ARGB32)
     p = QPainter(out)
+    p.setClipRect(0, 0, b.width, b.height)
     if keep & clipPix:
         p.drawImage(old.left - b.left, old.top - b.top, img)
     else:

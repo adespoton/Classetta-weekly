@@ -154,10 +154,12 @@ class AEState:
 _states: WeakKeyDictionary = WeakKeyDictionary()
 
 
-def state(t) -> AEState:
-    st = _states.get(t.process)
+def state(t, process=None) -> AEState:
+    """An application's: the current one's, or process's."""
+    process = t.process if process is None else process
+    st = _states.get(process)
     if st is None:
-        st = _states[t.process] = AEState()
+        st = _states[process] = AEState()
     return st
 
 
@@ -561,21 +563,28 @@ def _ids(c: Composite) -> tuple[bytes, bytes]:
     return (cls[2] if cls else typeNull), (eid[2] if eid else typeNull)
 
 
-def post(t, c: Composite) -> None:
-    """An Apple event from outside: a high-level event in the queue,
-    whose message is the event class and whose where is the event ID."""
+def post(t, c: Composite, process=None) -> None:
+    """An Apple event from outside: a high-level event in the queue (the
+    current application's, or process's), whose message is the event
+    class and whose where is the event ID."""
+    process = t.process if process is None else process
     cls, eid = _ids(c)
     ev = EventRecord(kHighLevelEvent, int.from_bytes(cls, "big"), 0,
                      Point(*struct.unpack(">hh", eid)))
-    state(t).pending.append((c.flatten(), ev))
-    t.process.events.post(ev)
+    state(t, process).pending.append((c.flatten(), ev))
+    process.events.post(ev)
+
+
+def aware(process) -> bool:
+    """Does an application take high-level events, as its SIZE says?"""
+    return process.app is not None and bool(size_flags(process.app) & isHighLevelEventAware)
 
 
 def launched(t, documents=()) -> None:
     """System 7 opens a high-level-event-aware application by sending it
     an Open Application event, or with documents (working directory,
     node), an Open Documents event listing them."""
-    if t.process.app is not None and size_flags(t.process.app) & isHighLevelEventAware:
+    if aware(t.process):
         psn = struct.pack(">II", 0, t.process.serial_number)
         eid = kAEOpenDocuments if documents else kAEOpenApplication
         c = _new_event(t, kCoreEventClass, eid, (typeProcessSerialNumber, psn))
@@ -702,7 +711,7 @@ def AEProcessAppleEvent(t, event_p):
         return errAENotAppleEvent
     ids = _code(t.mem.r32(event_p + 2)), _code(t.mem.r32(event_p + 10))
     st = state(t)
-    for entry in st.pending:
+    for entry in list(st.pending):          # another application may be adding to it
         c = Composite.parse(entry[0])
         if _ids(c) == ids:
             # Taken, perhaps by a GetSpecificHighLevelEvent filter, while

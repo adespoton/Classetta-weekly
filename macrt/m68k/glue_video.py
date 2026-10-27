@@ -62,9 +62,7 @@ def modes(system) -> list[int]:
     """The modes the screen can have: its depths, as far as they fit."""
     if system.devices is None:
         return []
-    bounds = system.screen_bits.bounds
-    return [mode for mode, depth in DEPTHS.items()
-            if (bounds.width * depth + 15) // 16 * 2 * bounds.height <= system.screen_room]
+    return [mode for mode, depth in DEPTHS.items() if system.fits(depth)]
 
 
 def _mode(system) -> int:

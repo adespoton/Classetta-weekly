@@ -11,6 +11,7 @@ import datetime
 import struct
 
 from ..memory import ADDRESS_MASK, from_mac
+from ..toolbox import intl
 from ..toolbox import lowmem
 from ..toolbox import numformat as nf
 from ..toolbox import sane
@@ -18,6 +19,7 @@ from ..toolbox import script as sm
 from ..toolbox.memmgr import noErr
 from ..ui import keymap
 from .dispatch import raw, trap
+from .glue_intl import record
 from .glue_toolbox import _port
 
 memFullErr = -108
@@ -341,6 +343,31 @@ def InitDateCache(t, cache):
     """The cache StringToDate and StringToTime keep their parsing tables
     in: nothing of it is used here."""
     return noErr
+
+
+def _parsed(t, parsed, used_p: int, date_p: int, fields: tuple[int, ...]) -> int:
+    """The bytes taken, and the LongDateRec's fields at those word
+    offsets: only the ones the routine fills in."""
+    t.mem.w32(used_p, parsed.used)
+    for at, value in zip(fields, parsed.fields):
+        t.mem.w16(date_p + at, value)
+    return parsed.status
+
+
+@trap
+def StringToDate(t, p, length, cache, used_p, date_p):
+    """The year, month, day and day of the week at the start of the text;
+    what isn't there is today's."""
+    today = intl.date_time(t.mem.r32(lowmem.Time))
+    parsed = intl.parse_date(_text(t, p, length), record(t, 0), record(t, 1), today)
+    return _parsed(t, parsed, used_p, date_p, (2, 4, 6, 14))
+
+
+@trap
+def StringToTime(t, p, length, cache, used_p, date_p):
+    """The hour, minute and second at the start of the text."""
+    parsed = intl.parse_time(_text(t, p, length), record(t, 0))
+    return _parsed(t, parsed, used_p, date_p, (8, 10, 12))
 
 
 # A LongDateTime is a signed 64-bit count of seconds since the start of
