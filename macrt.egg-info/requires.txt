@@ -1,0 +1,7 @@
+PyQt6>=6.5
+unicorn>=2.1
+rsrcfork>=1.8
+machfs>=1.3
+
+[dev]
+pytest>=8
