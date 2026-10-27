@@ -154,7 +154,7 @@ def lists() -> bytes:
 
 def vbl() -> bytes:
     code = assemble(HERE / "vbl.s")
-    resources = code_resources(code, globals_size=32)
+    resources = code_resources(code, globals_size=36)
     return macbinary("VBL", b"", build_fork(resources), b"APPL", b"VBLT")
 
 
@@ -168,6 +168,18 @@ def poll() -> bytes:
     code = assemble(HERE / "poll.s")
     resources = code_resources(code, globals_size=24)
     return macbinary("Poll", b"", build_fork(resources), b"APPL", b"POLL")
+
+
+def spin() -> bytes:
+    code = assemble(HERE / "spin.s")
+    resources = code_resources(code, globals_size=14)
+    return macbinary("Spin", b"", build_fork(resources), b"APPL", b"SPIN")
+
+
+def unanswered() -> bytes:
+    code = assemble(HERE / "unanswered.s")
+    resources = code_resources(code, globals_size=240)
+    return macbinary("Unanswered", b"", build_fork(resources), b"APPL", b"UNAN")
 
 
 def vectors() -> bytes:
@@ -236,8 +248,9 @@ def ospatch() -> bytes:
 
 def driver() -> bytes:
     code = assemble(HERE / "driver.s")
-    resources = code_resources(code, globals_size=242) + [
+    resources = code_resources(code, globals_size=244) + [
         Resource(b"DRVR", 20, assemble(HERE / "echo.s"), b".Echo"),
+        Resource(b"DRVR", 21, assemble(HERE / "shy.s"), b".Shy"),
     ]
     return macbinary("Driver", b"", build_fork(resources), b"APPL", b"DRVT")
 
@@ -271,8 +284,8 @@ APPS = {"Hello.bin": hello, "Launcher.bin": launcher, "Controls.bin": controls,
         "Dialogs.bin": dialogs, "Edit.bin": edit, "Lists.bin": lists, "Menus.bin": menus,
         "Frames.bin": frames, "VBL.bin": vbl, "Timer.bin": timer, "AEvents.bin": aevents,
         "ResStub.bin": resstub, "OSPatch.bin": ospatch, "Vectors.bin": vectors, "Poll.bin": poll,
-        "Tempo.bin": tempo, "Sounds.bin": sounds, "Driver.bin": driver, "Desk.bin": desk,
-        "Panel.bin": panel}
+        "Spin.bin": spin, "Tempo.bin": tempo, "Sounds.bin": sounds, "Driver.bin": driver,
+        "Desk.bin": desk, "Panel.bin": panel, "Unanswered.bin": unanswered}
 
 
 def main() -> None:

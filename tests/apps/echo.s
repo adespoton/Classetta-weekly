@@ -31,7 +31,8 @@ on_open:
         move.l  a0, d1
         movem.l (sp)+, a0-a1
         move.l  d1, dCtlStorage(a1)
-        rts                     | NewPtr's result
+        move.l  d1, d0          | not its result: an open routine's is in ioResult
+        rts
 
 on_prime:
         move.l  a3, -(sp)

@@ -2,7 +2,8 @@
 | a write and a read; a control call made asynchronously that a status
 | call finishes, and one made synchronously that a VBL task's status call
 | finishes while it waits; KillIO on one left going; Close, a write after
-| it, and Open again.  It keeps each result for the test to look at.
+| it, and Open again; and .Shy (shy.s), which won't be opened.  It keeps
+| each result for the test to look at.
 
         .include "traps.inc"
 
@@ -33,7 +34,8 @@ LATE            = -236          | Write's after it
 AGAIN           = -238          | Open's again
 AGAINREF        = -240          | and its ioRefNum
 NOPE            = -242          | Open's of .Nope, which isn't a driver
-GLOBALS         = 242
+SHY             = -244          | Open's of .Shy
+GLOBALS         = 244
 
 ioCompletion    = 12
 ioResult        = 16
@@ -136,6 +138,10 @@ start:
         move.l  a1, ioNamePtr(a0)
         _Open
         move.w  d0, NOPE(a5)
+        lea     shy(pc), a1
+        move.l  a1, ioNamePtr(a0)
+        _Open
+        move.w  d0, SHY(a5)
         _ExitToShell
 
 | A parameter block's 50 bytes, at A0, cleared.
@@ -169,4 +175,6 @@ echo:   .byte   5
         .ascii  ".Echo"
 nope:   .byte   5
         .ascii  ".Nope"
+shy:    .byte   4
+        .ascii  ".Shy"
         .even

@@ -133,3 +133,5 @@
         trap    SystemTask,     0xA9B4
         trap    SystemMenu,     0xA9B5
         trap    SystemEdit,     0xA9C2
+        trap    TickCount,      0xA975
+        trap    Button,         0xA974
