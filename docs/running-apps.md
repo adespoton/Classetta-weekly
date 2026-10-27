@@ -49,8 +49,8 @@ built-in demo programs instead.
 - **Python 3.11 or later.**
 - **PyQt6** (6.5 or later) for the windows and menus.
 - **unicorn** (2.1 or later), the 68k processor emulator.
-- **rsrcfork** and **machfs**, which read resource forks and HFS disks.
-  (MFS disks macrt reads itself.)
+- **rsrcfork** and **machfs**, which read resource forks and HFS disks'
+  B*-trees. (The rest of an HFS disk, and MFS disks, macrt reads itself.)
 
 `pip install -e .` installs all four. unicorn has wheels for Linux, macOS
 and Windows.
@@ -135,7 +135,8 @@ The Secret of Monkey Island, Netscape Navigator 2.02 with the web pages
 on its disk, a MacPaint demo, Adventures of Sean 2, Apple's tour of the
 Macintosh SE, Evocation, The Religion of Islam, HyperCard stacks such as
 Clue, the Twin Peaks Bedside Companion and a list of bulletin boards
-from 1987, and others (see
+from 1987, a CD of fifty game demos, the 500 Mac Games CD, Mac Format's
+cover floppies, Gary's HyperCard stacks, Thoru Yamamoto's, and others (see
 [Where to find software](#where-to-find-software)).
 
 | Application | What happens |
@@ -357,7 +358,7 @@ from 1987, and others (see
 | Crystal Crazy | Plays, with `--app "Crystal Crazy™" --host screen --size 512x342`. Click to start a game; Return shows the instructions and H the high scores. |
 | Spelunx | Runs, with `--app " Spelunx " --host screen --size 512x342`, the name with a space either side. It's a HyperCard 2 stack built as an application. OK the alert that Palatino is missing, and it opens on its main screen of pictures, with the menu bar hidden. The first picture goes to the cave's entrance: click the door to open it and go in. |
 | Bolo | Plays, with `--app "Bolo 0.99.7" --host screen --size 512x342`. Choose Practice in its Network Selection and OK, then OK its Game Setup: it shows the game's view of Everard Island. Its Tutorial teaches the game a step at a time: hold Q, and the tank's boat goes up the river, then the tank drives on over the grass and into the forest. |
-| BMAPEdit 4.0 | Runs, from the same disk, with `--model ii --depth 8 --size 800x600 --app "BMAPEdit 4.0"`. It wants System 7 (Gestalt's Help Manager, PPC Toolbox and `LaunchApplication`), which macrt says it has. Return closes its shareware notice; File › New opens an Untitled map with its tool palette and its View Options and Draw Options windows, whose sliders are its own `CDEF` and whose title bars its own colour `WDEF` draws. |
+| BMAPEdit 4.0 | Runs, from the same disk, with `--model ii --depth 8 --size 800x600 --app "BMAPEdit 4.0"`. It wants System 7 (Gestalt's Help Manager, PPC Toolbox and `LaunchApplication`), which macrt says it has. Return closes its shareware notice; File › New opens an Untitled map with its tool palette and its View Options and Draw Options windows, whose sliders are its own `CDEF` and whose title bars its own colour `WDEF` draws. BMAPEdit 1.2, on the 500 Mac Games CD, gets to its map, tile palette and tools too: the routine that makes its black-and-white start square ends with `SetPort` and no result of its own, so it returns whatever is in D0, which macrt leaves 0 after a Toolbox routine that has no result. |
 | Citadel | Plays, with `--host screen --size 512x342`. Type a name at its request for one and press Return; its title and introduction follow, then a click goes on to the town, whose signs name its places. A click on a sign says what it's for, and a double-click goes there: the Tavern, where a party is formed, has Done and Carouse. |
 | Rescue!, Action-Strategy Baseball, CX Base 500, My Office, Seastalker, Mavis Beacon Teaches Typing 2.0, Spaceway 2000 | Run, with `--host screen --size 512x342`, to their first screens: Rescue!'s title (`--app "Rescue! 2.0.5"`), A-S Baseball's teams, CX Base 500's window, My Office's alert that it can't find the last file used, Seastalker's request for your first name, Mavis Beacon's Enroll and Sign In (`--app "Mavis Beacon™ 2.0"`) and Spaceway 2000's story (`--app "Spaceway 2000™"`). |
 | Shanghai II: Dragon's Eye | Plays, with `--app "Shanghai II-Dragon's Eye:Shanghai II" --host screen --size 512x342`. OK its dialog to personalize your copy, and it lays out the Dragon. |
@@ -371,7 +372,7 @@ from 1987, and others (see
 | 3 in Three | Plays its story, with `--app "3 in Three™" --host screen --size 512x342`: click to continue (in its menu bar) from one cartoon to the next. |
 | Dubbelmoral! | Runs, with `--app "Dubbelmoral! ƒ:Dubbelmoral!" --host screen --size 512x342`. It's in Swedish: the town's map, the Nile and the status window. |
 | PicottHouse | Plays, with `--app PicottHouse --host screen --size 512x342`. Click the front door to open it and go in. |
-| SimpleText, Note Pad, Stickies, Jigsaw Puzzle, Scrapbook, Find File | Run, from PicottHouse's disk, which has System 7.5.3, with `--model ii --depth 8 --size 640x480`. `--app SimpleText` opens an untitled document to type in; `--app "System Folder:Apple Menu Items:Note Pad"` opens its first page, and `Stickies` (in the same folder) a note, both to type in; `Jigsaw Puzzle` shows its puzzle of the world, `Scrapbook` an empty Scrapbook and `Find File` its window for what to find. Their resources are compressed with the disk System's `dcmp`s, and they look for System 7.5 (see [A real System file](#a-real-system-file)). |
+| SimpleText, Note Pad, Stickies, Jigsaw Puzzle, Scrapbook, Find File | Run, from PicottHouse's disk, which has System 7.5.3, with `--model ii --depth 8 --size 640x480`. `--app SimpleText` opens an untitled document to type in; `--app "System Folder:Apple Menu Items:Note Pad"` opens its first page, and `Stickies` (in the same folder) a note, both to type in; `Jigsaw Puzzle` shows its puzzle of the world, `Scrapbook` an empty Scrapbook and `Find File` its window for what to find. Find File reads Apple Event Manager globals that macrt doesn't keep, through the ExpandMem pointer at $2B6, which macrt leaves at 0, so the pointer it follows there is made partly of the random seed at $156, which is set from the clock when the machine starts: started at some times it opens its window, at others it stops with a bus error. Their resources are compressed with the disk System's `dcmp`s, and they look for System 7.5 (see [A real System file](#a-real-system-file)). |
 | Desktop Patterns | Runs, from the same disk, with `--model ii --app "System Folder:Control Panels:Desktop Patterns"`. Its scroll bar goes through its patterns, and Set Desktop Pattern paints the desk in the one showing (`PaintOne` with no window, or `SetDeskCPat` for a colour pattern). They're its black-and-white ones, as the parameter RAM macrt starts with says the desk's pattern is. |
 | ResEdit 2.1.3 | Runs, in colour, from a disk with System 7.5.3 and Toxic Ravine, with `--model ii --depth 8 --size 640x480 --app "ResEdit:ResEdit"`. Click its startup screen away for its Open dialog, with its own New button and alias check box. Open a file (About ResEdit 2.1.3, beside it) for its resource types, a type for its resources and a resource for its editor, such as the picture editor. |
 | Script Editor | Opens, from the same disk (`--app "Apple Extras:AppleScript™:Script Editor"`), with an untitled script, but Check Syntax and Run say it can't connect to the scripting system. AppleScript is an extension, which macrt doesn't run, so there's no scripting component for Script Editor to open. |
@@ -430,7 +431,7 @@ from 1987, and others (see
 | TAoSR | Plays, with `--model ii --depth 8 --size 640x480 --host screen` and `--app TAoSR`: click its pictures past the BJ COMIX splash and the credits, type START, and the first scene is Your Office. It's a World Builder game, played by typing commands. |
 | Super Maze Wars trial | Plays, in colour, with `--model ii --depth 8 --size 640x480 --host screen` and `--app "Super Maze Trial Version 1.0"`: Play, then Ready, and the maze is drawn in 3D; the arrow keys move, and the robots score. Its clock is an extended Time Manager task primed in microseconds. |
 | Pyramad, its Guide | Run, in colour, with `--model ii --depth 8 --size 640x480 --host screen`, from their disk (`--app Pyramad`, `--app Guide`): Pyramad plays: clicks take it past its MagiCastle splash, the temple doors and its title to the board, where blocks are dragged onto the empty squares, matching the sides that touch. The Guide shows a book on a wooden table. |
-| Digital Messiah v2.0.1 | Plays, in colour, with `--model ii --depth 8 --size 640x480 --host screen` and `--app "Digital Messiah ƒ:Digital Messiah v.2.0.1"`: clicks go through its intro screens, File › New Game asks your name, Start leaves the story, and the map opens in its window; W, A, D and the other keys of Options › Controls move you about it, and the opponents come for you. It checks Gestalt for the Apple Sound Chip, which the Mac II has. |
+| Digital Messiah v2.0.1 | Plays, in colour, with `--model ii --depth 8 --size 640x480 --host screen` and `--app "Digital Messiah ƒ:Digital Messiah v.2.0.1"`: clicks go through its intro screens, File › New Game asks your name, Start leaves the story, and the map opens in its window; W, A, D and the other keys of Options › Controls move you about it, and the opponents come for you. Its music plays: from its own disk, with its System, through `SndPlayDoubleBuffer`, and from the 500 Mac Games CD, with BMUG's System 6.0.8, written to the Apple Sound Chip, which it checks Gestalt for and the Mac II has (see [Sound](#sound)). |
 | Lenny and Rita, StarGuardian, Mr. Fixitup 3.0.1 | HyperCard 2.2 stacks made into applications, which colour their cards with the AddColor XCMD: with `--model ii --depth 8 --size 640x480 --host screen` (`--app "Lenny and Rita"`, `--app "StarGuardian:StarGuardian"`, `--app "Mr. Fixitup 3.0.1:Mr. Fixitup 3.0.1"`), Lenny and Rita opens on the Lenny Mead Detective Agency's door, StarGuardian on its starry Click on rabbit to continue card, and Mr. Fixitup on its garage, at the screen's top left with the menu bar hidden, as its stack asks (`hide menuBar`). |
 | Cairo ShootOut, DataFlow, MS-BASIC | Run, on a Plus (`--model plus`, `--app CairoShootOut`, `--app DataFlow`, `--app MS-BASIC`): Cairo ShootOut to its game screen, DataFlow to its tool palette and windows, and MS-BASIC to its Command and Untitled windows. |
 | Mac Attack | Plays, on a Plus (`--model plus --app FINDER`, the name of its program on the disk). At Press mouse button to start, click, then click a level of difficulty, one to three stars, at the top of the screen, and the battle starts: a click fires a shell, which the status panel shows being loaded again, and the enemy's tanks shoot back. |
@@ -486,17 +487,24 @@ from 1987, and others (see
 | Teach Yourself HyperCard | The HyperCard 1.2.5 on its disk opens its Home card: `TeachYourselfHyperCard.img HyperCardBootSystem7.img --app HyperCard --model ii --depth 8 --size 640x480 --host screen`, whose arrows go on to its other cards. The disk's lesson stacks open by name in the same way (`--app "FINAL Pracstack"`, `Reference`, `sample`, `"CIRCUS CLOWNS"`). Intro and the Home card's other stacks aren't on the disk, so a click on one asks where it is. |
 | The Bee, Ziggy Gets Out, Phonics Workout, Symbols, Word Parts | Anne and Richard Wanderman's stacks, which run on their own from their disk with `--model ii --depth 8 --size 640x480 --host screen` (`--app "The Bee v. 1.2"`, `--app "Ziggy Gets Out"`, `--app "Phonics Workout"`, `--app Symbols`, `--app "Word Parts"`). Ziggy Gets Out's arrows turn the story's pages, and Phonics Workout's go from one word to the next. |
 | TesselMania!, Start TesselMania! | Run, in colour, with `--model ii --depth 8 --size 640x480 --host screen`, from their disk: TesselMania! (`--app "TesselMania!®"`) opens on its moving title, with Instructions…, Open… and New…, and Start TesselMania! (`--app "Start TesselMania!®"`) shows MECC's TesselMania! Deluxe Preview. |
-| Spaceship Warlock | Plays its opening, in colour: `SSWarlock.img --app "Spaceship Warlock™" --model ii --depth 8 --size 640x480 --host screen`. Reactor's logo, then the story's text, with arrows back and on. It looks for the screen's resources in its card's firmware with the Slot Manager, and goes on without them. |
+| Spaceship Warlock | Plays its opening, in colour: `SSWarlock.img --app "Spaceship Warlock™" --model ii --depth 8 --size 640x480 --host screen`. Reactor's logo, then the story's text, with arrows back and on. It reads the screen's modes from its card's declaration ROM with the Slot Manager. |
 | How God Makes God | A MacroMind Director movie: `HGMG.img --app " • How God Makes God" --model ii --depth 8 --size 640x480 --host screen`. It asks for its CAMELOT font to be installed in the System file, and OK goes on to its menu of Index, Beginning, About and Quit. |
 | TidBITS 1–50, TidBITS 51–100, TidBITS 101–150 | The newsletter's first issues, as HyperCard stacks that open with HyperCard 2.4's boot disk after their own: `TidBITS.img HyperCardBootSystem7.img --app TidBITS1to50 --model ii --depth 8 --size 640x480 --host screen`, and `--app TidBITS51to100`. Issues 101 to 147 are Easy View files: `TidBITS101147.img --app "TidBITS 101-150"` opens Easy View on their index. |
 | The Ambrosia Times 1.2 | Ambrosia Software's newsletter, a DOCMaker document: `TheAmbrosiaTimesVol1Iss2.img --app "The Ambrosia Times 1.2 " --model ii --depth 8 --size 640x480 --host screen` (the name ends in a space). |
 | Marathon Demo | Plays, in colour, with `--model ii --depth 8 --size 640x480 --host screen` and `--app "Marathon Demo"`: its main menu's Begin New Game starts a game. |
 | Wallpaper 2.0 | Runs, with `--model ii --depth 8 --size 640x480 --host screen` and `--app "Wallpaper 2.0"`: it asks to switch the screen to black and white, then shows its pattern generator. |
 | Mario's Game Gallery, Mario's FUNdamentals 1.1 | Run, in colour, with `--model ii --depth 8 --size 640x480 --host screen`, from their disks (`--app "Mario's Game Gallery"`, `--app "Mario's FUNdamentals 1.1"`), to their menus of games; Checkers opens its board. |
+| Mac Format's cover floppies | `MacFormat35Floppy.img`, the magazine's cover disks in folders such as `MacFormat 9`, has no System of its own: run it with `--system MacDemoGames.img` (the CD above) and `--model ii --depth 8 --size 640x480 --host screen`, naming each program by its path, as `--app "MacFormat 9:SimCity 2000 Demo Folder:SimCity2000™ Interactive Demo"`. Of the 55 games and demos tried, all start and none stops with an error: among them Wolfenstein 3D, Lemmings and Oh No! More Lemmings, Shatterball, Firefall, GNU Chess, Syndicate, Spectre Supreme, Maniac, Mombasa, Glypha III, Oxyd, Civilization, Operation Intercept and Maelstrom. Prince of Persia 2 plays. Populous II draws its title as its window's own picture (`SetWindowPic`) and goes on to its map. SimCity 2000's demo cycles its colours during its splash before it has made the colour tables it cycles, and goes on to its city. Tetris 2000 and Star 'Roids play from their Game menus, and Pathways into Darkness, given a name for a new game from File › New, opens its view of the pyramid and its welcome. Patriot Command says it runs only on A/UX, as it does on the Mac OS. Among its utilities, GraphicConverter 2.0.6 (`--app "MacFormat 24:GraphicConverter 2.0.6:GraphicConverter"`) opens the pictures on the disk, such as the model in `MacFormat 15:GrayStation 1`, beside its tools and its picture's information, once its About box is OK'd; SoundApp (`MacFormat 34:SoundApp:SoundApp`) plays a sound chosen from File › Open, such as the HyperStudio Preview's Parrot; DOCMaker 4.1 asks for a document to open; and FlashWorks opens on its flash cards. HomePublisher's demo (`MacFormat 16:HomePublisher Demo:HomePublisher™ DEMO`, its code loaded into a System 7 heap with room to grow) opens its New/Open Publication dialog, and Factory (`MacFormat 31:Factory:Factory 1.1`) plays from Game › Begin, given a name and no check number for a new game. Starter Accounts (`MacFormat 4:Ritz Starter Accounts ƒ:Starter Accounts`), a compiled BASIC program, opens on its main screen, asking for a data file from its File menu: its runtime sizes its workspace from `FreeMem` and `MaxMem` and grows its locked program handle into it. TechTool (`MacFormat 18:Troubleshooting:TechTool™ 1.0.4 ƒ:TechTool™`) shows its introduction and then its menus, which hold its work (File › Rebuild Desktop and Zap PRAM); its information window, which its Open Application handler opens, doesn't appear, because the introduction's `ModalDialog` gets that event first and its filter returns FALSE for it, and for an event the filter doesn't handle "ModalDialog does nothing" (*Inside Macintosh: Macintosh Toolbox Essentials*, Dialog Manager, ModalDialog). Fast Player asks Gestalt for QuickTime, which macrt doesn't have, and quits. Addresses & Birthdays stops with an error: its start-up code copies its globals from two bytes past the end of its `DATA` resource. |
+| Gary's HyperCard stacks | `GarysHyperCardPage.img`, with a HyperCard Player and stacks such as Car Care, The Cruel Fairy, Frappie the Frog, the Honey Do List, HyperEnvelope, Storybook, Tubers, HyperPatterns, Triangles and a SETI@home calculator, has no System of its own: run it with `--system MacDemoGames.img` and `--model ii --depth 8 --size 640x480 --host screen`, naming the stack by its path, as `--app "GarysHyperCardPage:CarCare Folder:Car Care"`. The Player says Palatino is missing, as neither disk has it; OK that, and each opens on its first card. Where a stack's card is bigger than the card window, the Player shows its Scroll window itself. |
+| Thoru Yamamoto's stacks | The stacks A Little Tree, Drug Store, Hand To Hand and HandToHand-X, See The Sky and the zizi series, on a disk named Thoru Yamamoto with no HyperCard of its own: give HyperCard 2.4's boot disk after it, `disk.img HyperCardBootSystem7.img --app "Thoru Yamamoto:A Little Tree" --model ii --depth 8 --size 640x480 --host screen`. OK the alert that Palatino is missing, and each plays its opening: HandToHand-X's hiragana around Click a Word!, zizi's title, Drug Store's moon. |
 | Deco | Runs, with `--model ii --depth 8 --size 640x480 --host screen` and `--app Deco`: past its notice, it shows its board. |
 | M&M's Shockwave games | From `MMS1996.img`, with `--model ii --depth 8 --size 640x480 --host screen`: `--app bagem` plays, `--app melt` shows Melt 'em's pool, and `--app paintem.sea.1` Paint 'em's palette and canvas. |
 | LEGO DACTA Control Lab 1.0 | Runs, with `--model ii --depth 8 --size 640x480 --host screen` and `--app "CtrLab 1.0"`. It looks for its interface box on the modem port and says it can't find it; OK goes on to its Command Center, and File › New Project opens Untitled (Setup), with the box's inputs 1 to 8 and outputs A to H and the sensors and motors to connect to them. |
 | Macromedia Flash 2 | Starts, with `--model ii --depth 8 --size 640x480 --host screen` and `--app "Flash 2"` (`MacromediaFlash2.img`): its splash, then its tool palette and its Quick Start lesson behind the Macromedia Flash Serialization dialog, whose name, organization and serial number fields take what's typed. There's no serial number on the disk, and Cancel quits. It makes its own table of the keys from the `KCHR` that GetScriptManagerVariable(smKCHRCache) points to. |
+| A CD of game demos | `MacDemoGames.img`, with System 7.5.5 and fifty demos in its More Information folder, each named by its path, as `--app "More Information:Tristan™:TRISTAN™ DEMO"`, with `--model ii --depth 8 --size 640x480 --host screen`. Nearly all reach their titles or play: Prince of Persia's palace, Battle Chess's board, Color Super Tetris, Crystal Quest, Lemmings, Glider 4.06, Spectre, Xanthus, SimAnt and Warlords past their notices, and Tesserae's mosaic. Mission Starlight turns its sound on by setting a bit of the VIA's with `BitSet`, and goes on to its game screen. Tristan opens its External Sound file again for each game and looks for its sounds there, and plays. Pararena asks for 16 or 2 colours and, given 16, sets the screen to them itself and shows its title. OIDS, RoboSport, Color VETTE! and Armor Alley want 2 or 16 colours, and run with `--depth 4`; Armor Alley also runs at 256 colours with `--memory 5000`. Mission Thunderbolt needs `--memory 6000`, and without it says its memory is critically low. Checkmate is a black-and-white demo and says so. The Journeyman Project's Sneak Preview and The Iron Helix's demo play their music from AIFF files with play from disk: Journeyman goes on past its burned city into the time machine, and Iron Helix shows its walkthrough on the ship's console, then its title, and quits when it is over, as it should. Rommel and Panzer Battles want 16 colours, or 2 for their black-and-white scenarios, and run with `--depth 4` or `--depth 1`; each asks for a scenario in an Open dialog and goes on to its Game Preparation dialog. Rodney's Funscreen shows its tent, and a click on a game, such as Guess-O-Matic, starts it. |
+| BMUG's PD-ROM Volume 1 | `BMUGPDROMVolume1.img`, a CD of public-domain and shareware programs with its own System Folder (System 6.0.8), runs on the default Plus, naming each program by its path, as `--app "PD ROM:Games:Arcade:AirTrafficController 4.0"`. All 174 programs in its Games folder start: among them Air Traffic Controller 4.0, whose author's address is a button with a title of three lines, Star Fleet Battles Playing Aid, MacYahtzee, Mouse Craps, Canfield, Royal Trick-Track and Euchre. The Fool's Errand's demo asks for its Demo Puzzles file in an Open dialog and goes on to the first page of its story, The Sun. Crozzle 0.8 calls `NewWindow` as `$AB13`, with bit 9 of the trap word set, which a Plus ignores. Vampire Castle speaks with MacinTalk, which the CD doesn't have, and without it stops with an illegal instruction the first time it speaks. Juggler reads its own file from the top of the disk rather than from its folder, and says error -43; so do Aquarium and Fido, in its Graphics folder, and Camera, in Education, which open their data forks by the volume of the file control block of their resource file, and a volume reference number with a name and no directory names the file in the volume's top directory. Copied out of the image with their resource forks, into a folder of their own on the computer, they find their files: Aquarium shows its fish and its snail, Fido its dog, and Camera its camera and a slide. Silicon Volleyball 2.0 looks for itself under its old name, Silicon Volleyball, and says it can't find its Hall of Fame. Beyond its games, HyperCard 1.2.1 opens the CD's home stack; LaserKey's installer makes its own item list, its text all user items whose procedures it puts there itself; TME's first menu is a space and an apple; and JamPaint, a paint program for AppleTalk networks, finds the printer port configured for the Serial Driver and says error -98 without trying to open AppleTalk. Among its utilities, Cipher 1.00 is a program for PShell, the Pascal interpreter beside it: it names itself in its Finder information and launches PShell, which shows Cipher's title and asks for the cipher to solve. Mount any Hard Disk looks for drives on the SCSI bus and, finding none (the disks macrt mounts aren't on a bus), quits. SCSI Evaluator 1.00 has `NumToString` put each of its numbers at NIL, address 0, and draws them from there. CassetteLabeler 1.0b1 stops with a bus error: its BASIC runtime goes on using a window it has disposed of. All but three of its other utilities and its virus tools start, from Icon Extractor, ICONstructor, SicnEdit and Zoomation to MacSnoop, Sample It!, RamDisk+, Ferret, Interferon and Virus Rx; SnapShot's installer zooms frames in the screen port where each of its windows is about to come, before it shows the window over them. ResEdit 1.2d2 stops with an illegal instruction at $2A: after its first `ParamText` it goes through the volume queue and calls through the long at $700, an address Inside Macintosh doesn't document, which macrt leaves 0; Memdoggie stops at `_OSDispatch` selector $17, which isn't documented either; and REMOVE*JCLOCK passes `InitGraf` 0 rather than the address of its `thePort`, so `InitGraf` stops with a bus error setting up the QuickDraw globals below it. In its Mac II folder, MPWAccuracy, which tests the accuracy of floating-point arithmetic, runs to the end of its table of results with `--model ii --depth 8`; macrt runs the 68020 and 68881 instructions it uses that the processor core doesn't (`CHK2`, packed decimal `FMOVE`, `FSAVE` and `FRESTORE`) itself. Mandelbrot 2.7 draws its picture with `--model ii --depth 8 --row-bytes 1024`: it writes each row of its 450-pixel map into the screen's memory 1024 bytes after the last, rather than as many as `screenBits` says. Color IconBounce, from its Graphics folder, bounces colour icons over the screen with the same `--row-bytes 1024` (and with `--depth 4 --row-bytes 512`); it copies its picture of the screen into the screen's memory itself, its rows 128 bytes apart for each bit of a pixel. JuliaSet 5.1 draws its Julia set with `--model ii --depth 8`: it reads the screen's mode from the System file's 'scrn' resource, where the Control Panel records how the screen is set up, and macrt's System file has one for the screen as it starts. Mandel881 and MandelSANE, in Updates/New, draw the Mandelbrot set with `--model ii --depth 8 --memory 4096`. They have no `SIZE` resource, so macrt gives them 1 MB, and each asks `NewPtr` for 2400K, 8 bytes for each pixel of a 640×480 screen; without the memory, they say they won't be able to refresh their window. Rainbow draws its string art in colour with `--model ii --depth 8`, writing the pixel value of each colour into its port's `fgColor` itself; Spectra draws whichever of its shapes is picked from its Shapes menu; and Flock's points flock in the window File › Flock opens. QuickBenchMark stops with a divide by zero when one of its tests takes less than a tick, as its test of the blend mode does in macrt. MonsterPaint, in Graphics, runs with `--model ii --depth 8 --memory 4096`: it has no `SIZE` resource, and its four 576×720 pixel maps don't fit in 1 MB. Its pencil starts in white, the first colour of the standard table; to draw in another, hold the button down on a colour in its palette, as it reads the colour only while the button is down. ColorArt, with `--model ii --depth 8`, draws coloured lines and shapes once Go › Start is picked, all in the top left 512×342 of the screen, as its own arithmetic places them there. Colorize v2 asks in an Open dialog for the program whose colours to change and lists the parts of its windows, dialogs, controls and menu bar; clicking one brings up the Color Picker, which in macrt is the host's colour dialog with Colorize's prompt as its title, and OK writes the colours into the program's resources and asks for the next. MandelZot 0.5's File › New draws the Mandelbrot set a point at a time, in whichever of the modes in its Display menu is picked. Mesmer's File › Start draws string art in colours it cycles, Spirograph Mac II draws its patterns from the start, and StarMapper Mac II draws its star map once the four values its form asks for are typed. Discovery Color Images plays a sound and then shows its photographs one after another; Display, in Graphics:Balls, asks for its Balls file and shows a ray-traced picture of four balls; and Show Screens, with `--row-bytes 1024`, shows the screens saved beside it, cycling their colours, as it unpacks each row into the screen's memory 1024 bytes after the last. Lichtenstein fills the screen with circles, boxes and lines in random colours. Wallpaper and FKey Manager say they need the screen in two colours, and with `--depth 1` they run. BackPrint v1.3 copies its INIT and driver into the System file and quits. With `--model ii --depth 8 --size 640x480` its Games and Graphics run as they do on the Plus, but for a few. Hustle and Think Ahead+ 1.3 need a 68000: the `TRAP` handlers of their Forth runtime expect the 68000's six-byte exception frame, and with the 68020's, which adds a format and vector offset word, they stop with a bus error in `SetCursor`. With `--model ii` macrt's Toolbox trap table has 1024 entries, so Crozzle's `$AB13` is trap $313, which isn't implemented, and Crozzle stops there. RingWarp keeps the size of the screen it fills in a word that a 640×480 screen overflows; it runs with `--size 512x342 --depth 1`. PackIt III, taking the Mac II's `ROM85` for an older ROM's, grows its heap itself, as programs for the 64K ROM did. MirrorBalls and Wide Flight write into the screen's memory a bit a pixel, and LAZlife sizes its window by the screen's rowBytes; they run with `--depth 1`. Vanlandingham wants a 512×342 screen, and on a bigger one says it hasn't enough memory. Notebook 2.0's `SIZE` resource asks for 253K, and with a 640×480 screen it says memory is low; with `--memory 512` it opens its notebook. Digital Clock, in Business, writes into the screen's memory a bit a pixel, and runs with `--depth 1`. AutoBlack, a screen saver, says on a Mac II that it can't find the screen hardware. PadDesign puts its second window at (450, 400) on the screen, past the bottom right of a 512×342 one, and on a 640×480 screen its corner shows there; GLA 1.5 places its window by the size of the screen, at its bottom right; and Synchronicity, in Pictures, makes its window 512×322 whatever the screen's size. On a Mac II, FontFkeyDAPntgSound Sampler, in FKEYs, puts its six menus in the list of submenus, `InsertMenu` with -1, and adds a menu, Hi!, to reach them; but the item strings it gives `AppendMenu` have the character $1B and each menu's ID as part of the text, without the `/` and `!` that make them the command and mark of an item with a submenu, so its items show those characters and have no submenus. On a Plus it puts its menus in the menu bar. Idealiner Jr 2.2, in Text, starts with an Open dialog of its own whose New button, item 2, starts a new outline. ICN#->ICON, in Stacks, has a `wctb` 0 of its own, and on a Mac II its window's frame is in its colours: a blue outline and stripes, a cyan title bar and a red title. |
+| BMUG's PD-ROM Volume 2 | `BMUGPDROM2.img`, the second CD, has no System Folder, so give it Volume 1's with `--system BMUGPDROMVolume1.img` and name each program by its path, as `--app "Games:Strategy:CrossWise"`, on the default Plus. Nearly all the programs tried so far start. Burtonia, a THINK C console program, installs its own driver with DrvrInstall. The Arkanoid Demo and Yeager's AFT draw in the alternate screen, and MyTimeDemo reads the dates typed into it with StringToDate. Crab Attack II needs `--memory 800`: its SIZE asks for 500K, and it takes seven 51,840-byte buffers with NewPtr. CrossWise needs `--memory 320`: its SIZE asks for 270K, and it won't go on unless MaxMem gives it 256,000 bytes. PSpice Tour Engine runs with `--model ii --memory 1500`. On a Plus, after checking ROM85, it reads addresses past the end of RAM and stops with a bus error. Ballistics v2 waits for a click before it plays. Fortune shows a saying and quits a few seconds later. Tic-Tac-Toe-Too paints the screen black and asks for a board size in its console. Core War's programs smear as they crawl, which comes from the way it copies them. MacNPCGenerator reports 96 MB free, as every macrt volume does. Vampire Castle and The Birds want MacinTalk, which macrt doesn't provide. World Class Demo looks for a file called World Class, which isn't on the CD, and says File Not Found. Juggler, Silicon Volleyball 2.0 and Aquarium behave as their copies on Volume 1 do. Bomber draws a pretend system error, with its own copy of the Finder's menus. Crystal Paint DEMO sets the LoadTrap byte, so each segment it loads is handed to `_Debugger` first, and installs its own A-line trap handler, which chains to the one it replaced. Icon Exchanger hands PlotIcon handles whose master pointers it keeps in blocks of its own. DD Expand 1.1 finds the screen's size by calling InitGraf with A5 pointing into a stack frame, then puts A5 back; QuickDraw goes back to the program's own globals with it. SpeakFile and Speech Tutor open MacinTalk from their own folder, `Sounds:Sound Utilties:MacinTalk:MacinTalk Programs`, but the CD keeps it a folder up; copy it beside them, onto a disk of your own, and SpeakFile speaks and Speech Tutor opens its windows. CheapTalk finds the folder called MacinTalk where it looks for the file, and says so. MacWelcome™ 1.4 shows the message in a text file called WelcomeMessage, which you write yourself; until there is one it keeps looking for it. ScheduleBrain asks for its Schedule Data file, and ModemAnswer 2 sends a command out of a serial port and quits. ResEdit 1.2 and Remove J-Clock stop as ResEdit 1.2d2 and REMOVE*JCLOCK on Volume 1 do. Take a Letter's Geneva 12 Form Letter opens a window full of the letter o, which is what its data fork holds. DoppleMaker and ToMultiFinder show ⌘ in their buttons and titles. RamDisk+ 2.11 installs and opens its own RAM disk driver; it keeps the creation date of the disk its settings were last saved on, and on any other disk it tidies them up and asks at once whether to save them. Speed Check stops with an F-line trap: it uses a dialog it hasn't made, and keeps globals past the space its CODE 0 asks for. Disk Librarian centres its opening message on its widest line, which in the system font, Chicago 12, is 502 pixels wide, 15 more than it allows, so the message starts 7 pixels left of its window and loses a letter or two at each end. TEXT Ranger asks at once for the disk whose TEXT files it's to go through, and Sound->snd 1.2e asks at once for a file to open, in a Standard File dialog of its own. CAMPAIGNER1.2DOCS and TARGETDOC read their text from their own data forks, which are empty on this disc, so their windows stay blank. Desktop Scout finds no Desktop file to look through: neither disc has one. HyperCard 2.0 says the System lacks Courier 12, Geneva 14, Palatino 24 and Helvetica 24, which Volume 1's doesn't have, and opens its Home stack, on a Plus or a Mac II. Some want a Mac II: Robot World runs with `--model ii --depth 8`; on a Plus it stops with a bus error in FillRect, at $C20080. SignalEditor II and TapeOp DEMO run with `--model ii --depth 8` too. V3d.fp says the Plus has no FPU; with `--model ii` it starts, its menus up and no window open. IEdit 1.1's Scrap window starts black: it fills its two scrap icons with ones itself. BigSound VW Player blanks the screen and asks at once, in a Standard File dialog, for a movie to play; pick one from its folder, such as Marbles, and it plays. Mac'N Med Engine, a Helix run-time engine, unloads the segment it's running in, then grows its Apple menu, which lies just below it, with AppendResMenu, and goes on to its menu bar; the demo collection beside it, DemoMac'N Med4.2, opened with File › Open, says it expired at midnight on 1 January 1988. |
+| The 500 Mac Games CD | `500MacGames.iso`, 472 shareware and freeware games, demos and game editors in folders by kind, has no System Folder: give it BMUG's with `--system BMUGPDROMVolume1.img` and name each program by its path, as `--app "Cards:Spoydworks Solitaire 1.2 ƒ:Spoydworks Solitaire 1.2"`, with `--host screen`. On the default Plus all but two run without stopping with an error; Orb Mazez and MacCribbage (Color) stop there, and run with `--model ii --depth 8 --size 640x480`, Orb Mazez to its title and MacCribbage to its choice of who deals first. Rescue! makes its offscreen world with `NewGWorld` on a Plus; Poly-Dol passes `UseResFile` a refnum, 2, that's no resource file's (it's the boot volume's extents tree), so it goes on finding its own resources; BrickBounce and Spoydworks Solitaire won't start without the Edition Manager, and Spoydworks, on a Mac II, finds its Games & Decks folder in a dialog that picks a folder (see [What works](#what-works)), then deals its eleven games with any of its sixteen decks; CyberBlast and the Deliverance demo call `RsrcMapEntry` at startup, and CyberBlast plays; and the CyberFlix previews (Jump Raven, Lunicus, Western) read the video card's declaration ROM to see which depths the screen has. On a Mac II in colour, `--model ii --depth 8 --size 640x480`, all but one run without an error: Race Car, a MacFORTH program, has its own handler for `TRAP #15` that takes the exception frame to be the 68000's six bytes, and the 68020 pushes eight, so it runs only on the Plus. MacTriv passes `RectRgn` the address of its rectangle for the region, which isn't a handle in any heap, and macrt leaves it alone. Some want more than a launch: MS BASIC Runtime runs its ADVENTURE program when that's named as the document (`--app "Adventure:ADVENTURE ƒ:ADVENTURE"`), Blocker plays after File › Open Game Map and File › Play the Game, Macinsplat's clicks draw once a weapon is picked from Options, and Ninja Boy, RoadKill and Populous ask for 16 colours. Castles Demo quits as it starts: a byte of its settings, 0 in macrt, takes it down a path that doesn't build its list of sound timers, and its idle loop walks that list until it reads $FFFF, writing -1 over its own class table as it goes, so making its intro's manager fails. |
 
 When you try another, the list of missing calls it prints when it quits
 (see [When it stops](#when-it-stops)) is what to report.
@@ -528,7 +536,7 @@ it works it out from the contents:
 | Executor | `App` next to `%App` | Executor's host folder |
 | a resource fork on its own | `App.rsrc`, or any file that is one | `DeRez`/`Rez` tooling, resource editors |
 | a macOS file | `App` itself, through `App/..namedfork/rsrc` | a Mac running macOS |
-| an HFS or MFS disk image | `Disk.dsk`, `.img`, `.image`, `.hfs`, `.toast` | raw and DiskCopy 4.2 floppy images (800K and 1.4MB HFS, 400K MFS), with each sector's 12 tag bytes or without them, HFS CD images, partitioned hard disk images |
+| an HFS or MFS disk image | `Disk.dsk`, `.img`, `.image`, `.hfs`, `.toast` | raw and DiskCopy 4.2 floppy images (800K and 1.4MB HFS, 400K MFS), with each sector's 12 tag bytes or without them, HFS CD images, partitioned hard disk images. A CD's image, or any other of 16 MB or more, is mapped rather than read in, and a file's forks are read from it only when they're wanted, so only what's used of it is in memory. |
 | a MOOF floppy image | `Disk.moof` | Applesauce, imaging a 400K or 800K floppy's tracks bit by bit |
 
 For AppleDouble and the emulator folders, give macrt the data-fork file
@@ -562,7 +570,10 @@ Each line gives the resource's type, ID, size in bytes, attributes and
 name, then what it holds.
 
 If macrt says the file *has no resource fork*, the fork was lost on the way.
-Go back to the archive or disk image it came from.
+Go back to the archive or disk image it came from. If it says the
+*resource fork is in its data fork*, something copied the file without
+keeping its two forks apart, and a Mac couldn't launch it either. McBug on
+both BMUG PD-ROM discs was mastered like this.
 
 ### Archives
 
@@ -750,12 +761,13 @@ python -m macrt FILE... [--app NAME]... [options]
 | `--menubar window` | A menu bar under each window's title bar. |
 | `--size WxH` | The Mac screen's size, such as `512x342` or `640x480`. The default is your screen's size with `--host desktop`, and 640×480 with `--host screen`. |
 | `--speed N` | Runs 68k code at about N times a Mac Plus's speed, by the cycles its instructions would take a 68000. Games from 1984 time themselves by how fast the processor goes, and are unplayable at full speed; `--speed 1` is a Mac Plus. The Toolbox's routines, which macrt runs itself, aren't slowed, and above about 3 the counting can't keep up. The default is as fast as it goes. |
-| `--memory K` | Gives the application K kilobytes of memory, in place of what its `SIZE` resource asks for, as the memory size in the Finder's Get Info does. A `SIZE` resource from before MultiFinder can ask for too little: the Finder of the time gave an application all the memory there was. |
+| `--memory K` | Gives the application K kilobytes of memory, in place of what its `SIZE` resource asks for, as the memory size in the Finder's Get Info does. A `SIZE` resource from before MultiFinder can ask for too little: the Finder of the time gave an application all the memory there was. A control panel runs in the memory of the program that hosts it, so its size goes to the application it launches from its own file, as After Dark 4.0's Demo does. |
 | `--no-sound` | Keeps the Mac's sound off your computer's speakers. See [Sound](#sound). |
 | `--record-sound FILE.wav` | Writes the Mac's sound to a WAV file as it plays, as well. |
 | `--model plus` | Says the Mac is a Mac Plus, with a 68000 and no floating-point unit. This is the default. Programs from before the Mac II need it: a 68000's exception frames are smaller than a 68020's, and MacWrite 4.5 pops its own. |
 | `--model ii` | Says the Mac is a Mac II, with a 68020 and a 68881, for a program that needs one. The instructions run are the same either way. Some games pick how to draw by the processor: on a 68000 they draw straight into the screen's memory as if it were a 512×342 Mac's, which on a bigger screen puts their picture in the wrong place. Give them `--model ii`, or `--size 512x342`. A Mac II's screen is in colour: see `--depth`. |
 | `--depth N` | With `--model ii`, the screen's bits a pixel: 1, 2, 4 or 8 for that many bits of an index into the screen's colour table, 16 or 32 for colours themselves. The default is 8, 256 colours. A Mac Plus's is 1, black and white. |
+| `--row-bytes N` | How many bytes apart the screen's rows are in its memory at the depth it starts at, as if its memory were wider than what shows; when a program changes the depth, they're as many pixels apart as before (with `--depth 8 --row-bytes 1024`, 128 bytes at 1 bit a pixel, 512 at 4). QuickDraw says how far apart they are (`screenBits.rowBytes`, and the `rowBytes` of the screen's `PixMap`), and most programs that draw straight into the screen ask it; a few take the rows to be some fixed number of bytes apart instead, and draw each row in the wrong place unless the screen's are so far apart. The default is as few as a row needs: 80 for a 640-pixel row at 1 bit a pixel, 640 at 8. |
 | `--classic-menus` | Menus stay open only while the mouse button is held, as before System 7. |
 | `--rainbow` | Shows the striped Apple logo in the menu bar. |
 
@@ -971,8 +983,12 @@ application's resource chain, as on a Mac, and its desk accessories are
 in the Apple menu. Chicago, Geneva and the other standard fonts are
 still drawn with your computer's fonts, but measured with the widths of
 the System file's own bitmap fonts, at the sizes it has them, so that
-text lines up as it did on a Mac. (A standard font the application
-carries in its own file, at the size asked for, is drawn from its
+text lines up as it did on a Mac. The fonts in the suitcases in the
+Fonts folder beside the System file are the System's too, up to 192K of
+their bitmap fonts (not their TrueType outlines): System 7.5's System
+file has Geneva only at 9 and 12 points, and Courier and Helvetica only
+in that folder, which HyperCard Player's stacks ask for. (A standard
+font the application carries in its own file, at the size asked for, is drawn from its
 bitmap, as Balance of Power's New York is, and Gemstone Warrior's
 Chicago, which it makes the application font by setting `ApFontID`. An
 application's own Chicago 12 is the one its menus are drawn in, as on a
@@ -981,6 +997,13 @@ Its 68k definition procedures and packages aren't run: windows, menus and
 the standard controls are always drawn by macrt, and the package calls
 are always macrt's. Anything above
 that the real System file lacks, macrt adds.
+
+A System 7 file's System heap has room to grow, as a real one's has
+("the system heap expands dynamically to meet your request", Inside
+Macintosh: Memory, "Allocating Memory at Startup Time"): up to 1.5 MB,
+with applications' partitions above it, where macrt's own System keeps
+to 512K. HomePublisher marks its code segments to be loaded into the
+System heap, and couldn't start in 512K.
 
 ### Control panels
 
@@ -1053,6 +1076,36 @@ Pro picked. Demo shows the module, its toasters flying across the
 screen around the panel's settings. The modules' libraries go in
 temporary memory.
 
+After Dark 4.0's demo disk (`AfterDark40.img --app "System
+Folder:Control Panels:After Dark 9" --memory 4096`, with the options
+above) says first, for the same reason, that it needs System 7.0 or
+later, and its panel opens with its modules listed. Demo launches the
+application in the panel's own file, and the panel quits, as a program
+that calls `Launch` does. Flying Toasters needs 256 colours, and about
+3.3 MB for its toasters, which it takes from the application's heap
+when there's no `_OSDispatch` for temporary memory. That application's
+`SIZE` resource asks for 600K, and the module says it's out of memory,
+so `--memory` gives the file a bigger memory size, as Get Info would.
+With it, the toasters fly, the words of their song along the bottom of
+the screen, with the module's settings in front.
+
+The Simpsons Screen Saver's disk (`AfterDarkSimpsons.img --app "System
+Folder:Control Panels:After Dark 9"`, with the options above) has
+After Dark 4.0's panel with modules of its own, in the Simpsons folder
+of the panel's pop-up menu. Their library takes temporary memory
+through `_OSDispatch`, so they run without `--memory`. Demo shows
+Chalkboard's lines being written on the board, Lisa's Mood Swings'
+Lisa playing her saxophone, and Itchy and Scratchy on a desktop of
+their own. That desktop's folders and Trash are the System's icons:
+with `--system` given the same disk they show, and with macrt's own
+System only their names do. Itchy & Scratchy asks for 2 MB of
+temporary memory at once. With `--memory 4096` there's less than that
+outside the panel's partition, and its screen stays black. The
+folder's other modules run too: How to Draw sketches Maggie, Homer
+Eats eats the desktop from the bottom up, Physics bounces the family's
+heads, Simpsons Trivia asks its questions, and Snowball I floats on
+clouds with a halo.
+
 ### Games from 1984
 
 The first Macintosh games often go around the Toolbox. They draw
@@ -1072,12 +1125,24 @@ them what they reach for:
   application launched with `Launch`'s page option finds it in
   `CurPageOption`, and while the VIA's `vPage2` bit is clear the desk and
   the menu bar show the alternate buffer rather than the main one. The
-  windows go on showing what's drawn in them. `BufPtr`, the top of what
-  an application may use, is each application's own: the screen's base
-  for an ordinary launch, and for one launched with the alternate screen
-  (a negative page option) the top of its partition, `$8000` over the top
-  of its A5 world, as on a Mac. MacRacquetball launches itself again until
-  it finds that room.
+  windows go on showing what's drawn in them. A Plus's RAM repeats through
+  its 4 MB of addresses, so the screens are at `$3FA700` and `$3F2700` as
+  well, and Apache Strike's flight writes them there. `BufPtr`, the top of what an
+  application may use, and `ScrnBase` are each application's own. For an
+  ordinary launch both are the screen's base, `$7A700`. An application
+  launched with the alternate screen (a negative page option) gets the
+  memory a Plus with 4 MB gives it: its partition ends just under
+  `$3F2700`, with its A5 world under the alternate screen, and its
+  `ScrnBase` and `BufPtr` are both `$3FA700`, as are its QuickDraw's
+  `screenBits.baseAddr` and the bit maps of the ports and windows it
+  opens. MacRacquetball launches itself again until `BufPtr` is far
+  enough over its A5, Arkanoid's demo stops unless `BufPtr` is
+  `ScrnBase`, and Yeager's AFT launches itself again until its A5 is
+  under `screenBits.baseAddr` less `$8000`. When that room is taken, as
+  when Arkanoid's launcher, which is in it, launches the game, the
+  partition goes lower, with its top `$8000` kept for the alternate
+  buffers, and gets the same `ScrnBase` and `BufPtr`. A partition above
+  `$400000` has `BufPtr` at its own top and `ScrnBase` at `$7A700`.
 - **The VIA**, at `$EFE1FE`: the mouse button, the vertical blanking flag
   at each tick, the one-second flag, the two timers, and which screen
   buffer is shown. Above it, where a Plus looks for a test ROM, there is
@@ -1190,9 +1255,22 @@ parameter RAM. What's in the buffer comes from three places:
   channel, or not asynchronously, waits for its sound to end, as does
   `SndDisposeChannel` without `quietNow`, with the ticks going on.
   MineSweeper, Glider, Glypha, Shadow Keep and Tesserae play their sounds
-  this way.
+  this way. Play from disk, `SndStartFilePlay`, plays an AIFF or AIFF-C
+  file the program has open, or the sampled sound of a `'snd '`
+  resource, all of it or the seconds its audio selection says;
+  `SndPauseFilePlay` pauses and resumes it, `SndStopFilePlay` stops it or
+  waits for its end, `SndChannelStatus` gives its times, and the
+  program's completion routine is called when it ends, however it ends.
 - **The program itself**, writing its samples into the buffer at each
   tick, as Dark Castle, Crystal Quest and SmoothTalker's speech do.
+
+On a Mac II, a program can also write its samples to the Apple Sound
+Chip, at the address in `ASCBase`, as Digital Messiah does with its
+music, 370 of them at each tick from its VBL task. What it writes to the
+chip's first 1K goes into one queue of samples and its second 1K into
+another, each keeping up to 1K; at each tick the speaker plays the next
+370 from them, the two averaged while both have some, with the sound
+buffer's. macrt's Mac Plus has no chip, and its `ASCBase` is 0.
 
 `--no-sound` keeps the sound off your speakers, and `--record-sound
 FILE.wav` writes it to a WAV file as well: 8-bit mono, 22,200 samples a
@@ -1223,6 +1301,13 @@ How it differs from a Mac:
   `Exp1to6` expand MACE to, and `syncCmd` doesn't wait for
   other channels. A channel's commands past its full queue wait outside
   it, so a program never waits for room.
+- Play from disk reads the whole sound from the file when it starts,
+  rather than a buffer at a time through the program's buffer.
+- The Apple Sound Chip is macrt's own: where it is, the two queues and
+  what the speaker takes from them are what Digital Messiah needs, not
+  taken from Apple's description of the chip. What a program writes to
+  the rest of it, from $800, is kept and reads back, but isn't heard: a
+  volume or a way of playing it sets there makes no difference.
 
 
 ## What happens at launch
@@ -1239,6 +1324,10 @@ How it differs from a Mac:
    first jump-table entry. Gestalt, `SysEnvirons` and the low-memory
    globals say it's a Mac Plus, with a 68000 and no floating-point unit,
    and the exception frames it stacks are a 68000's (see `--model`).
+   The few instructions of a 68020 and a 68881 that unicorn doesn't run
+   (`CHK2` and `CMP2`, packed decimal `FMOVE`, an `FMOVE` of immediate
+   data to the floating-point control registers, `FSAVE` and `FRESTORE`)
+   stop it, and macrt runs them in Python (`macrt/m68k/instructions.py`).
 4. **Traps.** Every A-line trap the code executes (`_NewWindow`,
    `_DrawString`, `_WaitNextEvent` and so on) stops the processor. The
    matching Python routine then reads its arguments from the 68k stack or
@@ -1340,12 +1429,29 @@ There are more than 700 Toolbox and Operating System routines:
     pixels are the screen's, draws on a colour screen at its depth, in
     its colours, as Color QuickDraw's do. There's one page and no gamma
     table;
+  - the screen's card, in slot 9, and the Slot Manager, which reads its
+    declaration ROM. The ROM is macrt's own, laid out as Designing Cards
+    and Drivers for the Macintosh Family describes a card's: its format
+    block, with a CRC that checks, the board's sResource and the screen's
+    (`catDisplay`, `typVideo`, `drSwApple`, and a `DrHW` of 0, macrt's own),
+    whose driver is the video driver above, and a mode list for each mode
+    the driver has, with its video parameters. Programs find it with
+    `SNextTypeSRsrc` and the other searches, and read it with `SReadByte`,
+    `SFindStruct`, `SGetBlock` and the rest, as the CyberFlix demos (Jump
+    Raven, Lunicus, Western) do to see which depths the screen has.
+    `SReadInfo`, `SReadFHeader`, `SFindDevBase` (the screen's pixels),
+    the card's parameter RAM and the Slot Resource Table's calls are
+    there too. The calls only the Operating System makes, and those that
+    load and run a card's own code (`SGetDriver`, `SExec`), aren't. A Mac
+    Plus has no slots: `GetTrapAddress` says the Slot Manager isn't
+    there, and it finds no cards;
   - colour ports (`OpenCPort`, `CGrafPort`s), which draw in RGB colours
     (`RGBForeColor` and the rest) and with pixel patterns (`NewPixPat`,
     `GetPixPat` from a `ppat` resource, `MakeRGBPat`, `PenPixPat`,
     `FillCRect` and the other `FillC` calls), and `GetCPixel` and
-    `SetCPixel`. An RGB pattern draws as the nearest colour the screen
-    has, not dithered. A picture plays its pixel patterns and RGB
+    `SetCPixel`. `ColorBit` sets the port's colour plane for a printer,
+    and changes nothing on the screen. An RGB pattern draws as the
+    nearest colour the screen has, not dithered. A picture plays its pixel patterns and RGB
     colours in a colour port, and `OpenPicture` in one records a version
     2 picture, which keeps them; `CopyBits` into it is recorded in black
     and white;
@@ -1396,9 +1502,16 @@ There are more than 700 Toolbox and Operating System routines:
   the table's handle. There are no outline fonts (`IsOutline`);
 - **Colour windows:** `NewCWindow` and `GetNewCWindow` make a window
   whose port is a colour port, its colours in its auxiliary record
-  (`SetWinColor`, `GetAuxWin`, a `wctb` resource). Its content is erased
-  in its content colour, as it is when the window is shown; its frame is
-  drawn in black and white whatever the table says.
+  (`SetWinColor`, `GetAuxWin`, a `wctb` resource), or the default
+  record's, from the application's `wctb` 0. Its content is erased in its
+  content colour, as it is when the window is shown. On a colour Mac any
+  window's frame is drawn in its table's colours, as near as the screen
+  has them: its outline, the line under its title bar, its boxes and its
+  shadow in the frame colour, its title in the text colour, its stripes
+  in the highlight colour and the title bar behind them in the title bar
+  colour, which is how macrt reads the parts' names; a dialog box's
+  white band is in the content colour. A rounded window's frame is black
+  and white.
 - **Palette Manager:** a colour window's palette (`NewPalette`,
   `GetNewPalette` from a `pltt` resource, and the one `GetNewCWindow`
   gives a window from the `pltt` of its ID) gives the screen its colours
@@ -1453,6 +1566,10 @@ There are more than 700 Toolbox and Operating System routines:
   `PaintOne` is called with no window, as Desktop Patterns does. What of
   the menu bar a program has put in `GrayRgn` is desk then too, as
   HyperCard's `hide menuBar` has it, until the bar is drawn again.
+  An application starts with `WWExist` and `QDExist` set, saying the
+  Window Manager and QuickDraw aren't set up yet; `InitGraf` and
+  `InitWindows` clear them. Burtonia's THINK C console sets up the
+  Toolbox only if they say it isn't.
 - **Menu Manager:** `MENU` and `MBAR` resources, key equivalents, marks,
   styles and `AppendResMenu`. Hierarchical menus: a submenu inserted
   with `InsertMenu(menu, hierMenu)` goes in the menu list's hierarchical
@@ -1501,7 +1618,21 @@ There are more than 700 Toolbox and Operating System routines:
   `Button`, `GetKeys`, `PostEvent` and `FlushEvents`. `GetNextEvent` with
   nothing to give returns at once, unless it's asked again in the same
   tick: then it waits for the next, so that a program's event loop
-  leaves the host the processor. `WaitNextEvent` gets its event through
+  leaves the host the processor. A program that waits by calling
+  `TickCount`, `Button`, `EventAvail`, `GetMouse`, `StillDown`, `GetKeys`,
+  `WaitMouseUp`, `OSEventAvail`, `GetOSEvent` or `SystemTask` over and
+  over, with nothing else between, as Lemmings and Airborne! do, leaves it
+  the processor too: after 2 ms of that in a row, it waits for the next
+  tick or for input, which is what it's asking about. One that does a
+  little work between such calls still has 2 ms of the host each tick,
+  many ticks of a Mac's work. With `--speed` it isn't done: there the
+  time a program takes is the point. An update event a program passes
+  over comes each time it asks, until it draws the window with
+  `BeginUpdate` and `EndUpdate`, as on a Mac; Cap'n Magneto's title
+  screen looks only for a click and never does. Asked again in the same
+  tick for an update it was given and hasn't begun, `GetNextEvent` and
+  `WaitNextEvent` wait for the next tick, or for input, first.
+  `WaitNextEvent` gets its event through
   a program's patch on `GetNextEvent`, as on a Mac: HyperCard 2 hands
   its main loop a click it noticed while a script ran that way.
   `StillDown` is false once the mouse-up is in the queue, and
@@ -1512,6 +1643,10 @@ There are more than 700 Toolbox and Operating System routines:
   `GetScriptManagerVariable(smKCHRCache)` points to that layout as a
   `KCHR`.
 - **Control Manager:** buttons, check boxes, radio buttons and scroll bars,
+  whose titles may have several lines separated by returns, each line of a
+  button's centered and those of a check box or radio button
+  left-justified, the lines a font's leading apart and centered together
+  in the control (Inside Macintosh IV, The Control Manager),
   plus the application's own 68k `CDEF`s, including code it puts in a
   control record's `contrlDefProc` itself, and a `CDEF` 0 or 1 of its
   own, which is found before the System's and takes its place (Flash 2
@@ -1569,6 +1704,10 @@ There are more than 700 Toolbox and Operating System routines:
   its hardware. The unit table and the first drivers' device control
   entries are made low in the System heap, under 32K, as a Mac makes them
   at startup: Speller Bee's speech driver keeps its registers a word each.
+  A program can make a device control entry of its own, for a driver
+  in its memory, with `DriverInstall` (`_DrvrInstall`), and take it out
+  again with `DriverRemove`, as THINK C's console does for its console
+  window: Burtonia's.
 - **Desk Manager:** desk accessories, the `DRVR`s an application lists
   in its Apple menu with `AddResMenu`, from the System file (`--system`)
   or its own file. `OpenDeskAcc` opens one for the application that
@@ -1578,7 +1717,10 @@ There are more than 700 Toolbox and Operating System routines:
   `SystemEdit`; `SystemTask` gives it time, and a pick from its own menu
   goes to it. The Event Manager calls `SystemEvent` and `SystemTask`
   through the trap table, so a patch of either sees the calls: After
-  Dark's `INIT` gets its time that way. It closes from its close box, with `CloseDeskAcc`, or when
+  Dark's `INIT` gets its time that way. With `SEvtEnb` cleared, the
+  Event Manager doesn't call `SystemEvent`, but a program's own call to
+  it still goes through: THINK C's console clears it and calls
+  `SystemEvent` itself, for the keys typed in its window. It closes from its close box, with `CloseDeskAcc`, or when
   the application quits. macrt's own System file has no desk
   accessories. `AddResMenu` lists them in alphabetical order, as a Mac
   Plus does (Inside Macintosh IV-55); a 128K or 512K Mac listed them
@@ -1598,9 +1740,19 @@ There are more than 700 Toolbox and Operating System routines:
   items, pictures and icons) is shown as it draws it; its `dlgHook` is
   called as each is clicked or typed in. MacWrite's choice of formats in
   its Save dialog is one, and Microsoft File's name for a new datafile
-  another.
+  another. In System 7's `CustomGetFile`, the reply record says what's
+  selected while the dialog is up, so a hook can let the user pick a
+  folder: Open with a folder selected returns it. The hook can say where
+  the dialog starts (`sfHookChangeSelection`), sends `sfHookGoToDesktop`
+  for the Desktop button, and hears `sfHookNullEvent` when a folder is
+  shown and each time the selection changes, not between them.
+  Spoydworks Solitaire finds its Games & Decks folder this way. The modal
+  filter and activation procedures aren't called.
 - **Icons:** `ICON`, `SICN`, `cicn` and icon families, through the mask; a
   `cicn` in its colours when the screen has more than 2 bits a pixel.
+  `ForEachIconDo` calls a program's icon action function for each type
+  of icon its selector names, and keeps what the function leaves in the
+  suite.
 - **Process Manager and MultiFinder:** the process calls, temporary memory
   and `SetFrontProcess`.
 - **Apple Event Manager:** descriptors, lists, records, and Apple events
@@ -1612,6 +1764,26 @@ There are more than 700 Toolbox and Operating System routines:
   launch](#what-happens-at-launch)), can look through what's waiting with
   `GetSpecificHighLevelEvent`, and can send events to itself, which is
   how recordable applications carry out their own commands.
+- **Edition Manager:** publishers and subscribers, registered across all
+  the applications running, and editions written and read through the
+  application's edition opener, the standard one or its own, with the
+  standard formats (`TEXT`, `PICT`, `snd `) or any others. When a
+  publisher's edition changes, its automatic subscribers get a Section
+  Read event; a publisher whose container has gone gets an empty one and
+  a Section Write event; `GoToPublisherSection` sends a Section Scroll.
+  These are Apple events, sent only to applications whose `SIZE` says they
+  take high-level events. An edition container's data fork is in macrt's
+  own format, since Inside Macintosh doesn't document Apple's, so macrt
+  finds no formats in one a real Mac wrote. The Publish and Subscribe
+  dialogs are Standard File's, the publisher's with a preview of the
+  edition; the options dialog is macrt's own. The `itemOffset` an expanded
+  dialog's hook is given counts the items before the expansion: Standard
+  File's own (12 for a publisher, 9 for a subscriber), or the options
+  dialog's OK and Cancel (2). None of the dialogs uses `where` or a filter
+  procedure. `GoToPublisherSection` opens an unregistered publisher's
+  document only if its application is already running, since macrt
+  doesn't launch applications itself. `Gestalt`'s `edtn` says the
+  Edition Manager is there.
 - **Component Manager:** components registered from a `thng` resource
   or by the program, found by their description, opened, called and
   closed, with their own storage and A5 world, captured and delegated to.
@@ -1646,10 +1818,15 @@ There are more than 700 Toolbox and Operating System routines:
   has been dismissed),
   the date and time, `SysBeep`, VBL tasks (`VInstall` and `VRemove`),
   run once a tick while their application runs or waits, and the Time
-  Manager (`InsTime`, `InsXTime`, `PrimeTime` and `RmvTime`). Gestalt's hardware
+  Manager (`InsTime`, `InsXTime`, `PrimeTime` and `RmvTime`). Below the
+  interrupted program's stack, a VBL task, a Time Manager task or a sound
+  channel's callback finds what the interrupt stacked before calling it:
+  the processor's exception frame and the registers its handler keeps,
+  A0-A3 and D0-D3 (Inside Macintosh II-200). Factory's sound callback
+  writes a word above its return address. Gestalt's hardware
   attributes (`hdwr`) are the model's: a Mac Plus has a VIA, an SCC and
   SCSI, and a Mac II a second VIA and the Apple Sound Chip as well, which
-  Digital Messiah looks for. On a Mac II the Slot
+  Digital Messiah looks for and writes its music to. On a Mac II the Slot
   Manager's VBL tasks (`SlotVInstall`, `SlotVRemove`) run as `VInstall`'s
   do, and the Start Manager's `GetVideoDefault` names the screen's card;
   a Mac Plus has no slots, and `GetTrapAddress` says these calls aren't
@@ -1671,13 +1848,17 @@ There are more than 700 Toolbox and Operating System routines:
   sounds, and samples a program puts in the Mac Plus sound buffer, played
   through your computer's sound output (see [Sound](#sound)). The Sound
   Manager's original calls, `SndPlay` and the channels and their commands,
-  play through the same buffer; `SndSoundManagerVersion` says it's
+  play through the same buffer, and so do the samples a program writes
+  to a Mac II's Apple Sound Chip; `SndSoundManagerVersion` says it's
   version 2.0, System 7's, or 3.0 on a Mac II when the disk's System is
   7.5 or later, and has its double buffering
   (`SndPlayDoubleBuffer`), `SndManagerStatus`, `SndChannelStatus`, the
-  system beep's state and the sound preferences. The Sound Input Manager
-  finds no device to record from, as on a Mac Plus or a Mac II, which have
-  none. Playing from a file (`SndStartFilePlay`) and speech aren't there
+  system beep's state and the sound preferences. Play from disk
+  (`SndStartFilePlay`, `SndPauseFilePlay`, `SndStopFilePlay`) plays AIFF
+  and AIFF-C files and the sampled sounds of `'snd '` resources, with
+  their audio selections, and calls the program's completion routine
+  when the sound ends. The Sound Input Manager finds no device to record
+  from, as on a Mac Plus or a Mac II, which have none. Speech isn't there
   yet.
 
 Not yet:
@@ -1795,3 +1976,7 @@ other application:
 ```sh
 python -m macrt tests/apps/Dialogs.bin --trace-traps
 ```
+
+Keep what you need in registers the way Inside Macintosh's "Using
+Assembly Language" says: a Toolbox routine called through the stack keeps
+only A2-A6 and D3-D7, and in macrt one that has no result leaves 0 in D0.
