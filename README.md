@@ -86,7 +86,7 @@ Ctrl stands in for ⌘ (Command), Alt for Option.
 ```sh
 python -m macrt App.bin                       # MacBinary
 python -m macrt App.hqx --list                # BinHex; list the resources and exit
-python -m macrt Disk.dsk                      # the only application on a disk image
+python -m macrt Disk.dsk                      # a Finder window; double-click to run what's on it
 python -m macrt Disk.dsk --app "Disk:Games:App"   # or pick one by name or Mac path
 python -m macrt App.bin --view                # its menus and windows, without its code
 python -m macrt App.bin --trace-traps         # log every trap it calls
