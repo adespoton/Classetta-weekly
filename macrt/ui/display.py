@@ -57,6 +57,7 @@ from ..toolbox.types import Point, Rect
 from ..toolbox.windows import WindowRecord, describe_proc
 from . import chrome, theme
 from .bridge import GuiBridge
+from .finder import FinderWindow, FinderOptions
 from .keymap import key_message, modifiers_from_qt
 from .menubar import MenuBarWidget, MenuTracker, PopUpTracker
 from .tracking import BoxTracker, DragTracker, GrowTracker, Tracker
@@ -215,6 +216,7 @@ class Display(QObject):
         self.memory_sizes: dict[str, int] = {}  # files' memory sizes, as Get Info sets them
         self.views: dict[WindowRecord, MacWindowView] = {}
         self.app_bars: dict[Process, AppBarWindow] = {}
+        self.finder_windows: list[FinderWindow] = []
         self.tracker: Tracker | MenuTracker | None = None
         self.body_font = theme.body_font()
         self._swallow_release = False
@@ -363,8 +365,8 @@ class Display(QObject):
         app = QApplication.instance()
         app.removeEventFilter(self._router)
         self._app_bar_timer.stop()
-        widgets = [*self.views.values(), *self.app_bars.values(), self.global_bar,
-                   self.host_window, *self._alerts, *self.file_dialogs,
+        widgets = [*self.views.values(), *self.app_bars.values(), *self.finder_windows,
+                   self.global_bar, self.host_window, *self._alerts, *self.file_dialogs,
                    *self.print_dialogs, *self.disk_dialogs, *self.color_dialogs,
                    *self.edition_dialogs]
         for w in widgets:
@@ -436,7 +438,7 @@ class Display(QObject):
     def _alert_closed(self, box: QMessageBox) -> None:
         if box in self._alerts:
             self._alerts.remove(box)
-        if not self._alerts and not self.processes:
+        if not self._alerts and not self.processes and not self.finder_windows:
             self.shutdown()             # the last app crashed; its alert kept the display up
 
     def _process_exited(self, proc: Process) -> None:
@@ -457,8 +459,10 @@ class Display(QObject):
         if self._obscured is proc:
             self._obscured = None
         if not self.processes:
-            if not self._alerts:
+            if not self._alerts and not self.finder_windows:
                 self.shutdown()
+            else:
+                self.refresh_bars()         # the Finder windows carry on without it
             return
         if was_front:
             self.switch_to(self.processes[0], force=True)
@@ -611,12 +615,47 @@ class Display(QObject):
         self._retire(view)
         self._app_bar_timer.start()
 
-    def _retire(self, widget: MacWindowView | AppBarWindow) -> None:
-        """Hide a window view or bar window for good, first ending any
-        tracking that's using it."""
+    def open_finder(self, volume, path: tuple[str, ...] = (),
+                    options: FinderOptions | None = None) -> FinderWindow:
+        """A Finder window over one folder of a disk image, or the one
+        already open there: brought to the front instead."""
+        for win in self.finder_windows:
+            if win.volume is volume and win.path == path:
+                win.raise_()
+                win.activateWindow()
+                win.show()
+                return win
+        win = FinderWindow(self, volume, path, options, parent=self.screen_widget)
+        self.finder_windows.append(win)
+        i = len(self.finder_windows) - 1
+        w, h = self.size
+        x = min(400 + 26 * i, max(4, w - win.width() - 8))
+        y = min(self.desk_top + 70 + 26 * i, max(self.desk_top, h - win.height() - 8))
+        win.place(Point(y, x))
+        win.show()
+        if win.isWindow():
+            win.activateWindow()
+        else:
+            win.tree.setFocus()
+        return win
+
+    def close_finder(self, win: FinderWindow) -> None:
+        """Close a Finder window.  With no applications left running and
+        no Finder windows open, macrt quits: they were all that was up."""
+        if win not in self.finder_windows:
+            return
+        self.finder_windows.remove(win)
+        self._retire(win)
+        if not self.processes and not self._alerts and not self.finder_windows:
+            self.shutdown()
+
+    def _retire(self, widget: MacWindowView | AppBarWindow | FinderWindow) -> None:
+        """Hide a window view, bar window or Finder window for good,
+        first ending any tracking that's using it."""
         t = self.tracker
         tracked = getattr(t, "view", None) or getattr(t, "widget", None)
-        if tracked is widget or (isinstance(t, MenuTracker) and t.bar is widget.bar):
+        if tracked is widget or (isinstance(t, MenuTracker)
+                                 and getattr(widget, "bar", None) is t.bar):
             t.cancel()
         widget.hide()
         widget.deleteLater()
