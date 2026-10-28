@@ -2,6 +2,8 @@
 
 A runtime for classic Mac OS (System 1–7) applications with a PyQt6 front end. **Weekly builds available every Wednesday!**
 
+__ANNOUNCEMENT: To provide a unified communication channel for Classetta, a new Discord server was made!  Access here: https://discord.gg/f6NF7yhWjF__
+
 macrt runs an application's own 68k code on an emulated CPU, catches its
 A-line traps, and answers them with a Toolbox written in Python, with Qt
 widgets standing in for what QuickDraw used to draw. There is no
