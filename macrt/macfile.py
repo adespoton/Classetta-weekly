@@ -27,6 +27,7 @@ disk images among them, to be put in the drives.
 from __future__ import annotations
 
 import binascii
+import copy
 import mmap
 import os
 import struct
@@ -79,6 +80,10 @@ class MacFile:
     @property
     def is_application(self) -> bool:
         return self.type == b"APPL"
+
+    def sizes(self) -> tuple[int, int]:
+        """Its data and resource forks' lengths."""
+        return len(self.data), len(self.rsrc)
 
 
 class Folder(Protocol):
@@ -239,6 +244,12 @@ class _VolumeFile(MacFile):
 
     def _set(self, fork: str, value: bytes | None) -> None:
         self._forks[fork] = value                       # None: what's on the volume
+
+    def sizes(self) -> tuple[int, int]:
+        """Its forks' lengths, without reading them when the disk has them."""
+        if hasattr(self._node, "sizes"):
+            return self._node.sizes()
+        return super().sizes()
 
     data = property(lambda self: self._get("data"), lambda self, v: self._set("data", v))
     rsrc = property(lambda self: self._get("rsrc"), lambda self, v: self._set("rsrc", v))
@@ -586,6 +597,22 @@ def volume_files(volume: machfs.Volume) -> Iterator[MacFile]:
             yield _from_machfs(volume, VolumeFolder(volume, path[:-1]), path[-1], node)
 
 
+def list_folder(volume: machfs.Volume, path: tuple[str, ...] = ()) -> list[MacFile]:
+    """One folder's contents, as the Finder's window lists them: its
+    files, and its subfolders as MacFiles of type 'fldr' with no forks,
+    each keeping its place in the folder it's in."""
+    folder = VolumeFolder(volume, path)
+    node = folder._node(folder.path)
+    out = []
+    for name, child in node.items():
+        if isinstance(child, machfs.Folder):
+            key = ":".join((volume.name, *folder.path, name))
+            out.append(MacFile(name, type=b"fldr", key=key, folder=folder))
+        else:
+            out.append(_from_machfs(volume, folder, name, child))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Single files
 # ---------------------------------------------------------------------------
@@ -831,7 +858,7 @@ def open_applications(paths, names=()) -> list[MacFile]:
     return open_disks(paths, names)[0]
 
 
-def open_disks(paths, names=()) -> tuple[list[MacFile], list[machfs.Volume]]:
+def open_disks(paths, names=(), *, browse: bool = False) -> tuple[list[MacFile], list[machfs.Volume]]:
     """The applications to launch, from several files, and the disk images
     among them, in the order they came, to be put in the drives.  Each file
     that isn't a disk image is an application; from the images, the names
@@ -845,7 +872,11 @@ def open_disks(paths, names=()) -> tuple[list[MacFile], list[machfs.Volume]]:
     rather than the HyperCard Player beside it.  An
     image nothing is taken from, one with no application or, when there
     are names, none of them, is a disk of documents, in a drive for the
-    applications to open: Beyond Dark Castle's second disk."""
+    applications to open: Beyond Dark Castle's second disk.
+
+    With browse and no names, nothing is taken from the images: they are
+    the caller's to show, in Finder windows, and only the files that
+    aren't images are applications here."""
     opened = [(Path(p), *_volume_or_file(p)) for p in paths]
     images = [(path, volume) for path, volume, _ in opened if volume is not None]
     if names and not images:
@@ -887,12 +918,30 @@ def open_disks(paths, names=()) -> tuple[list[MacFile], list[machfs.Volume]]:
             continue
         if i in picked:
             apps += picked[i]
-        elif not names and not _runs_nothing(volume):
+        elif not names and not browse and not _runs_nothing(volume):
             apps.append(_only_application(volume, path))
         i += 1
-    if not apps and images:
+    if not apps and images and not browse:
         _only_application(images[0][1], images[0][0])     # says there's nothing on it to run
     return apps, [volume for _, volume in images]
+
+
+def launch_target(f: MacFile) -> MacFile:
+    """What the Finder's opening f launches: f itself, if it's a program
+    (an application, a control panel with code of its own, or a program
+    in the Finder's place), or the application that made a document, with
+    the document to open.  ValueError if nothing here opens it."""
+    if not _is_document(f):
+        return f
+    volume = f.folder.volume if isinstance(f.folder, VolumeFolder) else None
+    made = _creator_on(volume, f.creator) if volume is not None else None
+    if made is None:
+        where = volume.name if volume is not None else "here"
+        raise ValueError(f"{f.name} is a document, and no application on {where} "
+                         f"made it (its creator is {_ostype(f.creator)})")
+    made = copy.copy(made)
+    made.documents = (f,)
+    return made
 
 
 def _volume_or_file(path: str | os.PathLike) -> tuple[machfs.Volume | None, MacFile | None]:

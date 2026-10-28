@@ -11,7 +11,8 @@ reacts to a click unless the guest asks it to.
 Or run a real 68k application instead (see docs/running-apps.md):
 
     python -m macrt App.bin                  # MacBinary, BinHex, AppleDouble…
-    python -m macrt Disk.dsk --app "Disk:Apps:App"
+    python -m macrt Disk.dsk                 # a Finder window; double-click to run
+    python -m macrt "System 6.0.8.dsk" --app TeachText
     python -m macrt One.bin Two.hqx          # several, side by side
     python -m macrt App.hqx --list           # just list its resources
     python -m macrt App.bin --view           # show its resources; don't run its code
@@ -37,6 +38,7 @@ from .toolbox import constants as k
 from .toolbox.api import Toolbox
 from .toolbox.types import Rect
 from .ui.display import Display, DisplayConfig
+from .ui.finder import FinderOptions
 from .viewer import describe, viewer_main
 
 # No "(" in these: AppendMenu reads it as "disable this item", as on a Mac.
@@ -295,7 +297,8 @@ def parse_args(argv=None):
                     help="Mac applications to run instead of the demo, side by side: "
                          "MacBinary, BinHex, AppleSingle/Double, emulator side files, or "
                          "disk images (HFS or MFS; raw, DiskCopy 4.2 or MOOF); an image "
-                         "with no application to run is a disk of documents, in a drive")
+                         "with no --app opens in a Finder window to pick from, and is "
+                         "in a drive as well")
     ap.add_argument("--app", metavar="NAME", action="append", default=[],
                     help="which application on a disk image (its name or Mac path), or "
                          "a document, to launch the application that made it with it; "
@@ -326,12 +329,14 @@ def parse_args(argv=None):
 
 def open_targets(args):
     """The applications named on the command line, each with whether to
-    show it from its resources rather than run its code, and the disk
-    images, for the drives; or an error message."""
+    show it from its resources rather than run its code, the disk images
+    for the drives, and those among them to show in Finder windows
+    (those no --app picks from); or an error message."""
+    browse = bool(args.file) and not args.app and not args.list
     try:
-        apps, disks = open_disks(args.file, args.app)
+        apps, disks = open_disks(args.file, args.app, browse=browse)
     except (OSError, ValueError) as e:
-        return None, None, str(e)
+        return None, None, None, str(e)
     targets = []
     for f in apps:
         print(describe(f, full=args.list))
@@ -340,14 +345,15 @@ def open_targets(args):
         if args.list:
             continue
         if not f.rsrc and is_fork(f.data):
-            return None, None, (f"{f.name}'s resource fork is in its data fork: it was copied "
-                                "by something that didn't keep its two forks apart.")
+            return None, None, None, (f"{f.name}'s resource fork is in its data fork: it "
+                                      "was copied by something that didn't keep its two "
+                                      "forks apart.")
         if not f.rsrc:
-            return None, None, (f"{f.name} has no resource fork. A Mac file has to travel in "
-                                "a form that keeps it: MacBinary, BinHex, AppleDouble or a "
-                                "disk image.")
+            return None, None, None, (f"{f.name} has no resource fork. A Mac file has to "
+                                      "travel in a form that keeps it: MacBinary, BinHex, "
+                                      "AppleDouble or a disk image.")
         if not is_fork(f.rsrc):
-            return None, None, f"{f.name}'s resource fork is damaged"
+            return None, None, None, f"{f.name}'s resource fork is damaged"
         view = args.view
         if view:
             print("Showing its menus and windows from its resources, without running its code.")
@@ -356,14 +362,14 @@ def open_targets(args):
                   "and windows from its resources.")
             view = True
         targets.append((f, view))
-    return targets, disks, None
+    return targets, disks, (disks if browse else []), None
 
 
 def main(argv=None) -> int:
     args = parse_args(argv)
-    targets, disks = [], []
+    targets, disks, finder = [], [], []
     if args.file:
-        targets, disks, error = open_targets(args)
+        targets, disks, finder, error = open_targets(args)
         if error:
             print(f"macrt: {error}", file=sys.stderr)
             return 2
@@ -387,9 +393,15 @@ def main(argv=None) -> int:
                                     row_bytes=args.row_bytes, disks=disks,
                                     sound=not args.no_sound, record_sound=args.record_sound))
     display.show()
-    if targets:
+    if targets or finder:
         logging.basicConfig(format="macrt: %(message)s")
         logging.getLogger("macrt").setLevel(logging.DEBUG if args.trace_traps else logging.INFO)
+    if finder:
+        options = FinderOptions(view=args.view, trace=args.trace_traps,
+                                memory=args.memory * 1024 if args.memory else None)
+        for volume in finder:
+            display.open_finder(volume, options=options)
+    if targets:
         try:
             for f, view in targets:
                 display.launch(f.name, viewer_main if view else None, app=f,
@@ -399,7 +411,7 @@ def main(argv=None) -> int:
             display.shutdown(quit_app=False)
             print(f"macrt: {e}", file=sys.stderr)
             return 2
-    else:
+    elif not finder:
         display.launch("Sampler", sampler_main)
         if not args.single:
             display.launch("Ticker", ticker_main)
