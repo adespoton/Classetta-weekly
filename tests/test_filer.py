@@ -1,4 +1,4 @@
-"""The Finder window a disk image opens in when no --app names what to run."""
+"""The Filer window a disk image opens in when no --app names what to run."""
 
 import machfs
 import pytest
@@ -8,7 +8,7 @@ from conftest import LB, NO_MODS
 from macrt.demo import open_targets, parse_args
 from macrt.macfile import open_disks
 from macrt.resfork import build_fork, Resource, resPurgeable
-from macrt.ui.finder import ARCHIVE_ICON, FinderOptions, _container_icon
+from macrt.ui.filer import ARCHIVE_ICON, FilerOptions, _container_icon
 from macrt.ui.stdfile import DISK_ICON, DOCUMENT_ICON, FOLDER_ICON
 from test_files import FORK, macbinary
 
@@ -163,17 +163,17 @@ def _dblclick(win, name, settle):
 
 def test_the_window_lists_the_folder(harness):
     h = harness(disks=[_volume()])
-    win = h.d.open_finder(h.d.config.disks[0])
+    win = h.d.open_filer(h.d.config.disks[0])
     h.settle()
     assert win.isVisible()
     assert _rows(win) == [("Games", "folder"), ("Letter", "document"),
                           ("Widget", "application")]
-    assert win in h.d.finder_windows
+    assert win in h.d.filer_windows
 
 
 def test_the_header_wears_the_lock_while_the_window_is_view_only(harness):
     h = harness(disks=[_volume()])
-    win = h.d.open_finder(h.d.config.disks[0])
+    win = h.d.open_filer(h.d.config.disks[0])
     h.settle()
     assert not win.tree.headerItem().icon(0).isNull()
     assert win.tree.headerItem().text(0) == "Name"      # beside it, not instead of it
@@ -181,14 +181,14 @@ def test_the_header_wears_the_lock_while_the_window_is_view_only(harness):
 
 def test_a_window_that_can_be_modified_would_wear_no_lock(harness):
     h = harness(disks=[_volume()])
-    win = h.d.open_finder(h.d.config.disks[0], options=FinderOptions(writable=True))
+    win = h.d.open_filer(h.d.config.disks[0], options=FilerOptions(writable=True))
     h.settle()
     assert win.tree.headerItem().icon(0).isNull()
 
 
 def test_the_name_label_begins_where_the_file_names_begin(harness):
     h = harness(disks=[_n_volume()])
-    win = h.d.open_finder(h.d.config.disks[0])
+    win = h.d.open_filer(h.d.config.disks[0])
     h.settle()
     assert _lock_left(win) == 8
     head, nimbus = _label_lefts(win, "Nimbus", after=17)
@@ -197,7 +197,7 @@ def test_the_name_label_begins_where_the_file_names_begin(harness):
 
 def test_the_name_label_begins_where_the_file_names_begin_without_the_lock(harness):
     h = harness(disks=[_n_volume()])
-    win = h.d.open_finder(h.d.config.disks[0], options=FinderOptions(writable=True))
+    win = h.d.open_filer(h.d.config.disks[0], options=FilerOptions(writable=True))
     h.settle()
     assert _lock_left(win) is None
     head, nimbus = _label_lefts(win, "Nimbus", after=0)
@@ -207,21 +207,21 @@ def test_the_name_label_begins_where_the_file_names_begin_without_the_lock(harne
 # -- what the title bar wears -----------------------------------------------
 def test_the_title_bar_wears_the_disk_icon_at_the_root(harness):
     h = harness(disks=[_volume()])
-    win = h.d.open_finder(h.d.config.disks[0])
+    win = h.d.open_filer(h.d.config.disks[0])
     h.settle()
     assert win.frame().title_icon == DISK_ICON
 
 
 def test_the_title_bar_wears_the_folder_icon_inside(harness):
     h = harness(disks=[_volume()])
-    win = h.d.open_finder(h.d.config.disks[0], ("Games",))
+    win = h.d.open_filer(h.d.config.disks[0], ("Games",))
     h.settle()
     assert win.frame().title_icon == FOLDER_ICON
 
 
 def test_a_folder_with_its_own_icon_wears_it_in_the_title_bar(harness):
     h = harness(disks=[_icon_folder_volume()])
-    win = h.d.open_finder(h.d.config.disks[0], ("Mystery",))
+    win = h.d.open_filer(h.d.config.disks[0], ("Mystery",))
     h.settle()
     assert win.frame().title_icon == ["#" * 16] * 16
 
@@ -257,14 +257,14 @@ def test_a_file_wears_its_own_icon_only_when_marked_as_having_one():
 def test_the_same_folder_is_one_window(harness):
     h = harness(disks=[_volume()])
     volume = h.d.config.disks[0]
-    win = h.d.open_finder(volume)
-    assert h.d.open_finder(volume) is win
-    assert h.d.finder_windows == [win]
+    win = h.d.open_filer(volume)
+    assert h.d.open_filer(volume) is win
+    assert h.d.filer_windows == [win]
 
 
 def test_double_click_launches_the_application(harness, monkeypatch):
     h = harness(disks=[_volume()])
-    win = h.d.open_finder(h.d.config.disks[0])
+    win = h.d.open_filer(h.d.config.disks[0])
     h.settle()
     launched = []
     monkeypatch.setattr(h.d, "launch",
@@ -272,12 +272,12 @@ def test_double_click_launches_the_application(harness, monkeypatch):
     _dblclick(win, "Widget", h.settle)
     h.settle()
     assert [(n, kw["app"].name) for n, _, kw in launched] == [("Widget", "Widget")]
-    assert win in h.d.finder_windows       # the window carries on
+    assert win in h.d.filer_windows       # the window carries on
 
 
 def test_a_document_opens_with_its_creator(harness, monkeypatch):
     h = harness(disks=[_volume()])
-    win = h.d.open_finder(h.d.config.disks[0])
+    win = h.d.open_filer(h.d.config.disks[0])
     h.settle()
     launched = []
     monkeypatch.setattr(h.d, "launch",
@@ -290,12 +290,12 @@ def test_a_document_opens_with_its_creator(harness, monkeypatch):
 
 def test_double_click_a_folder_opens_its_window(harness):
     h = harness(disks=[_volume()])
-    win = h.d.open_finder(h.d.config.disks[0])
+    win = h.d.open_filer(h.d.config.disks[0])
     h.settle()
     _dblclick(win, "Games", h.settle)
     h.settle()
-    assert len(h.d.finder_windows) == 2
-    child = h.d.finder_windows[1]
+    assert len(h.d.filer_windows) == 2
+    child = h.d.filer_windows[1]
     assert child.path == ("Games",)
     assert [name for name, _ in _rows(child)] == ["Game"]
     assert child.frame().title == "Games"
@@ -303,23 +303,23 @@ def test_double_click_a_folder_opens_its_window(harness):
 
 def test_the_close_box_closes_the_window(harness):
     h = harness(disks=[_volume()])
-    win = h.d.open_finder(h.d.config.disks[0])
+    win = h.d.open_filer(h.d.config.disks[0])
     h.settle()
     o = win.mac_origin()
     box = win.box_rect(4)                   # wInGoAway
     assert box is not None
     h.click(o.h + box.x() + 5, o.v + box.y() + 5)
-    h.wait_until(lambda: win not in h.d.finder_windows, what="the finder to close")
+    h.wait_until(lambda: win not in h.d.filer_windows, what="the finder to close")
     assert h.d.shutting_down                # it was all that was up: macrt quits
 
 
 def test_a_second_window_survives_the_first_closing(harness):
     h = harness(disks=[_volume()])
     volume = h.d.config.disks[0]
-    win = h.d.open_finder(volume)
-    child = h.d.open_finder(volume, ("Games",))
+    win = h.d.open_filer(volume)
+    child = h.d.open_filer(volume, ("Games",))
     h.settle()
     child.close()                           # closing its box goes through closeEvent
-    h.wait_until(lambda: child not in h.d.finder_windows, what="the folder window to close")
-    assert win in h.d.finder_windows
+    h.wait_until(lambda: child not in h.d.filer_windows, what="the folder window to close")
+    assert win in h.d.filer_windows
     assert not h.d.shutting_down

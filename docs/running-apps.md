@@ -226,7 +226,7 @@ cover floppies, Gary's HyperCard stacks, Thoru Yamamoto's, and others (see
 | Radical Castle | Plays, with `--host screen --size 512x342`: click Start. |
 | Citgo, BackBay 2.0 | Show Kenmore Square. The first one's name starts with a space: `--app " Citgo"`. |
 | Amazing | Plays with `--size 512x342`: the ball follows the mouse through the maze. The game sizes its maze from the screen but keeps it in arrays made for the original Mac's, so on a larger screen it runs past them and hangs on a grey screen. |
-| The Quest | Plays, with `--host screen --size 512x342`. The disk holds no application, and the game took the Finder's place on it; macrt shows the disk in a Finder window instead, where a double-click on the game runs it. Press keys through the story, then type commands such as `n` at the prompt, or click the compass. |
+| The Quest | Plays, with `--host screen --size 512x342`. The disk holds no application, and the game took the Finder's place on it; macrt shows the disk in a Filer window instead, where a double-click on the game runs it. Press keys through the story, then type commands such as `n` at the prompt, or click the compass. |
 | Prince of Persia | Plays: the introduction runs, with its music, Cmd-N starts the first level, and the arrow keys move the prince. |
 | Glypha 3.0 | Plays: Cmd-B begins, then Space flaps and A and S steer (or ; and '). It needs a screen of 640x480 or more. Its disk has its sound off: Options › Configure Game turns it on. |
 | Ishido | Plays, with `--app "Ishido (B&W)"`: Cmd-N deals, and a click places the stone in hand. |
@@ -677,7 +677,7 @@ on a Mac Plus.
 
 A few early games took the Finder's place on their disk, so that a Mac
 started from it went straight into the game. Given a disk without
-`--app`, macrt runs nothing itself: it opens a Finder window over the
+`--app`, macrt runs nothing itself: it opens a Filer window over the
 disk's contents (see [Several applications at once](#several-applications-at-once)),
 where the program the disk starts up into, as its boot blocks name it —
 the game on such a disk — is there to double-click like anything else.
@@ -797,12 +797,12 @@ python -m macrt mac6-0-8.dsk --app TeachText --app "Creepy Castle™"
 Every file you name is launched, in order. When disk images are among
 them, each `--app` is looked for on the images in turn and taken from the
 first one that has it. Without `--app`, nothing is launched from an
-image: each one opens in a Finder window, as System 6's Finder would show
+image: each one opens in a Filer window, as System 6's Finder would show
 the disk — double-click an application to run it (its launch is as if it
 had been named on the command line, so several can be started from the
 one window), a document to open it with the application that made it, or
 a folder to open a window of that folder too. The window stays up, and
-its close box closes it, like a real Finder window's.
+its close box closes it, like a real Filer window's.
 
 An image nothing is launched from, one with no application on it or, with
 `--app`, none of the names, is a disk of documents. Every image is in a

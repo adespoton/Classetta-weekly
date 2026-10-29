@@ -875,7 +875,7 @@ def open_disks(paths, names=(), *, browse: bool = False) -> tuple[list[MacFile],
     applications to open: Beyond Dark Castle's second disk.
 
     With browse and no names, nothing is taken from the images: they are
-    the caller's to show, in Finder windows, and only the files that
+    the caller's to show, in Filer windows, and only the files that
     aren't images are applications here."""
     opened = [(Path(p), *_volume_or_file(p)) for p in paths]
     images = [(path, volume) for path, volume, _ in opened if volume is not None]
