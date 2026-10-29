@@ -212,6 +212,38 @@ def _container_icon(volume: machfs.Volume, path: tuple[str, ...] = ()) -> list[s
     return CONTAINER_ICONS[kind]
 
 
+class _ListHeader(QHeaderView):
+    """The list's header, which paints Name over the names below it."""
+
+    def __init__(self, parent=None):
+        super().__init__(Qt.Orientation.Horizontal, parent)
+        self.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft
+                                 | Qt.AlignmentFlag.AlignVCenter)
+
+    def paintSection(self, painter, rect, logicalIndex):  # noqa: N802
+        super().paintSection(painter, rect, logicalIndex)
+        if logicalIndex != 0:
+            return
+        model = self.model()
+        text = model.headerData(logicalIndex, Qt.Orientation.Horizontal,
+                                Qt.ItemDataRole.DisplayRole)
+        if not text:
+            return
+        icon = model.headerData(logicalIndex, Qt.Orientation.Horizontal,
+                                Qt.ItemDataRole.DecorationRole)
+        painter.setFont(self.font())
+        text_left = rect.x() + 26
+        old_left = rect.x() + (4 if icon is None or icon.isNull() else 21)
+        painter.fillRect(old_left, rect.y(),
+                         text_left + painter.fontMetrics().horizontalAdvance(text)
+                         + 2 - old_left, rect.height() - 1, Qt.GlobalColor.white)
+        painter.setPen(Qt.GlobalColor.black)
+        painter.drawText(text_left, rect.y() + 2, rect.width() - 30,
+                         rect.height() - 5,
+                         int(Qt.AlignmentFlag.AlignLeft
+                             | Qt.AlignmentFlag.AlignVCenter), text)
+
+
 class FinderWindow(_Hosted):
     """One folder's window: its contents listed, ready to open.  Its
     title bar wears an icon of the container it lists — the disk image
@@ -242,6 +274,7 @@ class FinderWindow(_Hosted):
         self.tree.setHeaderLabels(["Name", "Size", "Kind"])
         if not self.options.writable:      # view-only: the lock beside Name
             self.tree.headerItem().setIcon(0, _lock())
+        self.tree.setHeader(_ListHeader(self.tree))
         header = self.tree.header()
         header.setFont(theme.title_font())
         header.setStretchLastSection(False)
