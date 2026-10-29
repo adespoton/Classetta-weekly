@@ -49,6 +49,16 @@ def _icon_folder_volume() -> machfs.Volume:
     return v
 
 
+def _n_volume() -> machfs.Volume:
+    """A disk whose only file's name begins as the header's Name does."""
+    v = machfs.Volume()
+    v.name = "Browse"
+    note = machfs.File()
+    note.data = b"Hello."
+    v["Nimbus"] = note
+    return v
+
+
 # -- what the command line asks for ---------------------------------------
 def test_browse_leaves_every_application_to_the_window(tmp_path):
     apps, disks = open_disks([_disk(tmp_path)], browse=True)
@@ -112,6 +122,34 @@ def _item(win, name):
                 if win.tree.topLevelItem(i).text(0) == name)
 
 
+def _ink(img, y, x0, x1):
+    """The first black pixel of a row between x0 and x1, or None."""
+    for x in range(x0, x1):
+        r, g, b, _ = img.pixelColor(x, y).getRgb()
+        if r < 128 and g < 128 and b < 128:
+            return x
+    return None
+
+
+def _label_lefts(win, name, after):
+    """The x of the header's Name label and of a row of the same first letter."""
+    img = win.tree.grab().toImage()
+    hdr = win.tree.header()
+    rows = range(hdr.geometry().top() + 1, hdr.geometry().bottom())
+    head = min((x for y in rows
+                if (x := _ink(img, y, after, 170)) is not None), default=None)
+    rect = win.tree.visualItemRect(_item(win, name))
+    y = win.tree.viewport().geometry().top() + rect.y() + rect.height() // 2
+    return head, _ink(img, y, 21, 170)
+
+
+def _lock_left(win):
+    """The x of the header's padlock at the header's middle row."""
+    img = win.tree.grab().toImage()
+    hdr = win.tree.header()
+    return _ink(img, hdr.geometry().top() + hdr.height() // 2, 0, 17)
+
+
 def _dblclick(win, name, settle):
     """A real double-click: click, then click again on the same spot."""
     c = win.tree.visualItemRect(_item(win, name)).center()
@@ -146,6 +184,24 @@ def test_a_window_that_can_be_modified_would_wear_no_lock(harness):
     win = h.d.open_finder(h.d.config.disks[0], options=FinderOptions(writable=True))
     h.settle()
     assert win.tree.headerItem().icon(0).isNull()
+
+
+def test_the_name_label_begins_where_the_file_names_begin(harness):
+    h = harness(disks=[_n_volume()])
+    win = h.d.open_finder(h.d.config.disks[0])
+    h.settle()
+    assert _lock_left(win) == 8
+    head, nimbus = _label_lefts(win, "Nimbus", after=17)
+    assert head == nimbus
+
+
+def test_the_name_label_begins_where_the_file_names_begin_without_the_lock(harness):
+    h = harness(disks=[_n_volume()])
+    win = h.d.open_finder(h.d.config.disks[0], options=FinderOptions(writable=True))
+    h.settle()
+    assert _lock_left(win) is None
+    head, nimbus = _label_lefts(win, "Nimbus", after=0)
+    assert head == nimbus
 
 
 # -- what the title bar wears -----------------------------------------------
