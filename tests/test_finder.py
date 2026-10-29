@@ -8,6 +8,7 @@ from conftest import LB, NO_MODS
 from macrt.demo import open_targets, parse_args
 from macrt.macfile import open_disks
 from macrt.resfork import build_fork, Resource, resPurgeable
+from macrt.ui.finder import FinderOptions
 from test_files import FORK, macbinary
 
 
@@ -117,6 +118,21 @@ def test_the_window_lists_the_folder(harness):
     assert _rows(win) == [("Games", "folder"), ("Letter", "document"),
                           ("Widget", "application")]
     assert win in h.d.finder_windows
+
+
+def test_the_header_wears_the_lock_while_the_window_is_view_only(harness):
+    h = harness(disks=[_volume()])
+    win = h.d.open_finder(h.d.config.disks[0])
+    h.settle()
+    assert not win.tree.headerItem().icon(0).isNull()
+    assert win.tree.headerItem().text(0) == "Name"      # beside it, not instead of it
+
+
+def test_a_window_that_can_be_modified_would_wear_no_lock(harness):
+    h = harness(disks=[_volume()])
+    win = h.d.open_finder(h.d.config.disks[0], options=FinderOptions(writable=True))
+    h.settle()
+    assert win.tree.headerItem().icon(0).isNull()
 
 
 def test_the_same_folder_is_one_window(harness):

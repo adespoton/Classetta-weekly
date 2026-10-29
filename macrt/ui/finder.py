@@ -9,6 +9,11 @@ application runs it, a document opens it with the application that made
 it, and a folder opens a window of its own.  The window stays open, so
 several applications can be started from one, and its close box closes
 it like a real Finder window's.
+
+Nothing here writes back to the disk: the window only lists what the
+folder already holds, so its header wears the padlock System 6 showed
+beside Name on a locked disk — that the list may be looked at, not
+changed.  FinderOptions.writable is how a window says otherwise.
 """
 
 from __future__ import annotations
@@ -20,7 +25,7 @@ from typing import TYPE_CHECKING
 
 import machfs
 from PyQt6.QtCore import QEvent, QSize, Qt
-from PyQt6.QtGui import QPainter
+from PyQt6.QtGui import QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QApplication, QHeaderView, QMessageBox, QTreeWidget, QTreeWidgetItem, QWidget,
 )
@@ -51,16 +56,35 @@ QHeaderView::section { background: white; color: black; border: none;
 FOLDER = b"fldr"
 KINDS = [(b"ZSYS", "System file"), (b"zsys", "System file"), (b"cdev", "Control Panel"),
          (b"FFIL", "Font")]
+# The padlock beside Name while the window is view-only: solid body, white
+# keyhole (the transparency behind it), close to the one System 6 drew.
+LOCK = [
+    "..#####..",
+    "..#...#..",
+    "..#...#..",
+    "..#...#..",
+    "#########",
+    "#########",
+    "#########",
+    "####.####",
+    "###...###",
+    "#########",
+    "#########",
+]
 
 
 @dataclass(frozen=True)
 class FinderOptions:
     """How applications are launched from the window, from the command
     line: view shows them from their resources without running them,
-    trace logs the traps they call, memory is their size in bytes."""
+    trace logs the traps they call, memory is their size in bytes.
+    writable is about the window itself: while it is False — always,
+    until Finder Windows can be written from here — the list is
+    view-only and the header shows the lock."""
     view: bool = False
     trace: bool = False
     memory: int | None = None
+    writable: bool = False
 
 
 def _kind(f: MacFile) -> str:
@@ -75,6 +99,17 @@ def _icon_for(f: MacFile) -> str:
     if f.type == FOLDER:
         return "folder"
     return "application" if f.is_application else "document"
+
+
+def _lock() -> QIcon:
+    """The header's padlock: the list may be looked at, not changed."""
+    w, h = theme.bitmap_size(LOCK)
+    pm = QPixmap(w, h)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    theme.draw_bitmap(p, 0, 0, LOCK)
+    p.end()
+    return QIcon(pm)
 
 
 class FinderWindow(_Hosted):
@@ -102,6 +137,8 @@ class FinderWindow(_Hosted):
         self.tree.setUniformRowHeights(True)
         self.tree.setIconSize(QSize(16, 16))
         self.tree.setHeaderLabels(["Name", "Size", "Kind"])
+        if not self.options.writable:      # view-only: the lock beside Name
+            self.tree.headerItem().setIcon(0, _lock())
         header = self.tree.header()
         header.setFont(theme.title_font())
         header.setStretchLastSection(False)
