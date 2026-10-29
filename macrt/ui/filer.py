@@ -1,5 +1,5 @@
 """
-macrt.ui.finder - A System 6 Finder window over a disk image's folder.
+macrt.ui.filer - A System 6 Filer window over a disk image's folder.
 
 When a disk image is named on the command line with no --app, the Display
 opens this instead of running the image's first application: a window with
@@ -8,12 +8,12 @@ close box — listing the folder's contents.  Double-clicking an
 application runs it, a document opens it with the application that made
 it, and a folder opens a window of its own.  The window stays open, so
 several applications can be started from one, and its close box closes
-it like a real Finder window's.
+it like a real Filer window's.
 
 Nothing here writes back to the disk: the window only lists what the
 folder already holds, so its header wears the padlock System 6 showed
 beside Name on a locked disk — that the list may be looked at, not
-changed.  FinderOptions.writable is how a window says otherwise.
+changed.  FilerOptions.writable is how a window says otherwise.
 """
 
 from __future__ import annotations
@@ -100,12 +100,12 @@ CONTAINER_ICONS = {"volume": DISK_ICON, "folder": FOLDER_ICON,
 
 
 @dataclass(frozen=True)
-class FinderOptions:
+class FilerOptions:
     """How applications are launched from the window, from the command
     line: view shows them from their resources without running them,
     trace logs the traps they call, memory is their size in bytes.
     writable is about the window itself: while it is False — always,
-    until Finder Windows can be written from here — the list is
+    until Filer Windows can be written from here — the list is
     view-only and the header shows the lock."""
     view: bool = False
     trace: bool = False
@@ -244,18 +244,18 @@ class _ListHeader(QHeaderView):
                              | Qt.AlignmentFlag.AlignVCenter), text)
 
 
-class FinderWindow(_Hosted):
+class FilerWindow(_Hosted):
     """One folder's window: its contents listed, ready to open.  Its
     title bar wears an icon of the container it lists — the disk image
     at the root, a folder inside — the container's own when it has one."""
 
     def __init__(self, display: Display, volume: machfs.Volume,
-                 path: tuple[str, ...] = (), options: FinderOptions | None = None,
+                 path: tuple[str, ...] = (), options: FilerOptions | None = None,
                  parent: QWidget | None = None):
         super().__init__(display, parent)
         self.volume = volume
         self.path = path
-        self.options = options or FinderOptions()
+        self.options = options or FilerOptions()
         self._title_icon = _container_icon(volume, path)
         self.setWindowTitle(self.path[-1] if self.path else self.volume.name)
         self._hilited = True
@@ -383,12 +383,12 @@ class FinderWindow(_Hosted):
 
     def _close_box_done(self, closed) -> None:
         if closed:
-            self.display.close_finder(self)
+            self.display.close_filer(self)
 
     def closeEvent(self, event):  # noqa: N802
         event.accept()
         if not self.display.shutting_down:
-            self.display.close_finder(self)
+            self.display.close_filer(self)
 
     # -- activation, so the pinstripes and close box show when it's front --
     def _set_hilited(self, hilited: bool) -> None:
@@ -427,7 +427,7 @@ class FinderWindow(_Hosted):
         if f is None:
             return
         if f.type == FOLDER:
-            self.display.open_finder(self.volume, self.path + (f.name,), self.options)
+            self.display.open_filer(self.volume, self.path + (f.name,), self.options)
             return
         self._open(f)
 
