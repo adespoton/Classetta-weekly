@@ -47,7 +47,8 @@ def test_numbers_and_text_coerce_to_each_other():
     for dtype, data, to in [(b"long", struct.pack(">l", 70000), b"shor"),     # too big
                             (b"long", struct.pack(">l", 2), b"bool"),
                             (b"TEXT", b"--12", b"long"), (b"TEXT", b"1_2", b"long"),
-                            (b"TEXT", b"twelve", b"long"), (b"long", bytes(4), b"type")]:
+                            (b"TEXT", b"twelve", b"long"), (b"long", bytes(4), b"type"),
+                            (b"TEXT", b"7" * 5000, b"long")]:           # too long to read
         assert coerce(t, dtype, data, to) is None, (dtype, data, to)
 
 

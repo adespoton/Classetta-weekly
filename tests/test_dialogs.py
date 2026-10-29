@@ -244,7 +244,7 @@ def test_modal_dialog_leaves_high_level_events_to_the_application(qapp, monkeypa
 
 class NoDisplay:
     """A display that shows nothing: windows are placed where they say."""
-    bridge = SimpleNamespace(call=lambda fn, *args, serve=None: fn(*args),
+    bridge = SimpleNamespace(call=lambda fn, *args, serve=None, killed=None: fn(*args),
                              post=lambda fn, *args: None)
     views: dict = {}
 
@@ -254,6 +254,24 @@ class NoDisplay:
 
     def __getattr__(self, name):
         return lambda *args, **kwargs: None
+
+
+def test_a_dialog_or_alert_with_no_room_leaves_no_item_list(qapp, monkeypatch):
+    items = ditl((ctrlItem + btnCtrl, (70, 230, 90, 290), b"OK"))
+    g = Guest([Resource(b"DITL", 300, items),
+               Resource(b"DLOG", 300, dlog((40, 40, 140, 340), "", 300)),
+               Resource(b"ALRT", 300, alrt((40, 40, 140, 340), 300))])
+    g.tb._d = NoDisplay()
+    lists = []
+
+    def no_room(t, *args, **kwargs):
+        lists.append(args[8])                   # item_list
+        return None
+    monkeypatch.setattr(glue_dialogs, "new_dialog", no_room)
+    assert g("GetNewDialog", 300, 0, -1) == 0
+    assert len(lists) == 1 and not g.heap.is_handle(lists[0])
+    assert g("Alert", 300, 0) == -1
+    assert len(lists) == 2 and not g.heap.is_handle(lists[1])
 
 
 def test_dialogs_with_colour_tables_are_colour_ones(qapp, monkeypatch):

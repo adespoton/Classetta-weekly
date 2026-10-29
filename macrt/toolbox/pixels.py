@@ -12,11 +12,11 @@ that isn't in the table writes the nearest that is, as Qt finds it.
 
 from __future__ import annotations
 
+import sys
 from array import array
-from functools import lru_cache
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QImage
+from PyQt6.QtGui import QImage, QPainter
 
 WHITE_RGB = 0xFFFFFFFF
 BLACK_RGB = 0xFF000000
@@ -25,36 +25,42 @@ DEPTHS = (1, 2, 4, 8, 16, 32)
 _THRESHOLD = Qt.ImageConversionFlag.ThresholdDither
 
 
-@lru_cache(maxsize=None)
-def _spread(depth: int) -> bytes:
-    """For each byte of depth-bit pixels, its pixels a byte each."""
-    n = 8 // depth
+def _places(depth: int, unpack: bool) -> list[bytes]:
+    """For each place of a depth-bit pixel in a byte, leftmost first, a
+    table for bytes.translate: from a byte, the pixel there (unpack), or
+    from a pixel value, its low bits in that place."""
     mask = (1 << depth) - 1
-    return b"".join(bytes((b >> (8 - depth * (i + 1))) & mask for i in range(n))
-                    for b in range(256))
+    shifts = range(8 - depth, -1, -depth)
+    if unpack:
+        return [bytes(b >> s & mask for b in range(256)) for s in shifts]
+    return [bytes((v & mask) << s for v in range(256)) for s in shifts]
+
+
+_PIXELS = {depth: _places(depth, True) for depth in (2, 4)}
+_PLACED = {depth: _places(depth, False) for depth in (2, 4)}
 
 
 def _unpack(data: bytes, depth: int) -> bytes:
     """2- or 4-bit pixels a byte each."""
     n = 8 // depth
-    table = _spread(depth)
-    return b"".join([table[b * n:b * n + n] for b in data])
-
-
-_LOW_BITS = {depth: bytes(i & (1 << depth) - 1 for i in range(256)) for depth in (2, 4)}
+    out = bytearray(len(data) * n)
+    for i, pixel in enumerate(_PIXELS[depth]):
+        out[i::n] = data.translate(pixel)
+    return bytes(out)
 
 
 def _pack(data: bytes, depth: int) -> bytes:
     """Bytes of pixel values packed depth bits each: each value's low
-    bits (a Qt image's rows are padded with bytes it leaves as they were)."""
+    bits (a Qt image's rows are padded with bytes it leaves as they were).
+    Each place's bits are put in place by a table and the places joined
+    as one number, the pixels' bits never overlapping."""
     n = 8 // depth
-    data = data.translate(_LOW_BITS[depth])
     if len(data) % n:
-        data += bytes(n - len(data) % n)
-    planes = [data[i::n] for i in range(n)]
-    if n == 2:
-        return bytes(a << 4 | b for a, b in zip(*planes))
-    return bytes(a << 6 | b << 4 | c << 2 | d for a, b, c, d in zip(*planes))
+        data = bytes(data) + bytes(n - len(data) % n)
+    packed = 0
+    for i, placed in enumerate(_PLACED[depth]):
+        packed |= int.from_bytes(data[i::n].translate(placed), "big")
+    return packed.to_bytes(len(data) // n, "big")
 
 
 def _swapped(data: bytes, size: int) -> bytes:
@@ -65,9 +71,31 @@ def _swapped(data: bytes, size: int) -> bytes:
     return words.tobytes()
 
 
+_GREY_READY = (QImage.Format.Format_RGB32, QImage.Format.Format_ARGB32,
+               QImage.Format.Format_ARGB32_Premultiplied)
+
+
+def mono(img: QImage) -> QImage:
+    """img as a 1-bit image in MONO_TABLE, each pixel the nearer of white
+    (0) and black (1), as Qt matches a colour to a table.  Where every
+    pixel is a grey, Qt's own threshold makes the same choice (black below
+    128) far more quickly than matching each pixel.  (Qt keeps a 1-bit
+    image's values as they are, whatever its table's colours.)"""
+    if img.format() not in _GREY_READY and img.colorTable() != MONO_TABLE:
+        img = img.convertToFormat(QImage.Format.Format_ARGB32)
+    if img.format() in _GREY_READY and img.allGray():
+        return img.convertToFormat(QImage.Format.Format_Mono, _THRESHOLD)
+    return img.convertToFormat(QImage.Format.Format_Mono, MONO_TABLE, _THRESHOLD)
+
+
 def decode(data: bytes, width: int, height: int, row_bytes: int, depth: int,
            table: list[int] | None = None) -> QImage:
     """Rows of pixels, row_bytes apart, as an RGB32 image width pixels wide."""
+    if depth > 8 and row_bytes % (depth // 8):
+        # rows that end part-way into a pixel: each row's whole pixels
+        n = width * depth // 8
+        data = b"".join(data[y * row_bytes:y * row_bytes + n] for y in range(height))
+        row_bytes = n
     if depth == 1:
         img = QImage(data, width, height, row_bytes, QImage.Format.Format_Mono)
         img.setColorTable(table or MONO_TABLE)
@@ -92,16 +120,27 @@ def _full(table: list[int] | None, depth: int) -> list[int]:
     return table + [BLACK_RGB] * (n - len(table))
 
 
-def encode(img: QImage, depth: int, table: list[int] | None = None) -> tuple[bytes, int]:
+def encode(img: QImage, depth: int, table: list[int] | None = None,
+           match: list[int] | None = None) -> tuple[bytes, int]:
     """img's pixels at depth: the bytes, and how many there are a row
     (rows padded as Qt pads them, to 4 bytes; a 2- or 4-bit image's rows
-    are packed from its 8-bit ones, so as long as they need be)."""
+    are packed from its 8-bit ones, so as long as they need be).  Given
+    match, table's colours with those of values no colour is matched to
+    made another's (Devices.matching), a pixel is written as one of those
+    values only if it's exactly that value's colour in table, and if not
+    as the nearest of match's (see _matched)."""
     if depth == 1:
-        out = img.convertToFormat(QImage.Format.Format_Mono, table or MONO_TABLE, _THRESHOLD)
+        if table is None or table == MONO_TABLE:
+            out = mono(img)
+        else:
+            out = img.convertToFormat(QImage.Format.Format_Mono, table, _THRESHOLD)
         return raw(out), out.bytesPerLine()
     if depth <= 8:
-        out = img.convertToFormat(QImage.Format.Format_Indexed8, _full(table, depth), _THRESHOLD)
+        full = _full(table, depth)
+        out = img.convertToFormat(QImage.Format.Format_Indexed8, full, _THRESHOLD)
         data, bpl = raw(out), out.bytesPerLine()
+        if match is not None and match is not table:
+            data = _matched(img, data, bpl, full, _full(match, depth))
         if depth == 8:
             return data, bpl
         return _pack(data, depth), bpl * depth // 8
@@ -110,6 +149,57 @@ def encode(img: QImage, depth: int, table: list[int] | None = None) -> tuple[byt
         return _swapped(raw(out), 2), out.bytesPerLine()
     out = img.convertToFormat(QImage.Format.Format_RGB32)
     return _swapped(raw(out), 4), out.bytesPerLine()
+
+
+_NONZERO = bytes([0]) + bytes([1]) * 255       # each byte, 1 if it isn't 0
+_ONES = bytes([0, 0xFF]) + bytes(254)          # 1, all ones
+_RGB = 0 if sys.byteorder == "little" else 1   # where an RGB32 pixel's colour bytes start
+_EXACT = (0xFF000000).to_bytes(4, sys.byteorder)
+
+
+def _matched(img: QImage, data: bytes, bpl: int, table: list[int], match: list[int]) -> bytes:
+    """data, img's pixels as the values of table's colours nearest theirs
+    (8 bits each, bpl a row), with each that is a value match leaves out
+    (whose colour isn't table's) but isn't exactly that colour written as
+    the nearest of match's instead.  The screen's entries reserved for
+    animation are kept as colours unlike any other (gdevice.apart): a
+    pixel drawn in one is that colour, and has to be written as its
+    value, to change as it does; a colour copied from a PixMap of other
+    colours is matched, as Color QuickDraw matches it, to the others."""
+    kept = bytes(a != b for a, b in zip(table, match)).ljust(256, b"\0")
+    hit = data.translate(kept)
+    if 1 not in hit:
+        return data
+    w, h = img.width(), img.height()
+    shown = QImage(data, w, h, bpl, QImage.Format.Format_Indexed8)
+    shown.setColorTable(table)
+    x = shown.convertToFormat(QImage.Format.Format_RGB32)
+    p = QPainter(x)
+    p.setCompositionMode(QPainter.CompositionMode.RasterOp_SourceXorDestination)
+    p.drawImage(0, 0, img)
+    p.end()
+    x = raw(x)                  # a pixel's colour 0 where it's exactly what it's written as
+    rb, exact = 4 * w, _EXACT * w
+    need = [y for y in range(h)
+            if x[y * rb:y * rb + rb] != exact and 1 in hit[y * bpl:y * bpl + w]]
+    if not need:
+        return data
+    top, bottom = need[0], need[-1] + 1
+    rows, lo, hi = bottom - top, top * bpl, bottom * bpl
+    x = x[top * rb:bottom * rb].translate(_NONZERO)
+    differ = (int.from_bytes(x[_RGB::4], "big") | int.from_bytes(x[_RGB + 1::4], "big")
+              | int.from_bytes(x[_RGB + 2::4], "big")).to_bytes(rows * w, "big")
+    if bpl != w:
+        pad = bytes(bpl - w)
+        differ = b"".join([differ[y * w:y * w + w] + pad for y in range(rows)])
+    redo = int.from_bytes(hit[lo:hi], "big") & int.from_bytes(differ, "big")
+    if not redo:
+        return data
+    mask = int.from_bytes(redo.to_bytes(hi - lo, "big").translate(_ONES), "big")
+    band = img.copy(0, top, w, rows)
+    other = raw(band.convertToFormat(QImage.Format.Format_Indexed8, match, _THRESHOLD))
+    part = int.from_bytes(data[lo:hi], "big") & ~mask | int.from_bytes(other, "big") & mask
+    return data[:lo] + part.to_bytes(hi - lo, "big") + data[hi:]
 
 
 def raw(img: QImage) -> bytes:

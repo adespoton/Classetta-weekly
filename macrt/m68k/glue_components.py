@@ -138,23 +138,16 @@ def _description(t, p: int) -> tuple:
     return DESC.unpack(t.mem.read(p & ADDRESS_MASK, DESC.size))
 
 
-def _heap(t, h: int):
-    try:
-        return t.system.heap_of(h)
-    except ValueError:
-        return None
-
-
 def _handle_bytes(t, h: int) -> bytes:
     h &= ADDRESS_MASK
-    heap = _heap(t, h) if h else None
+    heap = t.system.find_heap(h) if h else None
     p = t.mem.r32(h) & ADDRESS_MASK if heap is not None else 0
     return t.mem.read(p, heap.handle_size(h)) if p else b""
 
 
 def _fill(t, h: int, data: bytes) -> None:
     """The handle made to hold data, emptied or not as it was."""
-    heap = _heap(t, h)
+    heap = t.system.find_heap(h)
     if heap is None:
         return
     resized = (heap.set_handle_size(h, len(data)) if heap.deref(h)
@@ -344,6 +337,7 @@ def _register(t, comp: Component, flags: int) -> int:
         fields = 4 if comp.register_flags & componentAutoVersionIncludeFlags else 3
         same = [c for c in visible if c.desc[:fields] == comp.desc[:fields]]
         if any(c.version > comp.version for c in same):
+            _free_code(comp)                # loaded to be asked its version
             return 0
         older = [c for c in same if c.version < comp.version]
     if comp.desc[3] & cmpWantsRegisterMessage:

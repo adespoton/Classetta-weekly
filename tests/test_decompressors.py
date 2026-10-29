@@ -11,7 +11,7 @@ from guest import Processor
 
 from macrt.m68k import decompressors, dispatch, segload
 from macrt.macfile import MacFile, load_volume, system_on
-from macrt.resfork import Resource, build_fork, resCompressed
+from macrt.resfork import Resource, build_fork, open_fork, resCompressed, resPurgeable
 from macrt.toolbox import resources as rm
 from macrt.toolbox.system import LAST_SYSTEM_7, SYSTEM_VERSION, System, system_version
 
@@ -108,9 +108,40 @@ def test_an_expanded_resource_is_kept(qapp):
     assert g.contents(res.GetResource("TEXT", 129)) == g.contents(again) and len(calls) == 1
 
 
+def test_a_purgeable_dcmp_is_locked_before_its_buffers_are_made(qapp):
+    """Made with a purgeable 'dcmp' unlocked, the buffers it runs with
+    could purge it, and leave it to run from address 0."""
+    data = bytes(range(256)) * 8
+    g, res = runner(Resource(b"dcmp", 200, DOUBLE_9, None, resPurgeable),
+                    Resource(b"TEXT", 128, compressed(9, 200, data), None, resCompressed))
+    heap = g.process.heap
+    d = res.GetResource("dcmp", 200)
+    state = heap.get_state(d)
+    heap.grow(heap.limit)
+    full = []
+    while heap.max_block(grow=False) >= 64:
+        full.append(heap.new_ptr(min(heap.max_block(grow=False) - 16, 0x10000)))
+        assert full[-1]
+    heap.dispose_ptr(full.pop())            # room for the buffers only without the dcmp
+    need = len(compressed(9, 200, data)) + 2 * len(data)
+    assert heap.new_ptr(heap.max_block(grow=False) - need + len(DOUBLE_9) // 2 - 16)
+    h = res.GetResource("TEXT", 128)
+    assert g.contents(h) == bytes(b for b in data for _ in "xx")
+    assert g.mem.r32(d) and heap.get_state(d) == state
+
+
 def test_without_its_dcmp_a_resource_wont_expand(qapp):
     g, res = runner(Resource(b"TEXT", 128, compressed(9, 200), None, resCompressed))
     assert res.GetResource("TEXT", 128) == 0 and res.ResError() == rm.CantDecompress
+
+
+def test_a_dcmp_past_the_end_of_its_fork_isnt_run(qapp):
+    g, res = runner()
+    fork = bytearray(build_fork([Resource(b"dcmp", 200, DOUBLE_9)]))
+    at = struct.unpack_from(">I", fork)[0] + open_fork(bytes(fork)).find(b"dcmp", 200).offset
+    fork[at:at + 4] = struct.pack(">I", 0x7FFFFF)
+    g.call = None                       # not to be called
+    assert decompressors.expand(g, compressed(9, 200), bytes(fork)) is None
 
 
 def test_a_dcmp_isnt_run_from_another_thread(qapp):
@@ -201,3 +232,12 @@ def test_a_compressed_code_0_is_expanded(monkeypatch):
     monkeypatch.setattr(segload, "decompress", lambda data: code0)
     layout = segload.code0(app(compressed(9, 0)))
     assert (layout.above_a5, layout.jt_offset, layout.jump_table) == (0x28, 0x20, entry)
+
+
+def test_a_code_0_past_the_end_of_its_fork_cant_be_launched():
+    fork = bytearray(build_fork([Resource(b"CODE", 0, bytes(24))]))
+    data_at = struct.unpack_from(">I", fork)[0]
+    at = data_at + open_fork(bytes(fork)).find(b"CODE", 0).offset
+    fork[at:at + 4] = struct.pack(">I", 0x7FFFFF)        # its length, past the fork's end
+    with pytest.raises(segload.SegmentError, match="can't be read"):
+        segload.code0(MacFile("App", type=b"APPL", rsrc=bytes(fork)))

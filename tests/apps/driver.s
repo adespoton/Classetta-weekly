@@ -161,15 +161,15 @@ completion:
         movea.l (sp)+, a5
         rts
 
-| Each tick until the control call in CPB is going, then a status call to finish it.
+| Each tick, a status call to finish the control call in CPB while it's
+| going: the first can come before the driver's control routine has it.
 task:
-        cmpi.w  #1, CPB-TASK+ioResult(a0)
-        beq.s   1f
         move.w  #1, 10(a0)
-        rts
-1:      lea     SPB-TASK(a0), a0
+        cmpi.w  #1, CPB-TASK+ioResult(a0)
+        bne.s   1f
+        lea     SPB-TASK(a0), a0
         _StatusImmed
-        rts
+1:      rts
 
 echo:   .byte   5
         .ascii  ".Echo"

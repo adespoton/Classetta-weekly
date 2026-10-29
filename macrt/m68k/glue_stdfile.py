@@ -173,11 +173,10 @@ class Custom:
         if not item_list:
             if not hook:
                 return None
-            data_ = _standard_items(numbers)
-            item_list = t.process.heap.new_handle(len(data_))
+            data_ = _standard_items(numbers, b"Save" if put else b"Open")
+            item_list = t.process.heap.new_handle_with(data_)
             if not item_list:
                 return None
-            t.mem.write(t.process.heap.deref(item_list), data_)
             bounds, proc_id, go_away, ref_con, title = Rect(0, 0, 200, 348), 1, False, 0, ""
         w = dm.new_dialog(t, 0, bounds, title, False, proc_id, dm.IN_FRONT, go_away,
                           sfMainDialogRefCon if new else ref_con, item_list)
@@ -194,13 +193,11 @@ class Custom:
                  ok: bytes = b"Open") -> Custom | None:
         """A dialog with a hook that's told the item offset, as the Edition
         Manager's are: the standard items (Standard File's, or as numbers
-        says), then the items of DITL ditl_id, kept where they are to each
-        other, at the bottom."""
+        says), then the items of DITL ditl_id (none if there's no such DITL),
+        kept where they are to each other, at the bottom."""
         hook &= ADDRESS_MASK
         h = t.process.resources.GetResource("DITL", ditl_id) if ditl_id else 0
         expansion = t.tb.contents(h) if h else b""
-        if not hook and not expansion:
-            return None
         data_ = _standard_items(numbers, ok)
         item_list = t.process.heap.new_handle(len(data_))
         if not item_list:
@@ -351,7 +348,6 @@ class Custom:
         all of it meanwhile."""
         t, w = self.t, self.w
         surfaces = t.tb.qd.surfaces
-        before = surfaces.get(w.addr)
         vis = w.vis_rgn & ADDRESS_MASK
         kept = read_rgn(t.mem, vis) if vis else None
         if vis:
@@ -360,10 +356,7 @@ class Custom:
         try:
             yield
         finally:
-            if before is None:
-                surfaces.pop(w.addr, None)
-            else:
-                surfaces[w.addr] = before
+            surfaces.pop(w.addr, None)          # (the dialog is never shown: it had none)
             if kept is not None:
                 write_rgn(t.system.heap_of(vis), vis, kept)
 

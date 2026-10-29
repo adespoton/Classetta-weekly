@@ -218,6 +218,14 @@ class Heap:
             self.error = noErr
             return mp
 
+    def new_handle_with(self, data: bytes) -> int:
+        """A relocatable block holding a copy of data; 0, with memFullErr,
+        if there isn't room."""
+        h = self.new_handle(len(data))
+        if h:
+            self.mem.write(self.deref(h), data)
+        return h
+
     def new_empty_handle(self) -> int:
         with self._lock:
             mp = self._master()
@@ -467,6 +475,17 @@ class Heap:
             flags = self.mem.r8(h)
             if self.is_handle(h) and flags & PURGEABLE and not flags & LOCKED:
                 self.empty_handle(h)
+
+    def purge_for(self, size: int | None = None) -> bool:
+        """PurgeMem: purge the unlocked purgeable blocks, lowest first, until
+        a block of size could be had without moving any, or every one of
+        them if size is None (MaxMem); whether one could."""
+        with self._lock:
+            for h in self._purgeable(0):
+                if size is not None and self.max_block() >= size:
+                    break
+                self.empty_handle(h)
+            return size is None or self.max_block() >= size
 
     # =====================================================================
     # Internals

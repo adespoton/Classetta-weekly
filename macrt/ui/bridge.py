@@ -42,12 +42,15 @@ class GuiBridge(QObject):
         if not self.closed:
             self._invoke.emit(lambda: fn(*args))
 
-    def call(self, fn: Callable, *args: Any, serve: Callable | None = None) -> Any:
+    def call(self, fn: Callable, *args: Any, serve: Callable | None = None,
+             killed: Callable[[], bool] | None = None) -> Any:
         """Run fn on the GUI thread and wait for its result.
 
         With serve, fn gets one more argument, ask: ask(*a) has this
         thread run serve(*a) while it waits, and returns a Future for
-        what serve returns."""
+        what serve returns.  With killed, the wait ends in ProcessKilled
+        as soon as killed() is true: an application stopped while it
+        follows the mouse, which may be a while yet."""
         if self.on_gui_thread():
             result = fn(*args)
             if isinstance(result, Future):
@@ -73,27 +76,31 @@ class GuiBridge(QObject):
                 fut.set_exception(e)
 
         self._invoke.emit(job)
-        result = self._wait(fut, jobs, serve)
+        result = self._wait(fut, jobs, serve, killed)
         if isinstance(result, Future):
-            result = self._wait(result, jobs, serve)
+            result = self._wait(result, jobs, serve, killed)
         return result
 
     def _wait(self, fut: Future, jobs: queue.SimpleQueue | None = None,
-              serve: Callable | None = None) -> Any:
+              serve: Callable | None = None,
+              killed: Callable[[], bool] | None = None) -> Any:
+        def stopped() -> bool:
+            return self.closed or killed is not None and killed()
+
         if jobs is None:
             while True:
                 try:
                     return fut.result(timeout=0.1)
                 except TimeoutError:
-                    if self.closed:
+                    if stopped():
                         raise ProcessKilled() from None
         fut.add_done_callback(lambda _: jobs.put(None))
         while True:
+            if stopped():                   # even with the tracker asking all the while
+                raise ProcessKilled()
             try:
                 job = jobs.get(timeout=0.1)
             except queue.Empty:
-                if self.closed:
-                    raise ProcessKilled() from None
                 continue
             if job is None:
                 if fut.done():

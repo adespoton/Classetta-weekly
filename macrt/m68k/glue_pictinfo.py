@@ -32,7 +32,8 @@ from .dispatch import trap
 from .glue_color import GetCTSeed
 from .glue_palette import _fill, _new_palette, _record, pmTolerant
 from .glue_pict import _picture_heap
-from .glue_toolbox import _port, family_name, family_named
+from .glue_common import _port
+from .glue_fonts import family_name, family_named
 
 log = logging.getLogger("macrt.pictinfo")
 
@@ -77,14 +78,6 @@ def _check(t, verb: int, colors: int, method: int, version: int) -> int:
     return noErr
 
 
-def _new_handle(t, data: bytes) -> int:
-    heap = t.process.heap
-    h = heap.new_handle(len(data))
-    if h:
-        t.mem.write(heap.deref(h), data)
-    return h
-
-
 def _fonts(t, survey: Survey) -> tuple[bytes, bytes]:
     """The FontSpec records and the font names they point into, each a
     Pascal string."""
@@ -102,20 +95,34 @@ def _fonts(t, survey: Survey) -> tuple[bytes, bytes]:
 
 def _write(t, p: int, survey: Survey, verb: int, colors: int, method: int,
            pixels_only: bool = False) -> int:
-    """Fill in the PictInfo record at p."""
+    """Fill in the PictInfo record at p.  With no room for one of its
+    handles, it's memFullErr, the record as it was and the handles already
+    made disposed of."""
+    heap = t.process.heap
+    made: list[int] = []
+
+    def kept(h: int) -> int:
+        if h:
+            made.append(h)
+        return h
+
+    def no_room() -> int:
+        for h in made:
+            heap.dispose_handle(h)
+        return memFullErr
     palette = ctab = comments_h = fonts_h = names_h = 0
     color_qd = t.system.devices is not None
     if color_qd and verb & (returnColorTable | returnPalette):
         picked = survey.pick(colors, method, not verb & suppressBlackAndWhite)
         if verb & returnColorTable:
             padded = picked + [(0, 0, 0)] * (colors - len(picked))
-            ctab = _new_handle(t, color_table(padded, GetCTSeed(t)))
+            ctab = kept(heap.new_handle_with(color_table(padded, GetCTSeed(t))))
             if not ctab:
-                return memFullErr
+                return no_room()
         if verb & returnPalette:
-            palette = _new_palette(t, len(picked))
+            palette = kept(_new_palette(t, len(picked)))
             if not palette:
-                return memFullErr
+                return no_room()
             _fill(t, _record(t, palette), picked, pmTolerant, 0)
     counts = dict(survey.counts)
     unique_comments = unique_fonts = 0
@@ -124,16 +131,16 @@ def _write(t, p: int, survey: Survey, verb: int, colors: int, method: int,
     else:
         counts["comment"] = sum(survey.comments.values())
         unique_comments = len(survey.comments)
-        comments_h = _new_handle(t, b"".join(struct.pack(">hh", min(n, 0x7FFF), kind)
-                                             for kind, n in survey.comments.items()))
+        comments_h = kept(heap.new_handle_with(b"".join(
+            struct.pack(">hh", min(n, 0x7FFF), kind) for kind, n in survey.comments.items())))
         if not comments_h:
-            return memFullErr
+            return no_room()
     if not pixels_only and verb & recordFontInfo:
         specs, names = _fonts(t, survey)
         unique_fonts = len(survey.fonts)
-        fonts_h, names_h = _new_handle(t, specs), _new_handle(t, names)
+        fonts_h, names_h = (kept(heap.new_handle_with(x)) for x in (specs, names))
         if not fonts_h or not names_h:
-            return memFullErr
+            return no_room()
     width, height = survey.size
     t.mem.write(p, PICT_INFO.pack(
         0, len(survey.colors), palette, ctab, survey.h_res, survey.v_res, max(survey.depth, 1),

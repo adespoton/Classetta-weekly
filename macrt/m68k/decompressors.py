@@ -81,10 +81,10 @@ def expand(t, data: bytes, fork: bytes | None = None) -> bytes | None:
         return _run(t, data, header, h) if h and t.mem.r32(h) else None
     try:
         fm = open_fork(fork)
+        entry = fm.find(b"dcmp", dcmp_id)
+        code = fm.raw(entry) if entry is not None else b""
     except InvalidForkError:
         return None
-    entry = fm.find(b"dcmp", dcmp_id)
-    code = fm.raw(entry) if entry is not None else b""
     heap = t.process.heap
     h = heap.new_handle(len(code)) if code and code[:4] != COMPRESSED_TAG else 0
     if not h:
@@ -105,30 +105,26 @@ def _run(t, data: bytes, header: tuple[int, int, int, int], h: int) -> bytes | N
     sizes = [len(data), size + extra]
     if version == 8:
         sizes.append(max(size, length + length * data[12] // 256))
+    state = heap.get_state(h)
+    heap.lock(h)                # locked first, so making the buffers can't purge it
     buffers = []
-    for n in sizes:
-        p = t.process.heap.new_ptr(n) or sys_heap.new_ptr(n)
-        if not p:
-            break
-        buffers.append(p)
     try:
-        if len(buffers) < len(sizes):
-            return None
-        state = heap.get_state(h)
-        heap.lock(h)
-        try:
-            code = heap.deref(h)
-            entry = code if t.mem.r32(code + 4) == DCMP else code + t.mem.r16(code + 2)
-            src, dest = buffers[:2]
-            t.mem.write(src, data)
-            if version == 8:
-                t.call(entry, (("p", src + HEADER), ("p", dest), ("p", buffers[2]),
-                               ("l", length)))
-            else:
-                t.call(entry, (("l", length), ("p", src + HEADER), ("p", dest), ("p", src)))
-            return t.mem.read(dest, size)
-        finally:
-            heap.set_state(h, state)
+        for n in sizes:
+            p = t.process.heap.new_ptr(n) or sys_heap.new_ptr(n)
+            if not p:
+                return None
+            buffers.append(p)
+        code = heap.deref(h)
+        entry = code if t.mem.r32(code + 4) == DCMP else code + t.mem.r16(code + 2)
+        src, dest = buffers[:2]
+        t.mem.write(src, data)
+        if version == 8:
+            t.call(entry, (("p", src + HEADER), ("p", dest), ("p", buffers[2]),
+                           ("l", length)))
+        else:
+            t.call(entry, (("l", length), ("p", src + HEADER), ("p", dest), ("p", src)))
+        return t.mem.read(dest, size)
     finally:
+        heap.set_state(h, state)
         for p in buffers:
             t.system.heap_of(p).dispose_ptr(p)

@@ -4,6 +4,7 @@ resources, played through the sound buffer."""
 
 import math
 import struct
+import time
 
 import pytest
 
@@ -97,7 +98,18 @@ def test_a_snd_resource_s_synthesizer_and_commands():
     # An instrument, with notes for it, isn't.
     notes = struct.pack(">hhh", 2, 0, 2) + command(sound_cmd, 0, 22) + command(sm.noteCmd, 960, 60)
     assert len(sm.parse_snd(notes)[2]) == 2
+    # Past the last note, the first soundCmd is
+    after = struct.pack(">hhh", 2, 0, 4) + command(sound_cmd, 0, 22) + \
+        command(sm.noteCmd, 960, 60) + command(sm.restCmd, 0, 0) + command(sound_cmd, 0, 30)
+    assert sm.parse_snd(after)[2][-2:] == [(sound_cmd, 0, 30),
+                                           (sm.bufferCmd | sm.dataPointerFlag, 0, 30)]
     assert sm.parse_snd(b"snd") is None and sm.parse_snd(struct.pack(">hh", 3, 0)) is None
+    # in time that grows with the commands, not their square
+    many = struct.pack(">hhh", 2, 0, 8000) + command(sound_cmd, 0, 30) * 7999 + \
+        command(sm.noteCmd, 960, 60)
+    start = time.perf_counter()
+    assert len(sm.parse_snd(many)[2]) == 8000
+    assert time.perf_counter() - start < 1
 
 
 def test_a_sound_header_s_samples(g):
@@ -189,6 +201,17 @@ def test_a_full_queue(g):
     assert g("SndDisposeChannel", own, True) == 0
     assert g.heap.ptr_size(own) == 52                        # the program's own, still
     assert do(g, own, sm.waitCmd, 100) == sm.badChannel
+
+
+def test_there_are_only_so_many_channels(g):
+    """DeadEnd counts the channels it can have by asking for one more until
+    SndNewChannel refuses."""
+    chans = [channel(g) for _ in range(sm.MAX_CHANNELS)]
+    out = g.ptr(bytes(4))
+    assert g("SndNewChannel", out, sm.sampledSynth, 0, 0) == sm.notEnoughHardware
+    assert g.mem.r32(out) == 0
+    assert g("SndDisposeChannel", chans.pop(), True) == 0
+    assert g("SndNewChannel", out, sm.sampledSynth, 0, 0) == 0
 
 
 def test_immediate_commands_go_ahead_of_the_queue(g):
@@ -563,6 +586,9 @@ def test_an_aiff_file_s_samples():
     assert sm.parse_aiff(aiff(bytes(10), compression=b"ABCD")) == sm.siInvalidCompression
     assert sm.parse_aiff(b"RIFF" + bytes(20)) == sm.badFileFormat
     assert sm.parse_aiff(b"FORM\x00\x00\x00\x04AIFF") == sm.badFileFormat     # no COMM
+    rate = extended(sm.MAC_RATE)
+    for bad in (struct.pack(">HQ", 0x7FFF, 1 << 63), struct.pack(">HQ", 0x7FFF, 3 << 62)):
+        assert sm.parse_aiff(aiff(bytes(10)).replace(rate, bad)) == sm.badFileFormat  # ∞, NaN
 
 
 def open_file(g, data: bytes) -> int:

@@ -206,8 +206,6 @@ def _report_gui_error(etype, value, tb) -> None:
 class Display(QObject):
     def __init__(self, config: DisplayConfig | None = None):
         super().__init__()
-        if sys.excepthook is sys.__excepthook__:
-            sys.excepthook = _report_gui_error
         self.config = config or DisplayConfig()
         self.bridge = GuiBridge()
         self.input = InputState()
@@ -281,6 +279,9 @@ class Display(QObject):
             # The bar the Finder would have left in the screen buffer, for
             # a game that draws over it with no InitMenus (MacLanding).
             self.system.screen.bar_drawn(self.global_bar.image())
+        # Only once it's built: what goes wrong building it isn't in a slot
+        if sys.excepthook is sys.__excepthook__:
+            sys.excepthook = _report_gui_error
 
     # =====================================================================
     # Lifecycle
@@ -379,11 +380,15 @@ class Display(QObject):
     def join(self, timeout: float = 2.0) -> None:
         """After shutdown, wait up to timeout seconds in all for the
         applications' threads to stop: one still in its CPU's native code
-        as the interpreter exits can crash it."""
+        as the interpreter exits can crash it.  Once they all have, the
+        processor's clock stops too."""
         deadline = time.monotonic() + timeout
-        for proc in list(self.launch_order):
-            if proc.thread is not None:
-                proc.thread.join(max(0.0, deadline - time.monotonic()))
+        threads = [p.thread for p in list(self.launch_order) if p.thread is not None]
+        for thread in threads:
+            thread.join(max(0.0, deadline - time.monotonic()))
+        machine = getattr(self.system, "machine", None)
+        if machine is not None and not any(t.is_alive() for t in threads):
+            machine.close()
 
     @property
     def shutting_down(self) -> bool:
@@ -435,6 +440,11 @@ class Display(QObject):
         self._alerts.append(box)
         box.show()
 
+    def dismiss_alerts(self) -> None:
+        """OK every host alert that's up, as the user would."""
+        for box in list(self._alerts):
+            box.accept()
+
     def _alert_closed(self, box: QMessageBox) -> None:
         if box in self._alerts:
             self._alerts.remove(box)
@@ -444,6 +454,8 @@ class Display(QObject):
     def _process_exited(self, proc: Process) -> None:
         if proc not in self.processes:
             return
+        if self.tracker is not None and self.tracker.owner is proc:
+            self.tracker.cancel()                   # nothing waits for it now
         was_front = self.front_process is proc
         for rec in list(proc.windows):
             self.destroy_view(rec)
@@ -740,9 +752,11 @@ class Display(QObject):
     # =====================================================================
     # Trackers
     # =====================================================================
-    def _start_tracker(self, tracker) -> Future:
+    def _start_tracker(self, tracker, owner: Process | None = None) -> Future:
+        """Start tracker, for owner if an application waits for it."""
         if self.tracker is not None:
             self.tracker.cancel()
+        tracker.owner = owner
         self.tracker = tracker
         try:
             tracker.start()
@@ -756,15 +770,17 @@ class Display(QObject):
             self.tracker = None
 
     def track_box(self, rec: WindowRecord, part: int) -> Future:
-        return self._start_tracker(BoxTracker(self, Future(), self.views[rec], part))
+        return self._start_tracker(BoxTracker(self, Future(), self.views[rec], part),
+                                   rec.process)
 
     def track_drag(self, rec: WindowRecord, bounds: Rect, start: Point) -> Future:
         view = self.views[rec]
         return self._start_tracker(DragTracker(self, Future(), view, view.structure_origin(),
-                                               self._drag_limit(bounds), start))
+                                               self._drag_limit(bounds), start), rec.process)
 
     def track_grow(self, rec: WindowRecord, limits: Rect, start: Point) -> Future:
-        return self._start_tracker(GrowTracker(self, Future(), self.views[rec], limits, start))
+        return self._start_tracker(GrowTracker(self, Future(), self.views[rec], limits, start),
+                                   rec.process)
 
     def end_grow_preview(self, rec: WindowRecord) -> None:
         """The guest didn't take the size GrowWindow gave it."""
@@ -779,13 +795,13 @@ class Display(QObject):
             return 0
         proc.last_bar = bar
         return self._start_tracker(MenuTracker(self, bar, Future(), self.config.sticky_menus,
-                                               ask))
+                                               ask), proc)
 
     def track_popup(self, proc: Process, menu: Menu, where: Point, item: int,
                     ask=None) -> Future:
         """PopUpMenuSelect: menu's item `item` at where, global."""
         return self._start_tracker(PopUpTracker(self, proc, menu, where, item, Future(),
-                                                self.config.sticky_menus, ask))
+                                                self.config.sticky_menus, ask), proc)
 
     def _drag_limit(self, bounds: Rect | None) -> Rect:
         screen = self.screen_bounds

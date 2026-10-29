@@ -1,19 +1,23 @@
 """Offscreen graphics worlds: 32-Bit QuickDraw's GWorlds (Inside Macintosh
 VI-21)."""
 
+import itertools
 import struct
 
 import pytest
 
-from macrt.m68k.glue_gworld import (GWORLD_VERSION, clipPix, newRowBytes, noNewDevice,
-                                    pixelsLocked, pixelsPurgeable, reallocPix, stretchPix)
+from macrt.m68k.glue_gworld import (GWORLD_VERSION, cDepthErr, clipPix, cNoMemErr, gwFlagErr,
+                                    mapPix, newDepth, newRowBytes, noNewDevice, paramErr,
+                                    pixelsLocked, pixelsPurgeable, reallocPix, stretchPix,
+                                    useTempMem)
+from macrt.resfork import Resource
 from macrt.toolbox import lowmem
-from macrt.toolbox.color import color_table
+from macrt.toolbox.color import color_table, standard_table
 from macrt.toolbox.gdevice import GDevice, PixMap, deref, read_table
 from macrt.toolbox.quickdraw import GrafPort
 from macrt.toolbox.types import Rect
 
-from guest import Guest, Processor
+from guest import Guest, Processor, Room
 
 WHITE, BLACK = (0xFFFF, 0xFFFF, 0xFFFF), (0, 0, 0)
 RED, GREEN = (0xFFFF, 0, 0), (0, 0xFFFF, 0)
@@ -200,10 +204,15 @@ def test_dispose_gworld(g):
 
 
 def test_a_gworld_of_depth_0_is_like_the_deepest_screen(g):
+    main = g.system.devices.pixmap(g.system.devices.main)
+    entry = deref(g.mem, main.pm_table) + 8 + 8 * 5 + 2      # the screen's colours changed
+    g.mem.write(entry, struct.pack(">HHH", 0x1234, 0x5678, 0x9ABC))
+    g("CTabChanged", main.pm_table)
     gw = new_gworld(g, 0, Rect(0, 0, 4, 4))
-    pm, main = pixmap(g, gw), g.system.devices.pixmap(g.system.devices.main)
+    pm = pixmap(g, gw)
     assert pm.pixel_size == main.pixel_size
     assert read_table(g.mem, pm.pm_table) == g.system.devices.table()
+    assert read_table(g.mem, pm.pm_table)[5] & 0xFFFFFF == 0x12569A
     assert pm.pm_table != main.pm_table
 
 
@@ -330,3 +339,282 @@ def test_on_basic_quickdraw_dispose_gworld(plus):
         g("DisposeGWorld", gw)
         assert g.system.port_at(gw) is None
     assert g.heap.free_bytes() == free
+
+
+# -- what goes wrong ----------------------------------------------------------
+def short_of_room(g, room: Room, call) -> int:
+    """call() with room for 0, 1, 2... more blocks, until it has room
+    enough: each time short of it, the call gives cNoMemErr, and
+    QDError does, and it gives back what it took.  How many it needs."""
+    for n in itertools.count():
+        room.limit(n)
+        err = call()
+        if err == 0:
+            room.limit(None)
+            return n
+        assert err == cNoMemErr and g("QDError") == cNoMemErr, n
+        assert room.given_back(), n
+
+
+@pytest.mark.parametrize("depth, flags", [(8, 0), (8, useTempMem), (8, noNewDevice), (32, 0)])
+def test_new_gworld_short_of_room_makes_no_part_of_a_world(g, monkeypatch, depth, flags):
+    room = Room(monkeypatch, g)
+    out, r = g.ptr(bytes(4)), g.rect_ptr(Rect(0, 0, 8, 8))
+    device = g.system.devices.main if flags & noNewDevice else 0
+    port_p, device_p = g.ptr(bytes(4)), g.ptr(bytes(4))
+
+    def now() -> tuple[int, int]:
+        g("GetGWorld", port_p, device_p)
+        return g.mem.r32(port_p), g.mem.r32(device_p)
+    before = now()
+
+    def new() -> int:
+        assert g.mem.r32(out) == 0 and now() == before
+        return g("NewGWorld", out, depth, r, 0, device, flags)
+
+    # The pixels, table, PixMap, port and cGrafPort's own blocks, and a
+    # device and (for colour tables) its inverse table, unless given one.
+    assert short_of_room(g, room, new) >= 4 + (0 if device else 1 if depth > 8 else 2)
+    port = g.system.port_at(g.mem.r32(out))
+    assert port is not None and current(g) == before and g("QDError") == 0
+    assert (g("GetGWorldDevice", port.addr) == g.system.devices.main) == bool(device)
+    pixels = pixmap(g, port.addr).base_addr
+    assert g.system.heap_of(pixels) is (g.system.sys_heap if flags & useTempMem else g.heap)
+
+
+def test_on_basic_quickdraw_new_gworld_short_of_room_makes_no_part_of_a_world(plus,
+                                                                              monkeypatch):
+    g = plus
+    room = Room(monkeypatch, g)
+    out, r = g.ptr(bytes(4)), g.rect_ptr(Rect(0, 0, 8, 8))
+    assert short_of_room(g, room, lambda: g("NewGWorld", out, 1, r, 0, 0, 0)) >= 3
+    assert g.system.port_at(g.mem.r32(out)) is not None
+    assert g("NewGWorld", out, 1, g.rect_ptr(Rect(0, 0, 8, 0)), 0, 0, 0) == paramErr
+
+
+@pytest.mark.parametrize("model, depth", [("ii", 8), ("plus", 1)])
+def test_a_world_too_big_for_memory_makes_no_part_of_a_world(qapp, monkeypatch, model, depth):
+    """Pixels too many for either heap, though there's room for the rest."""
+    g = Guest(model=model)
+    out, r = g.ptr(bytes(4)), g.rect_ptr(Rect(0, 0, 3000, 3000 * 8 // depth))
+    room = Room(monkeypatch, g)
+    assert g("NewGWorld", out, depth, r, 0, 0, 0) == cNoMemErr == g("QDError")
+    assert g.mem.r32(out) == 0 and len(room.made) >= 2 and room.given_back()
+
+
+def test_new_gworld_given_what_it_cannot_make(g):
+    out = g.ptr(bytes(4))
+    r = g.rect_ptr(Rect(0, 0, 8, 8))
+    assert g("NewGWorld", out, 3, r, 0, 0, 0) == cDepthErr == g("QDError")
+    assert g("NewGWorld", out, 8, g.rect_ptr(Rect(0, 0, 0, 8)), 0, 0, 0) == paramErr
+    assert g("QDError") == paramErr and g.mem.r32(out) == 0
+    # Given what isn't a colour table, the world has the standard one.
+    assert g("NewGWorld", out, 8, r, g.mem.size - 2, 0, 0) == 0
+    assert read_table(g.mem, pixmap(g, g.mem.r32(out)).pm_table) == g.system.devices.table()
+
+
+def test_a_world_of_2_bits_has_its_clut_or_the_greys(qapp):
+    """A world of 2 bits given no table has the 'clut' of ID 2, or, with
+    none, the four greys (GetCTable's 34)."""
+    g = Guest(model="ii")
+    gw = new_gworld(g, 2, Rect(0, 0, 4, 4))
+    assert read_table(g.mem, pixmap(g, gw).pm_table) == [
+        0xFF000000 | v * 0x10101 for v in (0xFF, 0xAA, 0x55, 0)]
+    g = Guest([Resource(b"clut", 2, color_table([WHITE, RED, GREEN, BLACK]))], model="ii")
+    gw = new_gworld(g, 2, Rect(0, 0, 4, 4))
+    assert read_table(g.mem, pixmap(g, gw).pm_table) == [
+        0xFFFFFFFF, 0xFFFF0000, 0xFF00FF00, 0xFF000000]
+
+
+def test_a_world_of_direct_pixels_has_no_colour_table_to_match(g):
+    gw = new_gworld(g, 32, Rect(0, 0, 2, 2))
+    pm = pixmap(g, gw)
+    assert pm.pixel_size == 32 and read_table(g.mem, pm.pm_table) == []
+    gd = GDevice(g.mem, deref(g.mem, g("GetGWorldDevice", gw)))
+    assert gd.type == 2 and gd.i_table == 0                     # directType
+    saved = current(g)
+    g("SetGWorld", gw, 0)
+    g("RGBForeColor", rgb(g, *RED))
+    g("PaintRect", g.rect_ptr(Rect(0, 0, 1, 2)))
+    g("SetGWorld", *saved)
+    assert [g.mem.r32(pm.base_addr + 4 * i) & 0xFFFFFF for i in range(2)] == [0xFF0000] * 2
+
+
+def test_update_gworld_given_what_it_cannot_do(g, monkeypatch):
+    gw = new_gworld(g, 4, Rect(0, 0, 8, 8))
+    out, r = g.ptr(struct.pack(">L", gw)), g.rect_ptr(Rect(0, 0, 8, 8))
+    pm = pixmap(g, gw)
+    was = (pm.base_addr, pm.pixel_size, pm.bounds, read_table(g.mem, pm.pm_table))
+    screen = g.ptr(struct.pack(">L", cport(g).addr))
+    assert g("UpdateGWorld", screen, 8, r, 0, 0, 0) == gwFlagErr   # not a world
+    assert g("QDError") == paramErr
+    assert g("UpdateGWorld", out, 3, r, 0, 0, 0) == gwFlagErr and g("QDError") == cDepthErr
+    assert g("UpdateGWorld", out, 8, g.rect_ptr(Rect(0, 0, 8, -1)), 0, 0, 0) == gwFlagErr
+    assert g("QDError") == paramErr
+    # Short of room for the new pixels, or for its table to grow to 8
+    # bits' colours, the world is as it was.
+    room = Room(monkeypatch, g)
+    for n in range(2):
+        assert g("UpdateGWorld", out, 4, r, 0, 0, 0) == 0 == g("QDError")     # nothing to do
+        room.limit(n)
+        assert g("UpdateGWorld", out, 8, r, 0, 0, clipPix) == gwFlagErr
+        assert g("QDError") == cNoMemErr and room.given_back()
+        pm = pixmap(g, gw)
+        assert (pm.base_addr, pm.pixel_size, pm.bounds, read_table(g.mem, pm.pm_table)) == was
+    room.limit(None)
+    assert g("UpdateGWorld", out, 8, r, 0, 0, clipPix) & newDepth
+
+
+def test_update_gworld_to_another_depth_keeps_the_picture_in_its_colours(g):
+    gw = new_gworld(g, 4, Rect(0, 0, 2, 8))
+    saved = current(g)
+    g("SetGWorld", gw, 0)
+    g("RGBForeColor", rgb(g, *RED))
+    g("PaintRect", g.rect_ptr(Rect(0, 0, 2, 4)))
+    g("SetGWorld", *saved)
+    pm = pixmap(g, gw)
+    assert read_table(g.mem, pm.pm_table)[g.mem.r8(pm.base_addr) >> 4] == 0xFFDD0806
+    out = g.ptr(struct.pack(">L", gw))
+    done = g("UpdateGWorld", out, 8, g.rect_ptr(Rect(0, 0, 2, 8)), 0, 0, clipPix)
+    assert done == reallocPix | newDepth | newRowBytes | clipPix
+    pm = pixmap(g, gw)
+    assert pm.pixel_size == 8 and pm.row_bytes & 0x3FFF == 8
+    table = read_table(g.mem, pm.pm_table)
+    assert table == read_table(g.mem, g.handle(standard_table(8)))
+    near = table.index(0xFFDD0000)                              # 4 bits' red, in 8 bits
+    assert values(g, gw) == [bytes([near] * 4 + [0] * 4)] * 2
+    red = table.index(0xFFFF0000)
+    gd = GDevice(g.mem, deref(g.mem, g("GetGWorldDevice", gw)))
+    assert gd.type == 0 and gd.flags & 1 << 0                   # clutType, gdDevType
+    itable = g.contents(gd.i_table)
+    assert itable[:4] == g.contents(pm.pm_table)[:4]            # for this table
+    assert itable[6 + (15 << 8)] == red                         # red: res 4, its top bits
+    # To direct pixels, and the device is one for them.
+    assert g("UpdateGWorld", out, 32, g.rect_ptr(Rect(0, 0, 2, 8)), 0, 0, clipPix) & newDepth
+    assert g.mem.r32(pixmap(g, gw).base_addr) & 0xFFFFFF == 0xDD0000
+    assert GDevice(g.mem, deref(g.mem, g("GetGWorldDevice", gw))).type == 2
+
+
+def test_update_gworld_to_another_colour_table_maps_the_pixels_to_it(g):
+    table = g.handle(color_table([WHITE, RED, GREEN, BLACK]))
+    gw = new_gworld(g, 8, Rect(0, 0, 1, 2), table)
+    g.mem.write(pixmap(g, gw).base_addr, bytes([1, 2]))       # red, green
+    out = g.ptr(struct.pack(">L", gw))
+    swapped = g.handle(color_table([WHITE, GREEN, RED, BLACK]))
+    done = g("UpdateGWorld", out, 8, g.rect_ptr(Rect(0, 0, 1, 2)), swapped, 0, 0)
+    assert done == reallocPix | mapPix | clipPix
+    assert values(g, gw) == [bytes([2, 1])]
+    assert read_table(g.mem, pixmap(g, gw).pm_table)[1:3] == [0xFF00FF00, 0xFFFF0000]
+
+
+def test_ctab_changed(g):
+    """A program that changes a world's colours, then calls CTabChanged,
+    has a new seed for its table, and an inverse table made for it; for
+    the screen's table, the screen is shown in its new colours."""
+    gw = new_gworld(g, 8, Rect(0, 0, 2, 2), g.handle(color_table([WHITE, RED, GREEN, BLACK])))
+    pm = pixmap(g, gw)
+    ct = deref(g.mem, pm.pm_table)
+    seed = g.mem.r32(ct)
+    g.mem.write(ct + 8 + 2 * 8 + 2, struct.pack(">HHH", 0, 0, 0xFFFF))  # green to blue
+    g("CTabChanged", pm.pm_table)
+    assert g.mem.r32(ct) != seed and read_table(g.mem, pm.pm_table)[2] == 0xFF0000FF
+    itable = g.contents(GDevice(g.mem, deref(g.mem, g("GetGWorldDevice", gw))).i_table)
+    assert itable[:4] == g.mem.read(ct, 4) and itable[6 + 15] == 2   # blue
+    # A table no world has: a new seed, nothing more.
+    other = g.handle(color_table([WHITE, BLACK]))
+    g("CTabChanged", other)
+    assert g.mem.r32(deref(g.mem, other)) != 0
+    # The screen's.
+    devices = g.system.devices
+    main_ct = devices.pixmap(devices.main).pm_table
+    seed = g.mem.r32(deref(g.mem, main_ct))
+    entry = deref(g.mem, main_ct) + 8 + 8 * 5 + 2
+    g.mem.write(entry, struct.pack(">HHH", 0x1234, 0x5678, 0x9ABC))
+    g("CTabChanged", main_ct)
+    assert g.mem.r32(deref(g.mem, main_ct)) != seed
+    assert devices.table()[5] & 0xFFFFFF == 0x12569A
+    g("CTabChanged", 0)                                       # NIL: nothing
+
+
+def test_on_basic_quickdraw_ctab_changed_and_screen_buffers_do_nothing(plus):
+    g = plus
+    table = g.handle(color_table([WHITE, BLACK], seed=7))
+    g("CTabChanged", table)
+    assert g.mem.r32(deref(g.mem, table)) == 7
+    gdh, pm_p = g.ptr(bytes(4)), g.ptr(bytes(4))
+    assert g("NewScreenBuffer", g.rect_ptr(Rect(0, 0, 3, 5)), False, gdh, pm_p) == paramErr
+    assert g("QDError") == paramErr and g.mem.r32(pm_p) == 0
+
+
+def test_screen_buffers_short_of_room_or_given_no_rectangle(g, monkeypatch):
+    gdh, pm_p = g.ptr(bytes(4)), g.ptr(bytes(4))
+    assert g("NewScreenBuffer", g.rect_ptr(Rect(0, 0, 0, 5)), False, gdh, pm_p) == paramErr
+    assert g("QDError") == paramErr
+    room = Room(monkeypatch, g)
+    r = g.rect_ptr(Rect(0, 0, 3, 5))
+    assert short_of_room(g, room, lambda: g("NewScreenBuffer", r, False, gdh, pm_p)) == 2
+    assert short_of_room(g, room, lambda: g("NewTempScreenBuffer", r, False, gdh, pm_p)) == 2
+    base = PixMap(g.mem, deref(g.mem, g.mem.r32(pm_p))).base_addr
+    assert g.system.heap_of(base) is g.system.sys_heap         # temporary memory
+    g("DisposeScreenBuffer", g.mem.r32(pm_p))
+    assert not g.system.sys_heap.is_handle(g.system.sys_heap.recover_handle(base))
+
+
+def test_a_world_whose_pixels_a_program_has_moved(g):
+    """A program that points a world's baseAddr at pixels of its own keeps
+    them when it disposes the world, whose own pixels go."""
+    gw = new_gworld(g, 8, Rect(0, 0, 4, 4))
+    pm = pixmap(g, gw)
+    own = pm.base_addr
+    mine = g.handle(bytes(16))
+    g.heap.lock(mine)
+    pm.base_addr = deref(g.mem, mine)
+    g.mem.write(pm.base_addr, bytes([3]) * 16)
+    out = g.ptr(struct.pack(">L", gw))
+    # UpdateGWorld takes what's there now into its new pixels.
+    g("UpdateGWorld", out, 8, g.rect_ptr(Rect(0, 0, 4, 8)), 0, 0, clipPix)
+    assert values(g, gw) == [bytes([3] * 4 + [0] * 4)] * 4
+    assert g.heap.is_handle(mine) and not g.heap.is_handle(g.heap.recover_handle(own))
+    pm = pixmap(g, gw)
+    own = g.heap.recover_handle(pm.base_addr)
+    pm.base_addr = deref(g.mem, mine)
+    g("DisposeGWorld", gw)
+    assert g.heap.is_handle(mine) and g.contents(mine) == bytes([3]) * 16
+    assert not g.heap.is_handle(own)
+    # A screen buffer pointed at the screen leaves the screen alone.
+    gdh, pm_p = g.ptr(bytes(4)), g.ptr(bytes(4))
+    g("NewScreenBuffer", g.rect_ptr(Rect(0, 0, 3, 5)), False, gdh, pm_p)
+    buffer = PixMap(g.mem, deref(g.mem, g.mem.r32(pm_p)))
+    buffer.base_addr = g.system.screen_bits.base
+    g("DisposeScreenBuffer", g.mem.r32(pm_p))
+    assert not g.heap.is_handle(g.mem.r32(pm_p))
+
+
+def test_what_is_and_is_not_a_world(g):
+    screen = cport(g)
+    g("DisposeGWorld", screen.addr)                           # not a world: left as it is
+    assert g.system.port_at(screen.addr) is screen
+    assert g("GetGWorldPixMap", 0) == 0
+    # A colour port of a program's own making, and an old port.
+    record = g.ptr(bytes(GrafPort.SIZE))
+    g.mem.write(record + 2, struct.pack(">LH", 0x1234, 0xC000))
+    assert g("GetGWorldPixMap", record) == 0x1234
+    g.mem.w16(record + 6, 0)
+    assert g("GetGWorldPixMap", record) == 0
+    assert g("GetPixBaseAddr", g.mem.size - 2) == 0           # not a handle
+
+
+def test_the_calls_that_change_or_ask_nothing(g):
+    gw = new_gworld(g, 8, Rect(0, 0, 4, 4))
+    pm = g("GetGWorldPixMap", gw)
+    g("AllowPurgePixels", pm)
+    g("NoPurgePixels", pm)
+    assert g("GetPixelsState", pm) == 0
+    assert g("QDDone", gw) is True
+    assert g("OffscreenVersion") >= 0x100       # 32-Bit QuickDraw's offscreen routines
+    port = g.system.port_at(gw)
+    before = g.mem.read(gw, GrafPort.SIZE)
+    for name, arg in (("PortChanged", gw), ("PixPatChanged", port.pn_pix_pat),
+                      ("GDeviceChanged", g("GetGWorldDevice", gw))):
+        assert g(name, arg) is None
+    assert g.mem.read(gw, GrafPort.SIZE) == before

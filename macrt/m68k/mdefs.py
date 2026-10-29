@@ -70,10 +70,7 @@ def message(t, menu: MenuInfo, msg: int, rect_p: int, hit: int = 0, item_p: int 
         return False
     mem = t.mem
     h = menu.menu_proc & ADDRESS_MASK
-    try:
-        heap = t.system.heap_of(h)
-    except ValueError:                  # its master pointer is the application's own
-        heap = None
+    heap = t.system.find_heap(h)       # None if its master pointer is the application's own
     if heap is not None:
         state = heap.get_state(h)
         heap.lock(h)

@@ -14,6 +14,7 @@ import time
 from concurrent.futures import Future
 from typing import TYPE_CHECKING, Callable
 
+from PyQt6 import sip
 from PyQt6.QtCore import QPoint, QRect, Qt, QTimer
 from PyQt6.QtGui import QColor, QFont, QFontMetrics, QImage, QPainter, QPen, QRegion
 from PyQt6.QtWidgets import QWidget
@@ -527,7 +528,7 @@ def _answered(display: Display, ask: Callable, pd: DrawnPulldown, f: Future) -> 
         if tracker is not None and getattr(tracker, "ask", None) is ask:
             tracker.cancel()                # the application has stopped
         return
-    if not pd.isVisible():
+    if sip.isdeleted(pd) or not pd.isVisible():     # closed while its MDEF answered
         return
     pd.chose(*f.result())
     if pd.want is not None:
@@ -579,6 +580,8 @@ class MenuTracker:
     the mouse leaves the menu for it; choosing one of its items gives the
     submenu's ID.
     """
+
+    owner: Process | None = None        # the application waiting for it
 
     def __init__(self, display: Display, bar: MenuBarWidget, future: Future, sticky: bool,
                  ask: Callable[..., Future] | None = None):
@@ -772,8 +775,8 @@ class MenuTracker:
     def _asked(self, f: Future, idx: int, menu: Menu, cell: QRect) -> None:
         if f.exception() is not None:             # the application has stopped
             self._finish(0)
-        elif not self.done and self.index == idx:
-            drawn = f.result()
+        elif not self.done and self.index == idx and self.pulldown is None:
+            drawn = f.result()          # (once: off its title and back asks again)
             if drawn is None:
                 self._show(menu, cell)
                 return
@@ -834,6 +837,8 @@ class PopUpTracker:
     closed chooses nothing at once, as the Menu Manager follows the mouse
     only while its button is down: Beyond Cyberpunk's CyberDeck stack
     calls PopUpMenuSelect as it opens."""
+
+    owner: Process | None = None        # the application waiting for it
 
     def __init__(self, display: Display, proc: Process, menu: Menu, where: Point, item: int,
                  future: Future, sticky: bool, ask: Callable[..., Future] | None = None):

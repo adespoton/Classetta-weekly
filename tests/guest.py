@@ -36,7 +36,8 @@ class NoSoundDriver:
 class Machine:
     """Trap stubs at made-up addresses: only what they are matters.  The
     Sound Manager, with a sound buffer, a VIA for its speaker switch, and
-    the ROM's loop for its waits."""
+    the ROM's loop for its waits, and an RTS for the ADB devices' service
+    routines."""
 
     def __init__(self, system: System):
         self.mem = system.mem
@@ -46,6 +47,8 @@ class Machine:
         self.mem.w32(lowmem.SoundBase, system.sys_heap.new_ptr(runtime.SOUND_BUFFER, clear=True))
         self.sound_wait = system.sys_heap.new_ptr(len(runtime.SOUND_WAIT))
         self.mem.write(self.sound_wait, runtime.SOUND_WAIT)
+        self.adb_service = system.sys_heap.new_ptr(2)
+        self.mem.w16(self.adb_service, runtime.RTS)
         self.ejected = {}                   # no disk is out of its drive
 
     @staticmethod
@@ -178,3 +181,35 @@ class Processor(Guest):
             self.cpu.pc = self.cpu.pop32() if auto_pop else ev.pc + 2
             dispatch.dispatch(self, ev.code, ev.pc)
         assert ev.kind == "until", ev
+
+
+class Room:
+    """Room in the application and System heaps for only so many more
+    blocks (a handle grown counts as one), what's asked for after that not
+    there; and what was made, to see that a call that fails gives it back."""
+
+    def __init__(self, monkeypatch, g):
+        self.left, self.made = None, []
+        for heap in (g.heap, g.system.sys_heap):
+            for name in ("new_handle", "new_ptr", "set_handle_size"):
+                monkeypatch.setattr(heap, name, self._wrap(heap, name, getattr(heap, name)))
+
+    def limit(self, blocks: int | None) -> None:
+        self.left, self.made = blocks, []
+
+    def _wrap(self, heap, name, real):
+        def wrapped(*args, **kwargs):
+            if name == "set_handle_size" and args[1] <= heap.handle_size(args[0]):
+                return real(*args, **kwargs)
+            if self.left is not None:
+                if self.left == 0:
+                    return False if name == "set_handle_size" else 0
+                self.left -= 1
+            got = real(*args, **kwargs)
+            if got and name != "set_handle_size":
+                self.made.append((heap, got))
+            return got
+        return wrapped
+
+    def given_back(self) -> bool:
+        return not any(heap.is_handle(b) or heap.is_ptr(b) for heap, b in self.made)

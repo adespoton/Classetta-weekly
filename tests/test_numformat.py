@@ -62,6 +62,8 @@ def test_numbers_written_as_the_format_says(spec, x, want):
 def test_too_many_digits_overflow():
     out, status = written("###.###", "1234.56789")
     assert status == nf.fFormatOverflow and out == "1234.568"
+    out, status = written("#,##0.00", "1e4932")     # more whole digits than str writes
+    assert status == nf.fFormatOverflow and out == "1" + "0" * 254
 
 
 @pytest.mark.parametrize("spec, status", [

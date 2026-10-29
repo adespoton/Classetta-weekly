@@ -1,11 +1,11 @@
 | VBL: a VBL task that counts its runs, asking to run every other tick.
 | The application spins until it has run 10 times, counts its runs while
-| it waits in Delay, then checks that it doesn't run while interrupts are
-| masked or once it has been removed.  Then a task that doesn't set its
-| count again, which runs once and is taken out of the queue, so that it
-| can be installed again.  The task leaves a word above its return
-| address, as Factory's sound callback does: on a Mac that's in what the
-| interrupt stacked, not in the spin's stack.
+| it waits in Delay, and the ticks that took, then checks that it doesn't
+| run while interrupts are masked or once it has been removed.  Then a
+| task that doesn't set its count again, which runs once and is taken out
+| of the queue, so that it can be installed again.  The task leaves a word
+| above its return address, as Factory's sound callback does: on a Mac
+| that's in what the interrupt stacked, not in the spin's stack.
 
         .include "traps.inc"
 
@@ -19,7 +19,8 @@ DELAYED         = -28           | runs during a Delay of 30 ticks
 ONCE            = -30           | the runs of the task that runs once
 GONE            = -32           | VRemove's result for it: it's out of the queue
 CANARY          = -36           | what the spin had on the stack, after it
-GLOBALS         = 36
+WAITED          = -38           | the ticks from the first count of DELAYED to the last
+GLOBALS         = 38
 
 TICKS           = 0x16A
 VTYPE           = 1
@@ -43,11 +44,15 @@ start:
 
         | The host has the processor while it waits, and the ticks go on.
         move.w  COUNT(a5), d1
+        move.l  TICKS, d2
         movea.w #30, a0
         _Delay
         move.w  COUNT(a5), d0
+        move.l  TICKS, d3
         sub.w   d1, d0
         move.w  d0, DELAYED(a5)
+        sub.l   d2, d3
+        move.w  d3, WAITED(a5)
 
         | Masked, it waits.  (On a Mac Ticks would stop too, the VBL
         | interrupt being what counts them; macrt's clock keeps going.)

@@ -11,9 +11,10 @@ from macrt.resfork import Resource
 from macrt.toolbox import pict
 from macrt.toolbox.qdraw import srcCopy, srcXor
 from macrt.toolbox.quickdraw import BLACK_PAT, GRAY_PAT, GrafPort
-from macrt.toolbox.types import Rect
+from macrt.toolbox.memmgr import memWZErr, noErr
+from macrt.toolbox.types import Point, Rect
 
-from guest import Guest, Processor
+from guest import Guest, Processor, Room
 
 FRAME = (0, 0, 32, 64)
 BLANK = ["." * 64] * 32
@@ -307,6 +308,74 @@ def test_a_bad_picture_draws_what_it_can(g):
     assert ones(g.rows(port)) == 4
 
 
+def direct_bits(bounds, src, dst, cmp_count=3) -> tuple[int, bytes]:
+    """A DirectBitsRect of black 32-bit pixels, packType 4: its opcode and
+    data."""
+    width = bounds[3] - bounds[1]
+    pixmap = struct.pack(">hhlllhhhhlll", 0, 4, 0, 72 << 16, 72 << 16, 16, 32, cmp_count, 8,
+                         0, 0, 0)
+    row = pict.pack_bits(bytes(3 * width))
+    return 0x009A, (struct.pack(">L", 0xFF) + struct.pack(">H", 0x8000 | 4 * width)
+                    + rect(*bounds) + pixmap + rect(*src) + rect(*dst)
+                    + struct.pack(">h", srcCopy)
+                    + (bytes([len(row)]) + row) * (bounds[2] - bounds[0]))
+
+
+@pytest.mark.parametrize("cmp_count", [0, 32767])
+def test_direct_bits_packed_in_components_it_cannot_have_end_the_picture(g, cmp_count):
+    """packType 4 packs 3 components, or 4: a picture that says it packs
+    none, or thousands, draws what came before it and no more."""
+    port, _ = g.port()
+    data = v2(FRAME, (0x0031, rect(0, 0, 2, 2)),
+              direct_bits((0, 0, 2, 8), (0, 0, 2, 8), (0, 0, 2, 8), cmp_count),
+              (0x0031, rect(4, 4, 6, 6)))
+    play(g, port, data)
+    rows = g.rows(port)
+    assert black(rows, 0, 0, 2, 2) and ones(rows) == 4
+
+
+@pytest.mark.parametrize("cmp_count", [0, 2])
+def test_unpacked_direct_pixels_of_too_few_components_are_read_as_xrgb(qapp, cmp_count):
+    """Rows too narrow to be packed are read as they are: 4 bytes a pixel,
+    padded, whatever the components."""
+    img = pict.pixel_image([b"\x10\x20"] * 3, 1, 3, 32, None, 4, cmp_count)
+    assert (img.width(), img.height()) == (1, 3)
+    assert {img.pixel(0, y) & 0xFFFFFF for y in range(3)} == {0x200000}
+
+
+def tall_pix_pat(rows: int) -> tuple[int, bytes]:
+    """A FillPixPat of a white 1-bit pixel pattern 8 wide: its opcode and
+    data."""
+    pixmap = struct.pack(">hhlllhhhhlll", 0, 0, 0, 72 << 16, 72 << 16, 0, 1, 1, 1, 0, 0, 0)
+    ctab = struct.pack(">lHh", 0, 0, 0) + struct.pack(">HHHH", 0, 0xFFFF, 0xFFFF, 0xFFFF)
+    return 0x0014, (struct.pack(">H", 1) + GRAY_PAT + struct.pack(">H", 0x8002)
+                    + rect(0, 0, rows, 8) + pixmap + ctab + bytes(2 * rows))
+
+
+def test_a_pixel_pattern_bigger_than_a_picture_may_hold_ends_it(g):
+    port, _ = g.port()
+    data = v2(FRAME, (0x0031, rect(0, 0, 2, 2)), tall_pix_pat(pict.MAX_SIDE + 1),
+              (0x0031, rect(4, 4, 6, 6)))
+    play(g, port, data)
+    rows = g.rows(port)
+    assert black(rows, 0, 0, 2, 2) and ones(rows) == 4
+
+
+def test_a_source_rectangle_past_the_bitmap_draws_only_the_bitmap(g):
+    """Only the part of srcRect inside the bitmap's bounds has pixels: it
+    goes to the same part of dstRect, and the rest is left as it was."""
+    port, _ = g.port()
+    white = (0x0090, struct.pack(">H", 2) + rect(0, 0, 2, 2) + rect(0, 0, 4, 4)
+             + rect(0, 0, 20, 20) + struct.pack(">h", srcCopy) + bytes(4))
+    play(g, port, v2(FRAME, (0x0031, rect(*FRAME)), white))
+    rows = g.rows(port)
+    assert ones(rows) == 32 * 64 - 100 and not any("#" in r[:10] for r in rows[:10])
+    port, _ = g.port()
+    play(g, port, v2(FRAME, direct_bits((2, 2, 4, 4), (0, 0, 4, 4), (0, 0, 20, 20))))
+    rows = g.rows(port)
+    assert ones(rows) == 100 and black(rows, 10, 10, 20, 20)
+
+
 # -- recording ------------------------------------------------------------------
 def scene(g):
     """Some of everything a picture records."""
@@ -384,6 +453,95 @@ def test_the_opcodes_a_recording_makes(g):
         "ff")
 
 
+def test_open_picture_with_no_port_or_no_room_records_nothing(g, monkeypatch):
+    port, _ = g.port()
+    room = Room(monkeypatch, g)
+    room.limit(0)
+    assert g("OpenPicture", g.rect_ptr(FRAME)) == 0
+    assert port.pic_save == 0 and port.pn_vis == 0 and not g.tb.qd.pictures
+    room.limit(None)
+    g("SetPort", 0)
+    assert g("OpenPicture", g.rect_ptr(FRAME)) == 0
+    assert not g.tb.qd.pictures
+    g("ClosePicture")                                   # no port: nothing to close
+    g.set_port(port)
+    g("ClosePicture")                                   # nothing being recorded
+    assert port.pn_vis == 0
+
+
+def record(g, comment: int) -> int:
+    """A picture of a rectangle and a long comment of its data."""
+    pic = g("OpenPicture", g.rect_ptr(FRAME))
+    g("PaintRect", g.rect_ptr((0, 0, 2, 2)))
+    g("PicComment", 200, g.heap.handle_size(comment), comment)
+    g("ClosePicture")
+    return pic
+
+
+def test_close_picture_spools_through_the_put_pic_proc(g, monkeypatch):
+    """A port's putPicProc is given the picture a buffer's worth at a
+    time, the handle keeping its size and frame; with no room for the
+    buffer, it's given nothing."""
+    comment = g.handle(bytes(range(256)) * 20)
+    port, _ = g.port()
+    expected = g.contents(record(g, comment))
+    assert len(expected) > 4096
+    procs_of(g, port, _48=0x1234)
+    spooled, sizes = bytearray(), []
+
+    def put_pic(buf, n):
+        spooled.extend(g.mem.read(buf, n))
+        sizes.append(n)
+    g.procs[0x1234] = put_pic
+    pic = record(g, comment)
+    assert bytes(spooled) == expected and sizes == [4096, len(expected) - 4096]
+    assert g.contents(pic) == expected[:10]
+    assert not g.heap.is_ptr(g.calls[0][1][0][1])       # the buffer, given back
+    assert port.pic_save == 0 and port.pn_vis == 0
+    room = Room(monkeypatch, g)
+    sizes.clear()
+    pic = g("OpenPicture", g.rect_ptr(FRAME))
+    g("PaintRect", g.rect_ptr((0, 0, 2, 2)))
+    room.limit(0)
+    g("ClosePicture")
+    assert sizes == [] and g.contents(pic)[2:] == rect(*FRAME)
+    assert port.pic_save == 0 and port.pn_vis == 0
+
+
+def test_with_no_room_for_the_picture_it_is_an_empty_one(g, monkeypatch):
+    port, _ = g.port()
+    room = Room(monkeypatch, g)
+    pic = g("OpenPicture", g.rect_ptr(FRAME))
+    g("PaintRect", g.rect_ptr((0, 0, 2, 2)))
+    room.limit(0)
+    g("ClosePicture")
+    assert g.contents(pic) == struct.pack(">H", 10) + rect(*FRAME)
+    assert port.pic_save == 0 and port.pn_vis == 0
+    room.limit(None)
+    g("DrawPicture", pic, g.rect_ptr(FRAME))
+    assert ones(g.rows(port)) == 0
+
+
+def test_a_picture_disposed_of_while_it_was_recorded_is_left_alone(g):
+    """ClosePicture of a picture whose handle the program has disposed of
+    or purged writes nothing where its master pointer would take it: to
+    0, or, once disposed of, to the next free master pointer."""
+    port, _ = g.port()
+    low = g.mem.read(0, 0x40)
+    for h in (g.handle(b"a"), g.handle(b"b")):
+        g("DisposeHandle", h)                           # free master pointers, linked
+    for gone in ("DisposeHandle", "EmptyHandle"):
+        pic = g("OpenPicture", g.rect_ptr(FRAME))
+        g("PaintRect", g.rect_ptr((0, 0, 2, 2)))
+        g(gone, pic)
+        link = g.mem.r32(pic)                           # the next free one's, once disposed
+        assert bool(link) == (gone == "DisposeHandle")
+        there = g.mem.read(link, 16)
+        g("ClosePicture")
+        assert g.mem.read(0, 0x40) == low and g.mem.read(link, 16) == there
+        assert port.pic_save == 0 and port.pn_vis == 0
+
+
 def test_a_colour_picture_is_version_2(g):
     port, _ = g.port()
     params = g.ptr(rect(*FRAME) + struct.pack(">llhhl", 72 << 16, 72 << 16, -2, 0, 0))
@@ -407,6 +565,91 @@ def test_get_picture_and_kill_picture(qapp):
     g("KillPicture", h)                                 # a resource: released, not disposed
     h2 = g("GetPicture", 128)
     assert h2 and g.contents(h2)[:2] == struct.pack(">H", 10 + 2 + 9 + 1)
+
+
+def test_kill_picture(g):
+    """KillPicture disposes of a picture, one being recorded too, which is
+    then recorded into no more; NIL, or a handle in no heap, it passes
+    over, with MemErr as DisposeHandle sets it."""
+    port, _ = g.port()
+    g.set_mem_err(memWZErr)
+    g("KillPicture", 0)
+    assert g.mem_err == memWZErr
+    pic = g("OpenPicture", g.rect_ptr(FRAME))
+    other, _ = g.port()
+    kept = g("OpenPicture", g.rect_ptr(FRAME))
+    g.set_port(port)
+    g.set_mem_err(memWZErr)
+    g("KillPicture", pic)
+    assert not g.heap.is_handle(pic) and list(g.tb.qd.pictures) == [other.addr]
+    assert g.mem_err == noErr
+    g("PicComment", 100, 0, 0)                          # not recorded anywhere
+    g.set_port(other)
+    g("ClosePicture")
+    assert g.contents(kept) == v1(FRAME, b"")
+    master = g.process.partition.a5 - 0x100             # a master pointer of its own
+    g.mem.w32(master, g.ptr(v1(FRAME, b"")))
+    g("KillPicture", master)
+    assert g.mem_err == memWZErr
+
+
+def test_drawing_no_picture_or_in_no_port_draws_nothing(g):
+    """DrawPicture of NIL, of a handle that's been emptied, or with no
+    current port, draws nothing."""
+    port, _ = g.port()
+    data = v1(FRAME, b"\x31" + rect(0, 0, 2, 2))
+    g.mem.write(0, data)                                # where a NIL master pointer leads
+    g.mem.write(0x100, struct.pack(">L", 0))
+    empty = g.handle(data)
+    g("EmptyHandle", empty)
+    for h in (0, empty, 0x100):
+        g("DrawPicture", h, g.rect_ptr(FRAME))
+    g.mem.w32(0, g.ptr(data))                           # NIL is no handle, whatever's at 0
+    g("DrawPicture", 0, g.rect_ptr(FRAME))
+    g("SetPort", 0)
+    g("DrawPicture", g.handle(data), g.rect_ptr(FRAME))
+    assert ones(g.rows(port)) == 0
+
+
+def procs_of(g, port, **offsets) -> int:
+    """The standard procs for port, with these (an offset: an address)
+    in place of some."""
+    procs = g.ptr(bytes(52))
+    g("SetStdProcs", procs)
+    for at, addr in offsets.items():
+        g.mem.w32(procs + int(at[1:]), addr)
+    port.graf_procs = procs
+    return procs
+
+
+def test_a_comment_procs_long_comments_are_in_a_handle_while_it_runs(g, monkeypatch):
+    """A long comment's data is in a handle the commentProc is given,
+    disposed of after; with no room for one, the proc is given none."""
+    port, _ = g.port()
+    procs_of(g, port, _36=0x5678)
+    seen, handles = [], []
+
+    def comment(kind, size, h):
+        seen.append((kind, size, g.contents(h) if h else None))
+        handles.append(h)
+    g.procs[0x5678] = comment
+    pic = g.handle(v1(FRAME, b"\xa1" + struct.pack(">hh", 7, 3) + b"abc" + b"\xa0\x00\x08"))
+    g("DrawPicture", pic, g.rect_ptr(FRAME))
+    assert seen == [(7, 3, b"abc"), (8, 0, None)]
+    assert handles[0] and not g.heap.is_handle(handles[0])
+    seen.clear()
+    Room(monkeypatch, g).limit(0)
+    g("DrawPicture", pic, g.rect_ptr(FRAME))
+    assert seen == [(7, 0, None), (8, 0, None)]
+
+
+def test_a_spooled_picture_with_no_room_for_its_buffer_draws_nothing(g, monkeypatch):
+    port, _ = g.port()
+    procs_of(g, port, _44=0x1234)
+    header = g.handle(v1(FRAME, b"\x31" + rect(0, 0, 2, 2))[:10])
+    Room(monkeypatch, g).limit(0)
+    g("DrawPicture", header, g.rect_ptr(FRAME))
+    assert g.calls == [] and ones(g.rows(port)) == 0
 
 
 def test_spooled_pictures_and_comment_procs(g):
@@ -563,6 +806,105 @@ def test_std_tx_meas_measures_and_gives_the_font_info(g):
     assert g("StdTxMeas", 0, text, numer, denom, info) == 0
 
 
+def drawn(g, draw) -> list[str]:
+    """What draw(port) draws in a fresh port, the pen at (2, 20)."""
+    port, _ = g.port()
+    g("MoveTo", 2, 20)
+    draw(port)
+    return g.rows(port)
+
+
+def test_the_standard_procs_draw_as_the_calls_they_stand_for(g):
+    """StdRect and the rest, called themselves, draw as their verb says
+    (Fill in the port's fillPat), StdLine, StdText and StdBits as LineTo,
+    DrawText and CopyBits do."""
+    g.port()
+    r = g.rect_ptr((2, 3, 12, 30))
+    poly = g("OpenPoly")
+    g("MoveTo", 4, 2)
+    g("LineTo", 40, 4)
+    g("LineTo", 20, 28)
+    g("ClosePoly")
+    rgn, small = g("NewRgn"), g("NewRgn")
+    g("RectRgn", rgn, g.rect_ptr((4, 6, 20, 50)))
+    g("RectRgn", small, g.rect_ptr((6, 10, 12, 30)))
+    text = g.ptr(b"Hi")
+    one = Point(1, 1)
+    src = bitmap(g, [b"\xf0\x0f"] * 8, 16)
+    sr, dr = g.rect_ptr((0, 0, 8, 16)), g.rect_ptr((4, 8, 20, 40))
+    gray = g.ptr(GRAY_PAT)
+
+    def filled(std):
+        def draw(port):
+            port.fill_pat = GRAY_PAT
+            std()
+        return draw
+    for std, same in (
+            (lambda p: g("StdRect", 1, r), lambda p: g("PaintRect", r)),
+            (filled(lambda: g("StdRect", 4, r)), lambda p: g("FillRect", r, gray)),
+            (lambda p: g("StdOval", 0, r), lambda p: g("FrameOval", r)),
+            (lambda p: g("StdRRect", 3, r, 20, 4), lambda p: g("InvertRoundRect", r, 20, 4)),
+            (lambda p: g("StdArc", 1, r, 90, 135), lambda p: g("PaintArc", r, 90, 135)),
+            (lambda p: g("StdPoly", 0, poly), lambda p: g("FramePoly", poly)),
+            (lambda p: g("StdPoly", 1, poly), lambda p: g("PaintPoly", poly)),
+            (filled(lambda: g("StdPoly", 4, poly)), lambda p: g("FillPoly", poly, gray)),
+            (lambda p: g("StdRgn", 3, rgn), lambda p: g("InvertRgn", rgn)),
+            (lambda p: g("StdLine", Point(4, 40)), lambda p: g("LineTo", 40, 4)),
+            (lambda p: g("StdText", 2, text, one, one), lambda p: g("DrawText", text, 0, 2)),
+            (lambda p: g("StdText", 1, text, one, one), lambda p: g("DrawText", text, 0, 1)),
+            (lambda p: g("StdBits", src, sr, dr, srcCopy, 0),
+             lambda p: g("CopyBits", src, p.addr + 2, sr, dr, srcCopy, 0)),
+            (lambda p: g("StdBits", src, sr, dr, srcCopy, small),
+             lambda p: g("CopyBits", src, p.addr + 2, sr, dr, srcCopy, small))):
+        assert drawn(g, std) == drawn(g, same) != BLANK
+
+
+def test_the_standard_procs_draw_nothing_with_no_verb_or_no_port(g):
+    """A verb past Fill, or no current port, and the shape procs draw
+    nothing, as the rest don't with no port; StdTxMeas measures nothing."""
+    g.port()
+    r = g.rect_ptr((2, 3, 12, 30))
+    poly = g("OpenPoly")
+    g("MoveTo", 4, 2)
+    g("LineTo", 40, 4)
+    g("LineTo", 20, 28)
+    g("ClosePoly")
+    rgn = g("NewRgn")
+    g("RectRgn", rgn, g.rect_ptr((4, 6, 20, 50)))
+    text, one, info = g.ptr(b"Hi"), Point(1, 1), g.ptr(b"\xaa" * 8)
+    src = bitmap(g, [b"\xff\xff"] * 8, 16)
+    sr = g.rect_ptr((0, 0, 8, 16))
+
+    def none_drawn(port):
+        for verb in (5, -1):
+            g("StdRect", verb, r)
+            g("StdOval", verb, r)
+            g("StdRRect", verb, r, 8, 6)
+            g("StdArc", verb, r, 0, 90)
+            g("StdPoly", verb, poly)
+            g("StdRgn", verb, rgn)
+        g("SetPort", 0)
+        for verb in range(5):
+            g("StdRect", verb, r)
+            g("StdPoly", verb, poly)
+            g("StdRgn", verb, rgn)
+        g("StdLine", Point(4, 40))
+        g("StdText", 2, text, one, one)
+        g("StdBits", src, sr, sr, srcCopy, 0)
+        assert g("StdTxMeas", 2, text, one, one, info) == 0
+    assert drawn(g, none_drawn) == BLANK
+    assert g.mem.read(info, 8) == b"\xaa" * 8
+
+
+def test_std_comment_is_pic_comment(g):
+    g.port()
+    pic = g("OpenPicture", g.rect_ptr(FRAME))
+    g("StdComment", 100, 0, 0)
+    g("StdComment", 101, 2, g.handle(b"ok"))
+    g("ClosePicture")
+    assert g.contents(pic) == v1(FRAME, b"\xa0\x00\x64" b"\xa1\x00\x65\x00\x02ok")
+
+
 def test_draw_picture_puts_the_ports_state_back(g):
     port, _ = g.port()
     g("PenSize", 3, 3)
@@ -668,14 +1010,132 @@ def test_seed_c_fill_and_calc_c_mask(qapp):
     assert g.mem.read(g.mem.r32(wide) + 4, 4) == bytes.fromhex("ef c0 1f ff")
 
 
-def test_calc_c_mask_asks_a_match_proc(qapp):
-    """A matchProc decides the walls: this one says every colour is."""
-    g = Guest(model="ii")
-    src, dst = _box_pixmap(g), bitmap(g, [bytes(2)] * 8, 16)
-    proc = g.ptr(bytes.fromhex("206f0004 20bc00000001 205f 508f 1ebc0001 4ed0"))
+@pytest.mark.parametrize("model", ["ii", "plus"])
+def test_calc_c_mask_asks_a_match_proc(qapp, model):
+    """A matchProc decides the walls, given each colour, with the
+    device's GDRefCon, where there's a device, pointing to a MatchRec of
+    seedRGB and matchData while it runs; for a colour it returns false
+    for, the device decides, dark colours being walls."""
+    g = Guest(model=model)
+    src, dst = _box_pixmap(g), bitmap(g, [b"\xaa\xaa"] * 8, 16)
     r = g.rect_ptr((0, 0, 8, 16))
-    g("CalcCMask", src, dst, r, r, g.ptr(bytes(6)), proc, 0)
-    assert g.mem.read(g.mem.r32(dst), 16) == b"\xff" * 16
+    seed = g.ptr(struct.pack(">HHH", 0x1212, 0x3434, 0x5656))
+    gdh = g.mem.r32(0xCC8) if model == "ii" else 0
+    ref_con = (lambda: g.mem.r32(g.mem.r32(gdh) + 0x1A)) if gdh else (lambda: 0)
+    before = ref_con()
+    asked, answers = [], {}
+
+    def match(rgb, result):
+        rec = ref_con()
+        asked.append((g.mem.read(rgb, 6), g.mem.read(rec, 10) if rec else None))
+        colour = g.mem.read(rgb, 6)
+        if colour not in answers:
+            return False
+        if answers[colour] is not None:                 # None: true, with no result
+            g.mem.w32(result, answers[colour])
+        return True
+    g.procs[0x1234] = match
+    g("CalcCMask", src, dst, r, r, seed, 0x1234, 0xCAFE)
+    assert g.mem.read(g.mem.r32(dst), 16) == b"\xff" * 16        # red and blue: dark
+    rec = struct.pack(">HHHL", 0x1212, 0x3434, 0x5656, 0xCAFE)
+    assert {c for c, _ in asked} >= {b"\xff\xff\0\0\0\0", b"\0\0\0\0\xff\xff"}
+    assert {m for _, m in asked} == {rec if gdh else None} and ref_con() == before
+    answers.update({b"\xff\xff\0\0\0\0": 0, b"\0\0\0\0\xff\xff": 1})
+    g("CalcCMask", src, dst, r, r, seed, 0x1234, 0xCAFE)
+    assert g.mem.read(g.mem.r32(dst), 12) == bytes.fromhex("0000 7e00 7e00 7e00 7e00 0000")
+    answers.update({b"\xff\xff\0\0\0\0": None, b"\0\0\0\0\xff\xff": 0x100})  # bit 0 counts
+    g("CalcCMask", src, dst, r, r, seed, 0x1234, 0xCAFE)
+    assert g.mem.read(g.mem.r32(dst), 16) == bytes(16)
+
+
+def test_masked_copies_of_nothing_or_through_nothing_copy_nothing(g):
+    """CopyMask and CopyDeepMask with an empty srcRect or dstRect, a mask
+    of no 1s or an empty mask region copy nothing; CopyDeepMask with no
+    mask copies through its mask region alone, or with neither, all."""
+    port, _ = g.port()
+    src = bitmap(g, [b"\xff\xff"] * 8, 16)
+    mask = bitmap(g, [b"\xff\xff"] * 8, 16)
+    none = bitmap(g, [b"\x00\x00"] * 8, 16)
+    r, empty = g.rect_ptr((0, 0, 8, 16)), g.rect_ptr((4, 4, 4, 12))
+    dst = port.addr + 2
+    g("CopyMask", src, mask, dst, empty, r, r)
+    g("CopyMask", src, mask, dst, r, r, empty)
+    g("CopyMask", src, none, dst, r, r, r)
+    rgn = g("NewRgn")
+    g("CopyDeepMask", src, 0, dst, r, r, r, srcCopy, rgn)
+    g("CopyDeepMask", src, mask, dst, r, r, r, srcCopy, rgn)
+    assert ones(g.rows(port)) == 0
+    g("RectRgn", rgn, g.rect_ptr((0, 0, 8, 4)))
+    g("CopyDeepMask", src, 0, dst, r, r, r, srcCopy, rgn)
+    rows = g.rows(port)
+    assert black(rows, 0, 0, 8, 4) and ones(rows) == 32
+    g("CopyDeepMask", src, 0, dst, r, r, r, srcCopy, 0)
+    assert ones(g.rows(port)) == 128
+
+
+def test_a_mask_quickdraw_cannot_read_masks_nothing_out(g):
+    """A mask BitMap with no bits (a NIL baseAddr), or an empty maskRect,
+    is no mask: CopyMask copies as CopyBits would."""
+    port, _ = g.port()
+    src = bitmap(g, [b"\xff\xff"] * 8, 16)
+    nil = g.ptr(struct.pack(">LH", 0, 2) + rect(0, 0, 8, 16))
+    none = bitmap(g, [b"\x00\x00"] * 8, 16)
+    r = g.rect_ptr((0, 0, 8, 16))
+    for mask, mr in ((nil, r), (none, g.rect_ptr((2, 2, 2, 8)))):
+        g("EraseRect", r)
+        g("CopyMask", src, mask, port.addr + 2, r, mr, r)
+        assert ones(g.rows(port)) == 128
+
+
+def test_seed_fill_and_calc_mask_of_nothing_change_nothing(g):
+    src, dst = g.ptr(bytes(8)), g.ptr(b"\xaa" * 8)
+    for height, words in ((0, 1), (4, 0), (-1, 1), (4, -1)):
+        g("SeedFill", src, dst, 2, 2, height, words, 0, 0)
+        g("CalcMask", src, dst, 2, 2, height, words)
+    assert g.mem.read(dst, 8) == b"\xaa" * 8
+
+
+def test_colour_masks_of_nothing_change_nothing(qapp):
+    """SeedCFill and CalcCMask of an empty srcRect, or of a BitMap with no
+    bits, leave the mask as it was."""
+    g = Guest(model="ii")
+    src = _box_pixmap(g)
+    nil = g.ptr(struct.pack(">LH", 0, 2) + rect(0, 0, 8, 16))
+    dst = bitmap(g, [b"\xaa\xaa"] * 8, 16)
+    r, empty = g.rect_ptr((0, 0, 8, 16)), g.rect_ptr((2, 2, 2, 8))
+    blue = g.ptr(struct.pack(">HHH", 0, 0, 0xFFFF))
+    for bits, sr in ((src, empty), (nil, r)):
+        g("SeedCFill", bits, dst, sr, r, 3, 2, 0, 0)
+        g("CalcCMask", bits, dst, sr, r, blue, 0, 0)
+    assert g.mem.read(g.mem.r32(dst), 16) == b"\xaa" * 16
+
+
+def test_a_colour_mask_goes_only_into_its_bitmaps_bounds(qapp):
+    """The rows and columns of dstRect off the mask BitMap's bounds are
+    left out, and a BitMap with no bits or no rowBytes is left alone."""
+    g = Guest(model="ii")
+    src = _box_pixmap(g)
+    r = g.rect_ptr((0, 0, 8, 16))
+    blue = g.ptr(struct.pack(">HHH", 0, 0, 0xFFFF))
+    guard = b"\x55" * 16
+    block = g.ptr(guard + bytes(16) + guard)            # the BitMap's bits between guards
+    base = block + 16
+    dst = g.ptr(struct.pack(">LH", base, 2) + rect(0, 0, 8, 16))
+    for dr in ((0, 16, 8, 32), (0, -16, 8, 0), (0, 40, 8, 56), (0, -40, 8, -24)):
+        g("CalcCMask", src, dst, r, g.rect_ptr(dr), blue, 0, 0)
+    assert g.mem.read(base, 16) == bytes(16)
+    g("CalcCMask", src, dst, r, g.rect_ptr((4, 0, 12, 16)), blue, 0, 0)
+    assert g.mem.read(base, 16) == bytes.fromhex("0000 0000 0000 0000 0000 7e00 7e00 7e00")
+    g("CalcCMask", src, dst, r, g.rect_ptr((-4, 0, 4, 16)), blue, 0, 0)
+    assert g.mem.read(base, 8) == bytes.fromhex("7e00 0000 0000 0000")
+    assert g.mem.read(block, 16) == g.mem.read(base + 16, 16) == guard
+    low = bytes(i % 255 + 1 for i in range(0x40))
+    g.mem.write(0, low)
+    for bits, row_bytes in ((0, 2), (g.ptr(bytes(16)), 0)):
+        g("CalcCMask", src, g.ptr(struct.pack(">LH", bits, row_bytes) + rect(0, 0, 8, 16)),
+          r, r, blue, 0, 0)
+        assert bits == 0 or g.mem.read(bits, 16) == bytes(16)
+    assert g.mem.read(0, 0x40) == low
 
 
 def test_mask_regions_follow_the_mask(g):

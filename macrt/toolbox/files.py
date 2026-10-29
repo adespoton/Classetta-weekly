@@ -121,6 +121,7 @@ BLOCK = 4096                            # what every volume says its allocation 
 # $8000 and up for less than nothing: Word 1.0 calls its disk full.
 VOLUME_BLOCKS = 0x7FFF
 FREE_BLOCKS = 0x6000
+ROOM = FREE_BLOCKS * BLOCK              # what they say is free: no fork grows past it
 ERIK = 0x4552494B                       # 'ERIK': the procID the Finder gives working directories
 MAC_1904 = 2082844800
 BOOT_VOLUME = "Macintosh HD"
@@ -364,11 +365,9 @@ class Volume:
         node.parent = None
 
     def forget(self, node: Node) -> None:
+        """A file or an empty directory deleted."""
         self.unlink(node)
         self.nodes.pop(node.cnid, None)
-        if isinstance(node, Dir):
-            for child in list(node._children.values()):
-                self.forget(child)
 
     def rename_node(self, node: Node, name: str) -> None:
         if node is self.root:
@@ -404,7 +403,7 @@ class Store:
         pass
 
     def scan(self, vol: Volume, d: Dir) -> None:
-        pass
+        """Find what's in a directory not yet looked in."""
 
     def load(self, f: File) -> tuple[bytes, bytes]:
         if isinstance(f.ref, MacFile):
@@ -466,6 +465,8 @@ class FolderStore(Store):
             self.created(node)
             self.save(node)
         else:
+            if isinstance(node, File):
+                node.forks()                # kept in memory once the folder has them no more
             self.removed(node)
 
 
@@ -594,7 +595,11 @@ def _write(path: Path, data: bytes) -> None:
     path.parent.mkdir(exist_ok=True)
     tmp = path.with_name(f".{path.name}.macrt-tmp")
     tmp.write_bytes(data)
-    os.replace(tmp, path)
+    try:
+        os.replace(tmp, path)
+    except OSError:
+        tmp.unlink(missing_ok=True)         # nothing of a write the host refused is left there
+        raise
 
 
 def mac_name(host: str) -> str:
@@ -604,7 +609,16 @@ def mac_name(host: str) -> str:
 
 
 def host_name(name: str) -> str:
+    if "\0" in name:
+        raise FileError(bdNamErr)               # no host file can be called that
     return name.replace("/", ":")
+
+
+def _same(a: Path, b: Path) -> bool:
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
 
 
 class HostStore(Store):
@@ -621,21 +635,37 @@ class HostStore(Store):
             pass
 
     def path(self, node: Node) -> Path:
+        """Where a node is on the host: PermissionError if a symbolic link
+        made since it was seen takes that outside the shared folder."""
         parts = []
         while node.parent is not None:
             parts.append(node.ref.name if isinstance(node.ref, HostRef) else node.ref)
             node = node.parent
-        return self.root.joinpath(*reversed(parts))
+        return self._inside(self.root.joinpath(*reversed(parts)))
+
+    def _inside(self, p: Path) -> Path:
+        if not p.resolve().is_relative_to(self.root):
+            raise PermissionError(f"{p} is outside the shared folder")
+        return p
+
+    def _real_file(self, p: Path) -> bool:
+        """Is there a file at p, not a link, in a folder in the shared one?"""
+        try:
+            return p.is_file() and not p.is_symlink() and bool(self._inside(p.parent))
+        except OSError:
+            return False
 
     def scan(self, vol: Volume, d: Dir) -> None:
-        where = self.path(d)
         try:
+            where = self.path(d)
             names = sorted(os.listdir(where))
         except OSError:
             return
         for n in names:
             p = where / n
             try:
+                if p.is_symlink():
+                    continue                        # it may lead anywhere on the host
                 if n.startswith(("._", "%")):
                     base = n[2:] if n.startswith("._") else n[1:]
                     if not base or base in names or not p.is_file():
@@ -664,7 +694,7 @@ class HostStore(Store):
     def _file(self, where: Path, n: str) -> File:
         p = where / n
         raw = p.read_bytes()
-        mf = load_file(p, HostFolder(where))
+        mf = load_file(p, HostFolder(where), links=False)
         if raw[:4] == struct.pack(">I", APPLE_SINGLE):
             form = "applesingle"
         elif BINHEX_BANNER in raw[:4096]:
@@ -678,7 +708,7 @@ class HostStore(Store):
         f = File(mac_name(mf.name), *_finfo_for(mf))
         f.ref = HostRef(n, form)
         if form == "plain":
-            f.ref.side = next((s for s in SIDES if _side_path(where, n, s).is_file() and
+            f.ref.side = next((s for s in SIDES if self._real_file(_side_path(where, n, s)) and
                                (s != "namedfork" or _side_path(where, n, s).stat().st_size)),
                               None)
         f.locked = form == "binhex"                 # read only: it's text, not a Mac file
@@ -686,7 +716,7 @@ class HostStore(Store):
         return f
 
     def _orphan(self, where: Path, n: str, base: str) -> File | None:
-        mf = load_file(where / n, HostFolder(where))
+        mf = load_file(where / n, HostFolder(where), links=False)
         if not mf.rsrc:
             return None
         f = File(mac_name(mf.name), *_finfo_for(mf))
@@ -695,8 +725,6 @@ class HostStore(Store):
         return f
 
     def save(self, f: File) -> None:
-        if not isinstance(f.ref, HostRef):
-            return
         ref, data, rsrc = f.ref, *f.forks()
         p = self.path(f)
         finder = bytes(f.finfo + f.xinfo)
@@ -713,11 +741,12 @@ class HostStore(Store):
             _write(p, bytes(data))
             side = ref.side or "._"
             sp = _side_path(p.parent, ref.name, side)
-            old = sp.read_bytes() if sp.is_file() else b""
+            self._inside(sp.parent)
+            old = sp.read_bytes() if self._real_file(sp) else b""
             if side in RAW_SIDES or (old and _entries(old) is None):
                 _write(sp, bytes(rsrc))
                 side, sp = "._", _side_path(p.parent, ref.name, "._")
-                old = sp.read_bytes() if sp.is_file() else b""
+                old = sp.read_bytes() if self._real_file(sp) else b""
                 rsrc = None                         # Finder info only in the "._" file
             entries = _entries(old) or {}
             entries[AS_FINDER_INFO] = finder + entries.get(AS_FINDER_INFO, b"")[32:]
@@ -740,13 +769,21 @@ class HostStore(Store):
             node._forks = [bytearray(), bytearray()]
             self.save(node)
 
+    def _sides(self, node: Node, d: Path, name: str) -> list[tuple[str, Path]]:
+        """The side files beside a plain host file that are its own: the one
+        its resource fork was found in, and the "._" file save() keeps its
+        Finder information in.  Others there may be another file's."""
+        if not (isinstance(node.ref, HostRef) and node.ref.form == "plain"):
+            return []
+        mine = (node.ref.side, "._")
+        return [(s, p) for s in SIDES[1:] if s in mine
+                for p in (_side_path(d, name, s),) if self._real_file(p)]
+
     def _paths(self, node: Node) -> list[Path]:
         """Every host file a node is kept in."""
         p = self.path(node)
-        paths = [p]
-        if isinstance(node.ref, HostRef) and node.ref.form == "plain":
-            paths += [_side_path(p.parent, node.ref.name, s) for s in SIDES[1:]]
-        return [q for q in paths if q.is_file()]
+        return [q for q in [p] if q.is_file()] + [
+            q for _, q in self._sides(node, p.parent, p.name)]
 
     def removed(self, node: Node) -> None:
         if isinstance(node, Dir):
@@ -778,16 +815,17 @@ class HostStore(Store):
     def _relocate(self, node: Node, old_parent: Dir, old_host: str, new_host: str) -> None:
         src_dir, dst_dir = self.path(old_parent), self.path(node.parent)
         case_only = src_dir == dst_dir and old_host.lower() == new_host.lower()
-        if not case_only and os.path.lexists(dst_dir / new_host):
-            raise FileError(dupFNErr)
-        moves = [(src_dir / old_host, dst_dir / new_host)]
-        if isinstance(node.ref, HostRef) and node.ref.form == "plain":
-            for s in SIDES[1:]:
-                a = _side_path(src_dir, old_host, s)
-                if a.is_file():
-                    moves.append((a, _side_path(dst_dir, new_host, s)))
-            if not moves[0][0].exists():
-                moves.pop(0)                        # only a resource fork so far
+        src, dst = src_dir / old_host, dst_dir / new_host
+        if os.path.lexists(dst) and not (case_only and _same(src, dst)):
+            raise FileError(dupFNErr)               # on a host where case matters, another file
+        moves = [(src, dst)]
+        for s, a in self._sides(node, src_dir, old_host):
+            b = _side_path(dst_dir, new_host, s)
+            if s == ".rsrc" and os.path.lexists(b) and not _same(a, b):
+                raise FileError(dupFNErr)           # a file of its own, there for all to see
+            moves.append((a, self._inside(b)))
+        if isinstance(node.ref, HostRef) and node.ref.form == "plain" and not src.exists():
+            moves.pop(0)                            # only a resource fork so far
         for a, b in moves:
             b.parent.mkdir(exist_ok=True)
             os.replace(a, b)
@@ -1014,7 +1052,7 @@ class FileSystem:
         blocks = self._blocks(vol)
         self.mem.write(vol.dqe + 12, struct.pack(">HH", blocks & 0xFFFF, blocks >> 16))
 
-    def mount_folder(self, folder) -> Volume:
+    def mount_folder(self, folder: VolumeFolder | HostFolder | MemoryFolder) -> Volume:
         """The volume a Folder's files are on, mounted the first time."""
         with self.lock:
             if isinstance(folder, VolumeFolder):
@@ -1023,10 +1061,8 @@ class FileSystem:
             elif isinstance(folder, HostFolder):
                 root = Path(folder.root.path).resolve()
                 source, make = root, lambda: (mac_name(root.name or "Host"), HostStore(root))
-            elif isinstance(folder, MemoryFolder):
-                source, make = folder, lambda: ("Memory", FolderStore(folder))
             else:
-                return self.boot
+                source, make = folder, lambda: ("Memory", FolderStore(folder))
             for vol in self.volumes + self.offline:
                 if vol.store.source is source or (isinstance(source, Path) and
                                                   vol.store.source == source):
@@ -1441,9 +1477,8 @@ class FileManager:
                 try:
                     node = self.lookup(v.vref, b, name)
                     break
-                except FileError as again:
-                    if again.code != fnfErr:
-                        raise
+                except FileError:
+                    continue                        # not there, or no such folder
             else:
                 raise
         if not isinstance(node, File):
@@ -1471,11 +1506,6 @@ class FileManager:
         if name and ":" in name and not name.startswith(":"):
             return self.fs.volume_named(name.split(":", 1)[0])
         return self._start(vref, 0)[0]
-
-    def dir_of(self, vref: int) -> tuple[Volume, int]:
-        """The volume and directory a reference number alone means."""
-        vol, d = self._start(vref, 0)
-        return vol, d.cnid
 
     def item(self, vref: int, dirid: int, index: int) -> Node:
         """The index-th file or directory in a directory, from 1."""
@@ -1761,6 +1791,8 @@ class FileManager:
             self._writable(p.node.volume)
             pos = self._position(p, mode, offset)
             fork = p.fork
+            if pos + len(data) > max(len(fork), ROOM):
+                raise FileError(dskFulErr)
             if pos > len(fork):
                 fork.extend(bytes(pos - len(fork)))
             fork[pos:pos + len(data)] = data
@@ -1780,6 +1812,8 @@ class FileManager:
             if eof < 0:
                 raise FileError(paramErr)
             fork = p.fork
+            if eof > max(len(fork), ROOM):
+                raise FileError(dskFulErr)
             if eof < len(fork):
                 del fork[eof:]
             else:

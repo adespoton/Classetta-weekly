@@ -95,7 +95,7 @@ def known(mem, at: int) -> bool:
         return mode in (2, 4, 5, 6) or mode == 7 and reg < 2
     if op & 0xFFC0 == FRESTORE:
         return mode in (2, 3, 5, 6) or mode == 7 and reg < 4
-    if op == FMOVE_IMMEDIATE:                               # FMOVEM.L #<data>,<list>
+    if op == FMOVE_IMMEDIATE and ext & 0xE000 == FMOVE_TO_CONTROL:     # FMOVEM.L #<data>,<list>
         return ext & 0xE3FF == FMOVE_TO_CONTROL and ext & CONTROL_LIST != 0
     if op & 0xFFC0 == 0xF200 and mode > 1:                  # FMOVE.P, from memory or to it
         return (ext & 0xFC7F == FMOVE_P_IN
@@ -114,7 +114,7 @@ def do(cpu, at: int) -> tuple[int, int | None]:
             return _fsave(cpu, at, op), None
         if op & 0xFFC0 == FRESTORE:
             return _frestore(cpu, at, op)
-        if op == FMOVE_IMMEDIATE:
+        if op == FMOVE_IMMEDIATE and ext & 0xE000 == FMOVE_TO_CONTROL:
             return _fmove_to_control(cpu, at, ext), None
         if op & 0xFFC0 == 0xF200:
             return _fmove_packed(cpu, at, op, ext), None

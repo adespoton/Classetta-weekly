@@ -525,6 +525,30 @@ def test_typing_takes_the_style_before_it_or_the_null_style(qd):
     assert r().num_styles(0, 4) == 2
 
 
+def test_a_styled_record_holds_as_much_text_as_any(qd):
+    """Its runs end one past the text: past an INTEGER's range when the
+    text is as long as TextEdit lets it be, so the end is read unsigned."""
+    r = Record(qd, 150, styled=True)
+    r().set_text(b"x" * 40000)
+    assert r.rec.te_length == te.MAX_LENGTH
+    sr = te.TEStyleRec(qd.mem, qd.mem.r32(r.rec.style_handle))
+    assert qd.mem.r16(sr.addr + te.STYLE_REC + 4) == te.MAX_LENGTH + 1
+    r().set_text(b"x" * (te.MAX_LENGTH - 1))
+    r().select(0, 0)
+    r().key(ord("y"))
+    r().key(ord("z"))                               # no room for this one
+    assert r.rec.te_length == te.MAX_LENGTH and r.text()[:2] == b"yx"
+
+
+def test_adding_to_a_size_stops_at_the_largest(qd):
+    r = Record(qd, 150, styled=True)
+    r().set_text(b"hello")
+    r().select(0, 5)
+    for _ in range(2):
+        r().set_style(te.addSize, Style(0, 0, 20000), False)
+    assert r().get_style(2)[0].size == 0x7FFF
+
+
 # -- TETextBox -------------------------------------------------------------------
 def test_text_box_draws_wrapped_and_justified(qd, w):
     r = Record(qd, 100)
@@ -617,3 +641,222 @@ def test_lines_are_erased_through_the_ports_rect_proc(qapp):
                       (2, Rect(lh, 0, 2 * lh, W), Rect(lh, 0, 20, 40))]
     assert qdraw.read_rgn(g.mem, port.clip_rgn).bbox != view    # put back
     assert any("#" in row for row in g.rows(port))  # the text drawn
+
+
+def _record(g, text=b"", view=(0, 0, H, W), styled=False):
+    """A record with text in a port of its own; its handle and TERec."""
+    g.port(W, H)
+    h = g("TEStyleNew" if styled else "TENew", g.rect_ptr((0, 0, H, W)), g.rect_ptr(view))
+    g("TESetText", g.ptr(text), len(text), h)
+    return h, te.TERec(g.mem, g.mem.r32(h))
+
+
+def test_inserting_deleting_and_disposing_from_68k(qapp):
+    """TEInsert puts its text before the selection, which moves along with
+    it, and a negative length inserts nothing; TEDelete takes the
+    selection out; TECalText lays out text an application put in hText
+    itself; TEDispose frees the record and its text."""
+    from guest import Guest
+    g = Guest()
+    h, rec = _record(g, b"world")
+    g("TESetSelect", 0, 2, h)
+    g("TEInsert", g.ptr(b"hello "), 6, h)
+    assert g.contents(rec.h_text) == b"hello world" and (rec.sel_start, rec.sel_end) == (6, 8)
+    assert g.mem_err == 0
+    g("TEInsert", g.ptr(b"x"), -1, h)
+    assert g.contents(rec.h_text) == b"hello world"
+    g("TEDelete", h)
+    assert g.contents(rec.h_text) == b"hello rld" and (rec.sel_start, rec.sel_end) == (6, 6)
+    g.heap.set_handle_size(rec.h_text, 3)
+    g("TECalText", h)
+    assert rec.te_length == 3 and rec.n_lines == 1
+    g("TESetAlignment", te.teJustRight, h)
+    assert rec.just == te.teJustRight
+    text = rec.h_text
+    g("TEDispose", h)
+    assert not g.heap.is_handle(h) and not g.heap.is_handle(text)
+
+
+def test_where_the_text_is_from_68k(qapp):
+    """TEGetPoint gives the bottom left of a character as a Point (v in
+    the high word), TEGetOffset the character at a point, and TEGetHeight
+    the height of a range of lines, either way round, counted from 1."""
+    from guest import Guest
+    g = Guest()
+    h, rec = _record(g, b"ab\rcd\ref")
+    lh = rec.line_height
+    assert g("TEGetPoint", 3, h) == (2 * lh) << 16
+    assert g("TEGetPoint", 4, h) >> 16 == 2 * lh and 0 < g("TEGetPoint", 4, h) & 0xFFFF < 20
+    assert g("TEGetOffset", Point(lh + 2, 0), h) == 3
+    assert g("TEGetHeight", 3, 2, h) == g("TEGetHeight", 2, 3, h) == 2 * lh
+    assert g("TEGetHeight", 9, 1, h) == 3 * lh
+    g("TEScroll", -10, 0, h)
+    assert g("TEGetPoint", 3, h) == ((2 * lh) << 16) | (-10 & 0xFFFF)
+
+
+def test_scrolling_from_68k(qapp):
+    """TEScroll moves the destRect; TEPinScroll stops where the text's top
+    meets the viewRect's; with TEAutoView on, TESelView brings the
+    insertion point into view, and TEFeatureFlag gives the flag as it
+    was."""
+    from guest import Guest
+    g = Guest()
+    h, rec = _record(g, b"ab\rcd\ref", view=(0, 0, 20, W))
+    lh = rec.line_height
+    g("TESetSelect", 8, 8, h)
+    g("TESelView", h)
+    assert rec.dest_rect.top == 0                       # automatic scrolling is off
+    assert g("TEFeatureFlag", te.teFAutoScroll, te.teBitTest, h) == te.teBitClear
+    g("TEAutoView", 1, h)
+    assert g("TEFeatureFlag", te.teFAutoScroll, te.teBitTest, h) == te.teBitSet
+    g("TESelView", h)
+    assert rec.dest_rect.top == 20 - 3 * lh             # the last line's bottom at the view's
+    g("TEPinScroll", 0, 100, h)
+    assert rec.dest_rect.top == 0
+    g("TEScroll", 3, -5, h)
+    assert rec.dest_rect == Rect(-5, 3, H - 5, W + 3)
+    assert g("TEFeatureFlag", te.teFAutoScroll, te.teBitClear, h) == te.teBitSet
+    assert g("TEFeatureFlag", te.teFAutoScroll, te.teBitTest, h) == te.teBitClear
+    g("TEAutoView", 1, h)
+    g("TEAutoView", 0, h)
+    assert g("TEFeatureFlag", te.teFAutoScroll, te.teBitTest, h) == te.teBitClear
+
+
+def test_a_custom_hook_is_swapped_for_the_one_it_replaces(qapp):
+    """TECustomHook puts the routine at addr in place and leaves the one
+    it replaces there."""
+    from guest import Guest
+    g = Guest()
+    h, rec = _record(g, b"abc")
+    addr = g.ptr(struct.pack(">L", 0x1234))
+    g("TECustomHook", 0, addr, h)                       # intEOLHook
+    default = g.mem.r32(addr)
+    assert default != 0x1234
+    g.mem.w32(addr, 0x5678)
+    g("TECustomHook", 0, addr, h)
+    assert g.mem.r32(addr) == 0x1234
+    g("TECustomHook", 0, 0, h)                          # no address: nothing done
+
+
+def test_styles_set_and_found_from_68k(qapp):
+    """TESetStyle, TEGetStyle, TEContinuousStyle, TENumStyles and
+    TEReplaceStyle on a styled record; an unstyled one has no style
+    handle or style scrap, and its style is the record's."""
+    from guest import Guest
+    g = Guest()
+    h, rec = _record(g, b"plain bold", styled=True)
+    assert g("TEGetStyleHandle", h) == rec.style_handle != 0
+    g("TESetSelect", 6, 10, h)
+    st = g.ptr(bytes(te.TEXT_STYLE))
+    Style(0, bold, 0).write(g.mem, st)
+    g("TESetStyle", doFace, st, 0, h)
+    assert g("TENumStyles", 0, 10, h) == g("TENumStyles", 10, 0, h) == 2
+    assert g("TENumStyles", 0, 5, h) == 1
+    out, lh, ascent = g.ptr(bytes(te.TEXT_STYLE)), g.ptr(bytes(2)), g.ptr(bytes(2))
+    g("TEGetStyle", 7, out, lh, ascent, h)
+    assert Style.read(g.mem, out).face == bold and g.mem.r16s(lh) > g.mem.r16s(ascent) > 0
+    g("TEGetStyle", 2, out, lh, ascent, h)
+    assert Style.read(g.mem, out).face == 0
+    mode = g.ptr(struct.pack(">h", te.doAll))
+    g("TESetSelect", 0, 10, h)
+    assert not g("TEContinuousStyle", mode, out, h)
+    assert g.mem.r16s(mode) == te.doAll & ~doFace       # the face isn't continuous
+    g("TESetSelect", 6, 10, h)
+    g.mem.w16(mode, te.doAll)
+    assert g("TEContinuousStyle", mode, out, h) and g.mem.r16s(mode) == te.doAll
+    assert Style.read(g.mem, out).face == bold
+    old, new = g.ptr(bytes(te.TEXT_STYLE)), g.ptr(bytes(te.TEXT_STYLE))
+    Style(0, bold, 0).write(g.mem, old)
+    Style(MONACO, 0, 0).write(g.mem, new)
+    g("TESetSelect", 0, 10, h)
+    g("TEReplaceStyle", doFace | te.doFont, old, new, 0, h)
+    fonts = []
+    for offset in (2, 7):
+        g("TEGetStyle", offset, out, lh, ascent, h)
+        fonts.append(Style.read(g.mem, out).font)
+    assert fonts == [0, MONACO]
+    g("TESetStyleHandle", 0x1234, h)
+    assert rec.style_handle == 0x1234
+
+    plain, prec = _record(g, b"abc")
+    assert g("TEGetStyleHandle", plain) == g("TEGetStyleScrapHandle", plain) == 0
+    g("TESetStyleHandle", 0x1234, plain)
+    g("TEGetStyle", 0, out, lh, ascent, plain)
+    assert Style.read(g.mem, out) == Style(prec.tx_font, prec.tx_face, prec.tx_size)
+    assert (g.mem.r16s(lh), g.mem.r16s(ascent)) == (prec.line_height, prec.font_ascent)
+
+
+def test_style_scraps_from_68k(qapp):
+    """TEGetStyleScrapHandle gives the selection's styles in a new
+    handle, which TEStyleInsert inserts text in and TEUseStyleScrap
+    restyles a range with."""
+    from guest import Guest
+    g = Guest()
+    h, rec = _record(g, b"plain bold", styled=True)
+    g("TESetSelect", 6, 10, h)
+    st = g.ptr(bytes(te.TEXT_STYLE))
+    Style(0, bold, 0).write(g.mem, st)
+    g("TESetStyle", doFace, st, 0, h)
+    scrap = g("TEGetStyleScrapHandle", h)
+    assert scrap and g.mem_err == 0
+    assert [style.face for _, style in te.read_style_scrap(g.contents(scrap))] == [bold]
+    g("TESetSelect", 0, 0, h)
+    g("TEStyleInsert", g.ptr(b"BB"), 2, scrap, h)
+    assert g.contents(rec.h_text) == b"BBplain bold" and g("TENumStyles", 0, 12, h) == 3
+    out, lh, ascent = g.ptr(bytes(te.TEXT_STYLE)), g.ptr(bytes(2)), g.ptr(bytes(2))
+    g("TEGetStyle", 0, out, lh, ascent, h)
+    assert Style.read(g.mem, out).face == bold
+    g("TEUseStyleScrap", 2, 8, scrap, 0, h)                # "plain " bold too
+    assert g("TENumStyles", 0, 12, h) == 1
+    g("TEStyleInsert", g.ptr(b"n"), 1, 0, h)            # no style scrap: the insertion style
+    assert g.contents(rec.h_text) == b"BBnplain bold"
+
+
+def test_cut_copy_and_paste_from_68k(qapp):
+    """TECut and TECopy put the selection in TextEdit's scrap, and for a
+    styled record on the desk scrap too, with its styles, which
+    TEStylePaste takes back; with no text on the desk scrap it takes
+    TextEdit's."""
+    from guest import Guest
+    from macrt.m68k import glue_scrap
+    g = Guest()
+    g("TEInit")
+    h, rec = _record(g, b"plain bold", styled=True)
+    g("TESetSelect", 6, 10, h)
+    st = g.ptr(bytes(te.TEXT_STYLE))
+    Style(0, bold, 0).write(g.mem, st)
+    g("TESetStyle", doFace, st, 0, h)
+    g("TECut", h)
+    assert g.contents(rec.h_text) == b"plain "
+    assert te.te_scrap(g.process.world, g.mem) == b"bold"
+    assert glue_scrap.get_scrap(g, b"TEXT")[1] == b"bold"
+    assert glue_scrap.get_scrap(g, b"styl") is not None
+    g("TESetSelect", 0, 0, h)
+    g("TEStylePaste", h)
+    assert g.contents(rec.h_text) == b"boldplain " and g("TENumStyles", 0, 10, h) == 2
+
+    plain, prec = _record(g, b"xyz")
+    g("TESetSelect", 0, 2, plain)
+    g("TECopy", plain)
+    assert te.te_scrap(g.process.world, g.mem) == b"xy"
+    assert glue_scrap.get_scrap(g, b"TEXT")[1] == b"bold"         # the desk scrap as it was
+    g("ZeroScrap")
+    g("TESetSelect", 3, 3, h)
+    g("TEStylePaste", h)
+    assert g.contents(rec.h_text) == b"bolxydplain "
+    g("TESetSelect", 3, 3, plain)
+    g("TEPaste", plain)
+    assert g.contents(prec.h_text) == b"xyzxy"
+
+
+@pytest.mark.parametrize("name, args, result", [
+    ("TEGetText", (), 0), ("TEGetOffset", (Point(0, 0),), 0), ("TEGetPoint", (0,), 0),
+    ("TEGetHeight", (1, 1), 0), ("TEFeatureFlag", (0, te.teBitSet), te.teBitClear),
+    ("TENumStyles", (0, 1), 0), ("TEGetStyleHandle", (), 0),
+    ("TEGetStyleScrapHandle", (), 0), ("TEContinuousStyle", (0, 0), False),
+    ("TEGetStyle", (0, 0, 0, 0), None), ("TEStylePaste", (), None),
+])
+def test_a_nil_record_is_left_alone(qapp, name, args, result):
+    from guest import Guest
+    g = Guest()
+    assert g(name, *args, 0) == result

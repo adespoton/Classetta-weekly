@@ -40,6 +40,7 @@ class RAM:
     def __init__(self, size: int):
         self.size = size
         self._b = bytearray(size)
+        self._v = memoryview(self._b)   # to copy from without copying twice
         # Pages written from Python, by number: [start, end) of what's
         # been written in each.
         self.dirty: dict[int, list[int]] = {}
@@ -85,11 +86,20 @@ class RAM:
                         span[0] = a
                     if end > span[1]:
                         span[1] = end
-            else:
-                for p in range(first, last + 1):
-                    start, stop = max(a, p << PAGE_SHIFT), min(end, (p + 1) << PAGE_SHIFT)
-                    span = self.dirty.setdefault(p, [start, stop])
-                    span[0], span[1] = min(span[0], start), max(span[1], stop)
+            else:                       # to the end of the first, from the start of the last
+                dirty, after, before = self.dirty, (first + 1) << PAGE_SHIFT, last << PAGE_SHIFT
+                span = dirty.get(first)
+                if span is None:
+                    dirty[first] = [a, after]
+                else:
+                    span[0], span[1] = min(span[0], a), after
+                for p in range(first + 1, last):
+                    dirty[p] = [p << PAGE_SHIFT, (p + 1) << PAGE_SHIFT]
+                span = dirty.get(last)
+                if span is None:
+                    dirty[last] = [before, end]
+                else:
+                    span[0], span[1] = before, max(span[1], end)
         return a
 
     def take_dirty(self) -> list[tuple[int, int]]:
@@ -98,6 +108,9 @@ class RAM:
         if not self.dirty:
             return []
         taken, self.dirty = self.dirty, {}
+        if len(taken) == 1:             # as after most traps: what's left on the stack
+            (start, end), = taken.values()
+            return [(start, end)]
         ranges: list[list[int]] = []
         for p in sorted(taken):
             start, end = taken[p]
@@ -136,10 +149,18 @@ class RAM:
     def w32(self, addr: int, value: int) -> None:
         struct.pack_into(">I", self._b, self._wat(addr, 4), value & 0xFFFFFFFF)
 
+    def unpack(self, layout: struct.Struct, addr: int) -> tuple:
+        """layout's values, from the bytes at addr on."""
+        return layout.unpack_from(self._b, self._at(addr, layout.size))
+
     # -- bytes ---------------------------------------------------------------
     def read(self, addr: int, n: int) -> bytes:
         a = self._at(addr, n)
-        return bytes(self._b[a:a + n])
+        return self._v[a:a + n].tobytes()
+
+    def same(self, addr: int, data: bytes | bytearray) -> bool:
+        """Whether the bytes at addr are data, without reading them out."""
+        return self._b.startswith(data, self._at(addr, len(data)))
 
     def write(self, addr: int, data: bytes) -> None:
         a = self._wat(addr, len(data))
@@ -152,7 +173,7 @@ class RAM:
     def move(self, src: int, dst: int, n: int) -> None:
         """BlockMove: overlapping ranges are fine."""
         s, d = self._at(src, n), self._wat(dst, n)
-        self._b[d:d + n] = self._b[s:s + n]
+        self._b[d:d + n] = self._v[s:s + n].tobytes()
 
     # -- Toolbox types -----------------------------------------------------
     def r_pstr(self, addr: int) -> bytes:

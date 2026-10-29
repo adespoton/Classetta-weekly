@@ -2,8 +2,10 @@
 source) running on the emulated CPU, driven with synthetic input."""
 
 import struct
+import threading
 import time
 import wave
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,11 +16,12 @@ from PyQt6.QtGui import QFont, QFontMetrics
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication
 
-from macrt.m68k import controlpanel, dispatch
-from macrt.m68k.cpu import PAGE_SIZE
+from macrt.m68k import controlpanel, dispatch, runtime
+from macrt.m68k.cpu import CPU, PAGE_SIZE
 from macrt.m68k.hardware import vBufA
 from macrt.m68k.runtime import LEVEL_1_ROUTINE, Runner, SystemError68k
 from macrt.macfile import MacFile, MemoryFolder, load_volume, open_application, volume_files
+from macrt.memory import RAM
 from macrt.resfork import Resource, build_fork, open_fork, resSysHeap
 from macrt.toolbox import constants as k
 from macrt.toolbox import lowmem
@@ -37,6 +40,9 @@ from conftest import Recorder
 
 APPS = Path(__file__).parent / "apps"
 CLICKS = -236               # hello.s's click count, below A5
+# Tests that measure an application thread's own processor time, from this one.
+OWN_TIME = pytest.mark.skipif(not hasattr(time, "pthread_getcpuclockid"),
+                              reason="the host can't read another thread's processor time")
 
 
 def launch_hello(h):
@@ -179,6 +185,15 @@ def test_hello_quits(harness, how):
         h.click(*h.box_point(rec, k.wInGoAway))
     h.wait_until(lambda: proc not in h.d.processes, timeout=5, what="Hello to quit")
     assert rec not in h.d.views
+
+
+def test_the_clock_stops_once_the_display_is_done_with(harness):
+    h = harness()
+    proc, _ = launch_hello(h)
+    cpu = proc.runner.machine.cpu
+    h.d.shutdown(quit_app=False)
+    h.d.join(5)
+    assert cpu._closed.is_set()
 
 
 def test_a_crash_stops_only_that_app(harness):
@@ -931,11 +946,13 @@ def test_the_user_says_which_disk_goes_in_for_one_unmounted(harness):
 def test_vbl_tasks_run_every_tick_until_removed(harness):
     """VBL counts its VBL task's runs while it spins (it calls no trap, so
     only the vertical retrace gets the task in), and while it waits in
-    Delay, the host having the processor; then it masks interrupts, then
-    removes the task, and the task doesn't run in either case.  A task
-    that doesn't set its count again runs once and is taken out of the
-    queue, and can be installed again.  The task's word above its return
-    address lands in what the interrupt stacked, not in the spin's stack."""
+    Delay, the host having the processor: every other tick of those it
+    waited, which may be a few more than 30 if the host was slow.  Then it
+    masks interrupts, then removes the task, and the task doesn't run in
+    either case.  A task that doesn't set its count again runs once and is
+    taken out of the queue, and can be installed again.  The task's word
+    above its return address lands in what the interrupt stacked, not in
+    the spin's stack."""
     h = harness()
     h.launch(Recorder("Other"))
     f = open_application(APPS / "VBL.bin")
@@ -946,13 +963,64 @@ def test_vbl_tasks_run_every_tick_until_removed(harness):
     assert mem.r16s(a5 - 16) >= 10                  # its runs
     assert mem.r32(a5 - 26) == 0x12345678           # the spin's D1, as it left it
     assert mem.r32(a5 - 36) == 0xCAFEF00D           # what it had on its stack
-    assert 12 <= mem.r16s(a5 - 28) <= 16            # every other tick of 30
+    runs, waited = mem.r16s(a5 - 28), mem.r16s(a5 - 38)
+    assert waited >= 29 and abs(2 * runs - waited) <= 3     # every other tick
     assert mem.r16s(a5 - 18) == 0                   # none while masked
     assert mem.r16s(a5 - 20) == 0                   # VRemove: noErr
     assert mem.r16s(a5 - 22) == 0                   # none after
     assert mem.r16s(a5 - 30) == 2                   # once for each VInstall
     assert mem.r16s(a5 - 32) == -1                  # VRemove: qErr, it's gone
     assert proc.runner.unimplemented_calls == {}
+
+
+def test_a_late_retrace_makes_up_for_the_ticks_it_missed(monkeypatch):
+    """The host late for the vertical retrace, a VBL task is counted down
+    once for each tick it missed, up to MAX_LATE of them; after a break,
+    interrupts masked or another application's turn, up to MAX_RETRACES;
+    after a retrace that left nothing counting down, just once, so that a
+    task installed since counts from then.  A longer gap counts once."""
+    mem, task = RAM(0x10000), 0x1000
+    mem.w32(lowmem.VBLQueue + 2, task)
+    mem.w16(task + runtime.VBL_COUNT, 1000)
+    clock = SimpleNamespace(now=5000)
+    monkeypatch.setattr(runtime, "tick_count", lambda: clock.now)
+    cpu = SimpleNamespace(mem=mem, sr=0x2000, context=lambda: None, restore=lambda ctx: None,
+                          sound_waiting=lambda: False)
+    cpu.vbl_counting = lambda: CPU.vbl_counting(cpu)
+    quiet = SimpleNamespace(retrace=lambda *args: None)
+    r = SimpleNamespace(cpu=cpu, mem=mem, retrace_tick=0, catch_up=1, ctx=None,
+                        machine=SimpleNamespace(sound=quiet, sound_manager=quiet, speaker=quiet),
+                        process=SimpleNamespace(world=SimpleNamespace(switch_in=lambda: None)),
+                        _interrupt_frame=lambda: None)
+
+    def counted(gap):
+        clock.now += gap
+        before = mem.r16s(task + runtime.VBL_COUNT)
+        Runner._retrace_tasks(r)
+        return before - mem.r16s(task + runtime.VBL_COUNT)
+
+    def masked():
+        cpu.sr = 0x2700
+        Runner._vertical_retrace(r)
+        cpu.sr = 0x2000
+
+    assert counted(0) == 1                          # the first: once
+    assert [counted(1), counted(12), counted(runtime.MAX_LATE)] == [1, 12, runtime.MAX_LATE]
+    assert [counted(runtime.MAX_LATE + 1), counted(12)] == [1, 12]
+    masked()
+    assert [counted(12), counted(12)] == [1, 12]
+    masked()
+    assert counted(runtime.MAX_RETRACES) == runtime.MAX_RETRACES
+    other = SimpleNamespace(process=SimpleNamespace(world=SimpleNamespace(switch_out=lambda: None)))
+    machine = SimpleNamespace(_lock=threading.Lock(), owner=other, cpu=cpu)
+    runtime.Machine.acquire(machine, r)
+    machine._lock.release()
+    assert [counted(12), counted(12)] == [1, 12]
+    mem.w16(task + runtime.VBL_COUNT, 0)            # waiting for nothing
+    assert counted(1) == 0
+    mem.w16(task + runtime.VBL_COUNT, 1000)
+    assert [counted(3), counted(3)] == [1, 3]
+    assert counted(0) == 0 and r.catch_up == runtime.MAX_LATE
 
 
 def test_get_next_event_with_nothing_to_give_returns_at_once(harness):
@@ -972,6 +1040,7 @@ def test_get_next_event_with_nothing_to_give_returns_at_once(harness):
     assert proc.runner.unimplemented_calls == {}
 
 
+@OWN_TIME
 def test_a_program_asking_over_and_over_leaves_the_host_the_processor(harness):
     """Spin asks TickCount over and over for a second, then Button until
     the mouse goes down, with nothing else in its loops.  The ticks come
@@ -1004,6 +1073,51 @@ def test_a_program_asking_over_and_over_leaves_the_host_the_processor(harness):
     assert proc.runner.unimplemented_calls == {}
 
 
+def test_asking_over_and_over_is_timed_by_the_programs_own_processor_time(monkeypatch):
+    """The host may give the processor to something else between two of a
+    program's calls to TickCount, as it does under load: that isn't the
+    program doing something else, so once it's had SPIN_BUDGET of its own
+    time asking it still waits for the next tick.  Its own time between
+    them is something else, as is another trap."""
+    clock = SimpleNamespace(own=0.0, wall=0.0)
+    naps = []
+    monkeypatch.setattr(runtime, "time", SimpleNamespace(monotonic=lambda: clock.wall))
+    monkeypatch.setattr(runtime, "dispatch", SimpleNamespace(
+        trap_key=dispatch.trap_key, dispatch=lambda runner, word, pc: None))
+    r = SimpleNamespace(cpu_time=lambda: clock.own, polled=-runtime.SPIN_GAP, spun_from=0.0,
+                        holding=True,
+                        machine=SimpleNamespace(ticking=lambda: False),
+                        cpu=SimpleNamespace(rate=0, sr=0x2000), yielding=nullcontext,
+                        process=SimpleNamespace(events=SimpleNamespace(
+                            nap=lambda secs: naps.append(clock.own))))
+    r._polling = lambda: Runner._polling(r)
+
+    def ask(times, own, away=0.0, between=None):
+        for _ in range(times):
+            clock.own += own
+            clock.wall += own + away
+            Runner._dispatch(r, 0xA975, 0)          # TickCount
+            if between:
+                Runner._dispatch(r, between, 0)
+    ask(30, 0.0001, away=0.001)
+    assert len(naps) == 1 and naps[0] - 0.0001 >= runtime.SPIN_BUDGET
+    naps.clear()
+    ask(30, runtime.SPIN_GAP)
+    ask(30, 0.0001, between=0xA122)                 # NewHandle
+    assert naps == []
+
+
+def test_where_the_host_cant_tell_a_threads_own_time_spinning_is_timed_by_the_clock(
+        monkeypatch):
+    """macOS has no clock for another thread's processor time: there the
+    clock's time stands in, as before, and on Linux a thread's own."""
+    if hasattr(time, "pthread_getcpuclockid"):
+        assert abs(runtime.thread_clock()() - time.thread_time()) < 0.01
+    monkeypatch.delattr(time, "pthread_getcpuclockid", raising=False)
+    assert runtime.thread_clock() is time.monotonic
+
+
+@OWN_TIME
 def test_an_update_event_left_unanswered_comes_once_a_tick(harness):
     """Unanswered never draws its window, so GetNextEvent gives it the
     update event each time it asks, as on a Mac: but asked again in the
@@ -1547,6 +1661,34 @@ def test_the_sound_driver_plays_its_three_synthesizers_and_the_buffer_is_heard(
     # frame of its own when the host is late with a tick.
     assert levels.count({0xC0}) >= 3
     assert levels.count({0x40}) >= 4                # the buffer, written straight
+
+
+def test_the_sound_chip_written_between_traps_is_heard_as_the_program_runs_on(
+        harness, tmp_path):
+    """On a Mac II, a program fills the Apple Sound Chip's first FIFO
+    itself and spins for five ticks before its next trap: what it wrote
+    is played at a tick as it spins, not left for after it quits."""
+    wav = tmp_path / "chip.wav"
+    h = harness(model="ii", record_sound=str(wav))
+    code = bytes.fromhex(f"2278 {lowmem.ASCBase:04X}"     # MOVEA.L ASCBase,A1
+                         "323C 0171"                     # MOVE.W #369,D1
+                         "12BC 0040"                     # 1: MOVE.B #$40,(A1)
+                         "51C9 FFFA"                     # DBRA D1,1b
+                         f"2038 {lowmem.Ticks:04X}"      # MOVE.L Ticks,D0
+                         "5A80"                          # ADDQ.L #5,D0
+                         f"B0B8 {lowmem.Ticks:04X}"      # 2: CMP.L Ticks,D0
+                         "62FA"                          # BHI.S 2b
+                         "A9F4")                         # _ExitToShell
+    app = MacFile("Chip", rsrc=build_fork(code_resources(code, 4)), type=b"APPL",
+                  creator=b"CHIP")
+    proc = h.d.launch(app.name, None, app=app)
+    h.wait_until(lambda: proc not in h.d.processes, timeout=10, what="Chip to finish")
+    assert not h.d.system_errors
+    h.d.shutdown(quit_app=False)
+    with wave.open(str(wav)) as w:
+        samples = w.readframes(w.getnframes())
+    frames = [frozenset(samples[i:i + 370]) for i in range(0, len(samples), 370)]
+    assert frames == [{0x40}]
 
 
 # -- ResStub: a patch on _ResourceStub ---------------------------------------------

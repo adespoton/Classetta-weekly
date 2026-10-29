@@ -36,16 +36,7 @@ from ..toolbox.dialogs import (
 )
 from ..toolbox.events import EventRecord
 from ..toolbox.memmgr import noErr
-from ..toolbox.qdraw import (
-    _mono,
-    frame_path,
-    qrect,
-    read_rgn,
-    rect_path,
-    round_rect_path,
-    source_image,
-    srcCopy,
-)
+from ..toolbox.qdraw import frame_path, read_rgn, rect_path, round_rect_path
 from ..toolbox.quickdraw import BLACK_PAT, GRAY_PAT
 from ..toolbox.templates import (
     editText,
@@ -75,7 +66,9 @@ from .glue_controls import (
     new_control,
     scratch,
 )
-from .glue_toolbox import window_pictures
+from .glue_icons import PlotIcon
+from .glue_pict import DrawPicture
+from .glue_windows import window_pictures
 
 from . import glue_textedit as te
 
@@ -270,28 +263,15 @@ def _text_box(t, w, data: bytes, r: Rect) -> None:
 
 
 def _plot_icon(t, w, r: Rect, h: int) -> None:
-    plot = dispatch.IMPLEMENTATIONS.get("PlotIcon")
-    if plot is not None:
-        with _in_port(t, w), scratch(t, 8) as rp:
-            t.set_rect(rp, r)
-            plot(t, rp, h)
-        return
-    data = _text(t, h)
-    if len(data) < 128:
-        return
-    img, comp = source_image(_mono(data[:128], 32, 32, 4), srcCopy)
-    with t.tb.qd.painting(w, r) as p:
-        if p is not None:
-            p.setCompositionMode(comp)
-            p.drawImage(qrect(r), img)
+    with _in_port(t, w), scratch(t, 8) as rp:
+        t.set_rect(rp, r)
+        PlotIcon(t, rp, h)
 
 
 def _draw_picture(t, w, r: Rect, h: int) -> None:
-    draw = dispatch.IMPLEMENTATIONS.get("DrawPicture")
-    if draw is not None and h:
-        with _in_port(t, w), scratch(t, 8) as rp:
-            t.set_rect(rp, r)
-            draw(t, h, rp)
+    with _in_port(t, w), scratch(t, 8) as rp:
+        t.set_rect(rp, r)
+        DrawPicture(t, h, rp)
 
 
 def _alert_icon(t, w, which: int) -> None:
@@ -381,11 +361,7 @@ def _copy_resource(t, rtype: str, rid: int) -> int:
     h = t.process.resources.GetResource(rtype, rid)
     if not h:
         return 0
-    data = t.tb.contents(h)
-    copy = t.process.heap.new_handle(len(data))
-    if copy:
-        t.mem.write(t.process.heap.deref(copy), data)
-    return copy
+    return t.process.heap.new_handle_with(t.tb.contents(h))
 
 
 def _make_items(t, w, first: int = 1) -> None:
@@ -409,9 +385,7 @@ def _make_items(t, w, first: int = 1) -> None:
             else:
                 h = new_control(t, w, item.rect, data, True, 0, 0, 1, kind & 3, 0)
         elif item.is_text:
-            h = heap.new_handle(len(data))
-            if h:
-                t.mem.write(heap.deref(h), data)
+            h = heap.new_handle_with(data)
             if kind == editText and first_edit is None:
                 first_edit = item
         elif kind == iconItem:
@@ -518,6 +492,7 @@ def GetNewDialog(t, dialog_id, storage, behind):
     w = new_dialog(t, storage, bounds, tmpl.title, False, tmpl.proc_id, _behind(t, behind),
                    tmpl.go_away, tmpl.ref_con, item_list, color=bool(ct))
     if w is None:
+        t.process.heap.dispose_handle(item_list)    # the copy is ours, not the caller's
         return 0
     if ct:
         _colored(t, w, ct)
@@ -1082,6 +1057,7 @@ def _alert(t, alert_id: int, filter_proc: int, icon: int = -1) -> int:
     w = new_dialog(t, 0, bounds, "", False, k.dBoxProc, IN_FRONT, False, 0, item_list,
                    color=bool(ct))
     if w is None:
+        t.process.heap.dispose_handle(item_list)
         return -1
     if ct:
         _colored(t, w, ct)

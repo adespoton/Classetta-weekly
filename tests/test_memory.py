@@ -1,10 +1,12 @@
 """RAM, the Memory Manager and the low-memory globals."""
 
+import random
 import struct
 
 import pytest
 from guest import Guest
 
+from macrt.m68k.glue_common import _heap
 from macrt.memory import RAM, BusError
 from macrt.toolbox import lowmem
 from macrt.toolbox.memmgr import (
@@ -36,6 +38,42 @@ def test_a_mirrored_range_is_another_way_to_the_memory_it_mirrors():
     assert m.read(0xF800, 3) == b"abc" and m.r8(0xFF00F801) == ord("b")
     assert m.physical(0xF700) == 0x3700 and m.physical(0xD700) == 0xD700
     assert m.take_dirty() == [(0x3700, 0x3803)]     # the memory written, by where it is
+
+
+def test_whats_written_is_noted_in_each_page_from_its_first_byte_to_its_last():
+    m = RAM(0x10000)
+    rng = random.Random(7)
+    for _ in range(300):
+        seen: dict[int, list[int]] = {}         # page: [first, last + 1], byte by byte
+        for _ in range(rng.randrange(1, 6)):
+            at = rng.randrange(0x10000)
+            n = rng.choice([0, 1, 2, 4, rng.randrange(1, 0x100), rng.randrange(1, 0x4000)])
+            n = min(n, 0x10000 - at)
+            rng.choice([lambda: m.write(at, bytes(n)), lambda: m.fill(at, n, 0xAA),
+                        lambda: m.move(rng.randrange(0x10000 - n + 1), at, n)])()
+            for page in range(at >> 12, (at + n - 1 >> 12) + 1 if n else at >> 12):
+                lo, hi = max(at, page << 12), min(at + n, page + 1 << 12)
+                span = seen.setdefault(page, [lo, hi])
+                span[0], span[1] = min(span[0], lo), max(span[1], hi)
+        want: list[tuple[int, int]] = []
+        for page in sorted(seen):
+            lo, hi = seen[page]
+            if want and want[-1][1] == lo:
+                want[-1] = (want[-1][0], hi)
+            else:
+                want.append((lo, hi))
+        assert m.take_dirty() == want
+
+
+def test_bytes_are_compared_where_they_are():
+    m = RAM(0x10000)
+    m.mirror(0xE000, 0x10000, 0x2000)
+    m.write(0x3000, b"abcdef")
+    assert m.same(0x3000, b"abcdef") and m.same(0xF001, bytearray(b"bcd"))
+    assert not m.same(0x3001, b"abcd") and m.same(0x3000, b"")
+    assert m.read(0x2000, 0x8000)[0x1000:0x1006] == b"abcdef"
+    with pytest.raises(BusError):
+        m.same(0x1FFFE, b"abc")
 
 
 def test_ram_toolbox_types():
@@ -95,6 +133,32 @@ def test_handles_go_through_master_pointers():
     h.unlock(hd)
     h.dispose_handle(hd)
     assert h.new_handle(4) == hd                  # the master pointer is reused
+
+
+def test_a_handle_can_be_made_holding_bytes_or_not_at_all():
+    m, h = heap()
+    hd = h.new_handle_with(b"bytes")
+    assert h.handle_size(hd) == 5 and m.read(h.deref(hd), 5) == b"bytes" and h.error == noErr
+    free = h.free_bytes()
+    assert h.new_handle_with(bytes(0x10000)) == 0 and h.error == memFullErr
+    assert h.free_bytes() == free
+
+
+def test_the_heap_an_address_is_in(qapp):
+    """The heap of a block, the application's for one in none (a handle
+    whose master pointer is in a program's globals) to the glue that has
+    somewhere to make a block for it."""
+    g = Guest()
+    system, app = g.system, g.process.heap
+    own = system.sys_heap.new_handle(4)
+    for addr, where in ((app.new_handle(4), app), (own, system.sys_heap),
+                        (system.sys_heap.deref(own), system.sys_heap)):
+        assert system.find_heap(addr) is system.heap_of(addr) is _heap(g, addr) is where
+    globals_ = g.process.partition.a5 - 4
+    for addr in (0, lowmem.ApplLimit, globals_):
+        assert system.find_heap(addr) is None and _heap(g, addr) is app
+        with pytest.raises(ValueError):
+            system.heap_of(addr)
 
 
 def test_disposing_a_handle_whose_master_pointer_was_written_over():
@@ -347,6 +411,47 @@ def test_max_mem_compacts_the_zone(qapp):
     assert heap.deref(hs[2]) == was - 0x408
     addr, size = heap._free[-1]
     assert addr + size == heap.end and size - HEADER == largest
+
+
+def test_max_mem_purges_every_purgeable_block(qapp):
+    """Inside Macintosh II-38: "MaxMem compacts the current heap zone and
+    purges all purgeable blocks from the zone", the locked ones aside."""
+    g = Guest()
+    heap = g.process.heap
+    purged, locked, kept = (heap.new_handle(0x400) for _ in range(3))
+    for h in (purged, locked):
+        heap.set_purgeable(h)
+    heap.lock(locked)
+    largest, growth = g("MaxMem", 0)
+    assert heap.is_empty(purged) and heap.is_handle(purged)
+    assert not heap.is_empty(locked) and not heap.is_empty(kept)
+    assert g.mem_err == noErr and largest == heap.max_block(grow=False)
+
+
+def test_purge_mem_purges_until_there_is_room_and_moves_nothing():
+    """Inside Macintosh II-40: blocks are purged "until a contiguous block
+    of at least cbNeeded free bytes is created"; it doesn't compact."""
+    m, h = heap(0x1800)
+    first, kept, second, third = (h.new_handle(0x500) for _ in range(4))
+    for hd in (first, second, third):
+        h.set_purgeable(hd)
+    where = h.deref(kept)
+    assert h.max_block() < 0x400
+    assert h.purge_for(0x400)
+    assert h.is_empty(first) and not h.is_empty(second) and not h.is_empty(third)
+    assert h.deref(kept) == where
+    assert not h.purge_for(0x2000)
+    assert h.is_empty(second) and h.is_empty(third) and h.deref(kept) == where
+
+
+def test_purge_mem_says_when_there_is_no_room(qapp):
+    g = Guest()
+    hd = g.process.heap.new_handle(0x100)
+    g.process.heap.set_purgeable(hd)
+    g("PurgeMem", 0x10, 0)
+    assert g.mem_err == noErr and not g.process.heap.is_empty(hd)
+    g("PurgeMem", 0x7FFFFFFF, 0)
+    assert g.mem_err == memFullErr and g.process.heap.is_empty(hd)
 
 
 def test_blocks_a_program_moved_itself_are_found_where_they_are():
@@ -830,3 +935,32 @@ def test_a_zone_made_in_the_system_heap_outlives_the_application(qapp):
     g.system.close_partition(g.process.partition)
     assert g.system.zone(in_system) is not None
     assert g.system.zone(in_appl) is None
+
+
+def test_dequeue_from_a_queue_that_goes_round_ends(qapp):
+    """An element enqueued again while it's the last links it to itself:
+    Dequeue of one that isn't there then stops where the queue starts over."""
+    g = Guest()
+    header, a, b, c = (g.ptr(bytes(10)) for _ in range(4))
+    for elem in (a, b, b):
+        g("Enqueue", elem, header)
+    assert g.mem.r32(b) == b                    # b's link is b
+    assert g("Dequeue", c, header) == -1        # qErr: not in it
+    assert g("Dequeue", a, header) == 0
+    assert g.mem.r32(header + 2) == b
+
+
+def test_a_limit_past_the_stack_leaves_the_stack(qapp):
+    """Macify 2.7 sets ApplLimit 128K past ApplZone, past the stack of its
+    75K partition, then calls MaxApplZone and loads a segment: the heap
+    stops where the stack starts, and the segment can't land on it."""
+    g = Guest()
+    proc = g.process
+    heap, world = proc.heap, proc.world
+    limit, stack_base = world.r32(lowmem.ApplLimit), proc.partition.stack_base
+    g("SetApplLimit", stack_base + 0x10000)
+    assert g.mem_err == noErr and world.r32(lowmem.ApplLimit) == stack_base + 0x10000
+    g("MaxApplZone")
+    assert heap.end == heap.limit == limit == world.r32(lowmem.HeapEnd)
+    g("SetApplLimit", stack_base - 0x100)        # below the base: a smaller stack, as asked
+    assert g.mem_err == noErr and heap.limit == (stack_base - 0x100) & ~3

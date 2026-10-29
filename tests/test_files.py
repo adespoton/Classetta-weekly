@@ -325,6 +325,59 @@ def test_hfs_catalog_flags():
     assert games["Test Prefs"].locked and games["Test Prefs"].attributes == 0
 
 
+def _btree(img, at):
+    """Where the MDB says an HFS image's extents (130) or catalog (146) file is."""
+    block_size, = struct.unpack_from(">I", img, 1024 + 20)
+    first, = struct.unpack_from(">H", img, 1024 + 28)
+    start, = struct.unpack_from(">H", img, 1024 + at + 4)
+    return first * 512 + start * block_size
+
+
+def test_a_damaged_hfs_disk_is_damaged_not_endless():
+    """Links in an image's catalog that go round are a damaged disk, which
+    macrt says it is, rather than reading it for ever."""
+    img = bytearray(hfs_image())
+    tree = _btree(img, 146)
+    leaf, = struct.unpack_from(">L", img, tree + 14 + 10)        # bthFNode
+    struct.pack_into(">L", img, tree + 512 * leaf, leaf)         # its ndFLink: itself
+    with pytest.raises(ValueError, match="damaged .*B.-tree"):
+        load_volume(bytes(img))
+    # A folder in itself: the disk's top folder, there in its own Games folder.
+    img = bytearray(hfs_image())
+    key = img.find(b"\x00\x00\x00\x02\x05Games", _btree(img, 146)) - 2
+    value = key + ((img[key] + 2) & ~1)
+    games = img[value + 6:value + 10]
+    top = img.find(b"\x00\x00\x00\x01\x09Test Disk", _btree(img, 146)) - 2
+    img[top + 2:top + 6] = games
+    with pytest.raises(ValueError, match="damaged .*inside itself"):
+        load_volume(bytes(img))
+
+
+def test_an_hfs_file_whose_extents_overflow_into_nothing():
+    """A fork longer than its extents, whose next ones in the extents
+    overflow file are of no blocks at all."""
+    img = bytearray(hfs_image())
+    key = img.find(b"\x00\x00\x00\x02\x05Games", _btree(img, 146)) - 2
+    games = img[key + ((img[key] + 2) & ~1) + 6:][:4]
+    key = img.find(games + b"\x08Test App", _btree(img, 146)) - 2
+    value = key + ((img[key] + 2) & ~1)
+    cnid, = struct.unpack_from(">L", img, value + 20)
+    struct.pack_into(">L", img, value + 26, 3 * 512)             # filLgLen: three blocks
+    assert struct.unpack_from(">H", img, value + 74 + 2)[0] == 1  # in one block's extent
+    # An extents overflow tree, its one leaf in block 1, over the data fork it never reads.
+    xt = _btree(img, 130)
+    struct.pack_into(">I12s", img, 1024 + 130, 1024, struct.pack(">6H", 0, 2, 0, 0, 0, 0))
+    struct.pack_into(">HLLLL", img, xt + 14, 1, 1, 1, 1, 1)      # depth, root, records, F, L
+    struct.pack_into(">L", img, xt + 14 + 22, 2)                 # bthNNodes
+    leaf = xt + 512
+    img[leaf:leaf + 512] = bytes(512)
+    struct.pack_into(">LLBBH", img, leaf, 0, 0, 0xFF, 1, 1)
+    img[leaf + 14:leaf + 34] = struct.pack(">BBLH12s", 7, 0, cnid, 1, bytes(12))
+    struct.pack_into(">HH", img, leaf + 508, 34, 14)
+    with pytest.raises(ValueError, match="damaged .*extents"):
+        load_volume(bytes(img))
+
+
 def test_diskcopy_image():
     img = hfs_image()
     header = bytearray(84)

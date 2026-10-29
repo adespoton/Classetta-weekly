@@ -145,7 +145,7 @@ def edit() -> bytes:
 
 def lists() -> bytes:
     code = assemble(HERE / "lists.s")
-    resources = code_resources(code, globals_size=262) + [
+    resources = code_resources(code, globals_size=264) + [
         Resource(b"WIND", 128, wind((60, 40, 220, 300), "Lists", k.documentProc, True, True)),
         Resource(b"SIZE", -1, size_res(256 * 1024, 128 * 1024)),
     ]
@@ -154,7 +154,7 @@ def lists() -> bytes:
 
 def vbl() -> bytes:
     code = assemble(HERE / "vbl.s")
-    resources = code_resources(code, globals_size=36)
+    resources = code_resources(code, globals_size=38)
     return macbinary("VBL", b"", build_fork(resources), b"APPL", b"VBLT")
 
 

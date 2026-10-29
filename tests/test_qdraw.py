@@ -1,10 +1,13 @@
 """QuickDraw's drawing, checked bit by bit in 1-bit bitmaps in guest
 memory, and its regions, checked against QuickDraw's own region format."""
 
+import random
+
 import pytest
 from PyQt6.QtGui import QColor, QFont, QImage
 
-from macrt.toolbox import qdraw
+from macrt.memory import RAM
+from macrt.toolbox import pixels, qdraw
 from macrt.toolbox.qdraw import Region, oval_path, rect_path
 from macrt.toolbox.quickdraw import BLACK_PAT, GRAY_PAT, Backing, GrafPort
 from macrt.toolbox.system import System
@@ -62,6 +65,14 @@ def test_region_data_is_quickdraws():
         "7fff")
     assert Region.from_data(rgn.to_data()) == rgn
     assert Region.rect(Rect(1, 2, 3, 4)).to_data().hex() == "000a0001000200030004"
+
+
+def test_an_unpaired_inversion_point_is_left_out():
+    # rows 0 to 10: 2, 5 and 9 (the 9 unpaired), then 2 and 5 again
+    data = bytes.fromhex("0018" "000000000014000a" "0000" "000200050009" "7fff"
+                         "000a" "00020005" "7fff" "7fff")
+    rgn = Region.from_data(data)
+    assert rgn == Region.rect(Rect(0, 2, 10, 5)) and list(rgn.rects()) == [Rect(0, 2, 10, 5)]
 
 
 def test_region_operations():
@@ -151,6 +162,27 @@ def test_pattern_transfer_modes(qd, mode, expect):
     port.pn_mode = mode
     qd.shape(port, "Paint", rect_path, Rect(0, 0, 1, 8))
     assert rows(qd, bits, 1)[0][:8] == expect
+
+
+@pytest.mark.parametrize("mode, black, white", [
+    (qdraw.patCopy, "########", "........"),
+    (qdraw.patOr, "########", "####.#.#"),
+    (qdraw.patXor, "....#.#.", "####.#.#"),
+    (qdraw.patBic, "........", "####.#.#"),
+    (qdraw.notPatCopy, "........", "########"),
+    (qdraw.notPatOr, "####.#.#", "########"),
+    (qdraw.notPatXor, "####.#.#", "....#.#."),
+    (qdraw.notPatBic, "####.#.#", "........"),
+])
+def test_patterns_of_one_colour_in_each_mode(qd, mode, black, white):
+    """Black and white patterns (painted with a plain brush, not a pattern's)."""
+    for pat, expect in ((BLACK_PAT, black), (bytes(8), white)):
+        port, bits = offscreen(qd)
+        qd.mem.w8(bits, 0b11110101)
+        port.pn_pat = pat
+        port.pn_mode = mode
+        qd.shape(port, "Paint", rect_path, Rect(0, 0, 1, 8))
+        assert rows(qd, bits, 1)[0][:8] == expect
 
 
 def test_drawing_is_clipped_to_the_clip_region(qd):
@@ -331,6 +363,73 @@ def test_get_pixel(qd):
     port, bits = offscreen(qd)
     qd.mem.w8(bits + ROW_BYTES, 0b01000000)
     assert qd.get_pixel(port, Point(1, 1)) and not qd.get_pixel(port, Point(1, 0))
+
+
+def value(data, s, x, y):
+    """The value of the pixel at (x, y) of s, a MemorySurface, in data, the
+    memory it's in."""
+    bit = (x - s.bounds.left) * s.depth
+    byte = data[s.base + (y - s.bounds.top) * s.row_bytes + (bit >> 3)]
+    return byte >> (8 - s.depth - (bit & 7)) & ((1 << s.depth) - 1)
+
+
+def inside(r, x, y):
+    return any(t <= y < b and any(xs[i] <= x < xs[i + 1] for i in range(0, len(xs), 2))
+               for t, b, xs in r.bands)
+
+
+@pytest.mark.parametrize("depth, bounds, rb, left, bands, width", [
+    # two bands with rows between, two spans in one, ends in the middle of
+    # bytes, and an image whose rows end in the middle of one
+    (1, Rect(10, 16, 30, 80), 10, 24, [(12, 15, (27, 33, 40, 51)), (17, 20, (25, 60))], 37),
+    (2, Rect(4, 0, 12, 30), 8, 4, [(5, 6, (5, 6)), (8, 11, (4, 13, 15, 28))], 28),
+    (4, Rect(0, 3, 9, 21), 10, 5, [(2, 4, (6, 9)), (4, 7, (5, 7, 12, 19))], 16),
+    (8, Rect(0, 0, 6, 12), 14, 2, [(1, 5, (2, 10))], 8),        # all of each row's bytes
+    (8, Rect(0, 0, 6, 12), 14, 2, [(1, 5, (2, 10))], 20),       # an image wider than the rows
+    (8, Rect(0, 0, 6, 12), 14, 2, [(1, 2, (4, 6)), (3, 5, (2, 10))], 8),   # the last band all
+])
+def test_put_writes_the_images_pixels_where_the_region_is(qapp, depth, bounds, rb, left,
+                                                          bands, width):
+    """MemorySurface.put, as the screen's mirror is written: each pixel in
+    the region is the image's, and every other, in its rows, beside them in
+    rowBytes, or in the rows above and below, is as it was."""
+    rng = random.Random(depth * 100 + width)
+    before = bytes(rng.randrange(256) for _ in range(0x200))
+    mem = RAM(0x200)
+    mem.write(0, before)
+    table = qdraw.VALUE_TABLES[depth]
+    s = qdraw.MemorySurface(mem, 0x40, rb, bounds, depth, table)
+    r, top = Region(bands), bands[0][0]
+    values = [[rng.randrange(1 << depth) for _ in range(width)]
+              for _ in range(bands[-1][1] - top)]
+    img = QImage(width, len(values), QImage.Format.Format_RGB32)
+    for y, row in enumerate(values):
+        for x, v in enumerate(row):
+            img.setPixel(x, y, table[v])
+    s.put(pixels.mono(img) if depth == 1 else img, left, r)
+    after = mem.read(0, 0x200)
+    end = s.base + rb * bounds.height
+    assert after[:s.base] == before[:s.base] and after[end:] == before[end:]
+    got = [[value(after, s, x, y) for x in range(bounds.left, bounds.left + rb * 8 // depth)]
+           for y in range(bounds.top, bounds.bottom)]
+    assert got == [[values[y - top][x - left] if inside(r, x, y) else value(before, s, x, y)
+                    for x in range(bounds.left, bounds.left + rb * 8 // depth)]
+                   for y in range(bounds.top, bounds.bottom)]
+
+
+def test_drawing_on_rows_longer_than_their_pixels_leaves_the_rest_of_each_row(qapp):
+    """32 bits a pixel on rows of 10 bytes: two pixels a row, each where
+    it is in its row, and the last two bytes of each as they were."""
+    mem = RAM(0x100)
+    mem.write(0x10, bytes(range(1, 31)))
+    s = qdraw.MemorySurface.make(mem, 0x10, 10, Rect(0, 0, 3, 4), 32)
+    assert s.bounds == Rect(0, 0, 3, 2)
+    with s.painter() as p:
+        p.fillRect(0, 0, 1, 3, QColor(0x11, 0x22, 0x33))
+    for y in range(3):
+        row = mem.read(0x10 + y * 10, 10)
+        assert row[1:4] == b"\x11\x22\x33"                         # its colour
+        assert row[5:] == bytes(range(y * 10 + 6, y * 10 + 11))     # the rest as it was
 
 
 # -- recording -------------------------------------------------------------------

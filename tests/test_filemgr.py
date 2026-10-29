@@ -2,6 +2,7 @@
 from 68k code, and the dialogs driven as the user would drive them."""
 
 import mmap
+import shutil
 import struct
 
 import machfs
@@ -279,6 +280,26 @@ def test_files_in_memory_read_and_write(qapp):
     assert (old.type, old.creator) == (b"TEXT", b"ttxt")
 
 
+def test_a_fork_grows_no_bigger_than_the_volume_has_free(qapp):
+    """dskFulErr for SetEOF or a write past what GetVInfo says is free, and
+    the fork as it was."""
+    s = System()
+    folder = MemoryFolder([])
+    files = FileManager(s.files, None, s.files.dir_for(folder))
+    files.create(0, 0, "Big")
+    p = files.open(0, 0, "Big", False, fm.fsRdWrPerm)
+    files.write(p.refnum, b"data", fm.fsFromStart, 0)
+    for grow in (lambda: files.set_eof(p.refnum, fm.FREE_BLOCKS * fm.BLOCK + 1),
+                 lambda: files.write(p.refnum, b"!", fm.fsFromStart, fm.FREE_BLOCKS * fm.BLOCK)):
+        with pytest.raises(FileError) as e:
+            grow()
+        assert e.value.code == fm.dskFulErr
+    assert files.get_eof(p.refnum) == 4
+    files.set_eof(p.refnum, 4096)
+    files.close(p.refnum)
+    assert folder.find("Big").data == b"data" + bytes(4092)
+
+
 def test_permissions_and_locks(qapp):
     s = System()
     files = FileManager(s.files, None, s.files.dir_for(MemoryFolder([])))
@@ -409,6 +430,124 @@ def test_host_files_are_written_as_load_file_reads_them(qapp, tmp_path):
     files.delete(0, d.cnid, "Renamed")
     files.delete(0, 0, "Folder")
     assert not (tmp_path / "Folder").exists()
+
+
+def host_volume(root):
+    (root / "App").write_bytes(b"app")
+    s = System()
+    return FileManager(s.files, None, s.files.dir_for(load_file(root / "App").folder))
+
+
+def test_what_a_symbolic_link_leads_to_is_neither_shown_nor_changed(qapp, tmp_path):
+    """A shared folder's links can lead outside it (an archive unpacked
+    there can hold them), so a program never goes through one."""
+    root, outside = tmp_path / "shared", tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    (outside / "precious.txt").write_bytes(b"keep")
+    (root / "Data").symlink_to("../outside")
+    (root / "Precious").symlink_to("../outside/precious.txt")
+    (root / ".AppleDouble").symlink_to("../outside")
+    (root / "Notes").write_bytes(b"notes")
+    (outside / "Notes").write_bytes(b"not Notes' resource fork")
+    (root / "Sub" / ".rsrc").mkdir(parents=True)
+    (root / "Sub" / ".rsrc" / "Card").write_bytes(build_fork([]))
+    (root / "Sub" / "Card").write_bytes(b"card")
+    (root / "Other").mkdir()
+    (root / "Other" / ".rsrc").symlink_to("../../outside")
+    # Side files that are links: one beside a file, one a folder of them
+    # that becomes a link after the file is seen.
+    (root / "Report").write_bytes(b"report")
+    (outside / "secret").write_bytes(build_fork([Resource(b"STR ", 1, b"secret")]))
+    (root / "Report.rsrc").symlink_to("../outside/secret")
+    (outside / "Card.ad").write_bytes(fm._apple_double_bytes({4: b"secret"}))
+    (root / "._Report").symlink_to("../outside/Card.ad")
+    (root / "Sub" / "._Card").symlink_to("../../outside/Card.ad")
+    (root / "Third" / ".rsrc").mkdir(parents=True)
+    (root / "Third" / "Deck").write_bytes(b"deck")
+    (root / "Third" / ".rsrc" / "Deck").write_bytes(build_fork([]))
+    (outside / "rs").mkdir()
+    (outside / "rs" / "Deck").write_bytes(b"not Deck's resource fork")
+    before = {q: q.read_bytes() for q in outside.rglob("*") if q.is_file()}
+    files = host_volume(root)
+    assert [n.name for n in files.get_vol()[0].root.items()] == \
+        ["App", "Notes", "Other", "Report", "Sub", "Third"]
+    assert not files.lookup_file(0, 0, "Report").forks()[1]
+    for name in ("Report", ":Sub:Card"):
+        p = files.open(0, 0, name, True, fm.fsRdWrPerm)
+        files.write(p.refnum, build_fork([]))
+        files.close(p.refnum)
+    assert (root / "Report.rsrc").is_symlink()
+    for q in (root / "._Report", root / "Sub" / "._Card"):
+        assert not q.is_symlink() and b"secret" not in q.read_bytes()
+    assert files.lookup_file(0, 0, ":Third:Deck").ref.side == ".rsrc/"
+    shutil.rmtree(root / "Third" / ".rsrc")
+    (root / "Third" / ".rsrc").symlink_to("../../outside/rs")
+    p = files.open(0, 0, ":Third:Deck", True, fm.fsRdWrPerm)
+    files.write(p.refnum, build_fork([Resource(b"STR ", 2, b"new")]))
+    with pytest.raises(FileError) as e:
+        files.close(p.refnum)
+    assert e.value.code == fm.ioErr
+    for name in (":Data:precious.txt", "Precious"):
+        with pytest.raises(FileError) as e:
+            files.lookup_file(0, 0, name)
+        assert e.value.code in (fm.fnfErr, fm.dirNFErr)
+    with pytest.raises(FileError) as e:
+        files.create(0, 0, "Data")                      # the host has something by that name
+    assert e.value.code == fm.dupFNErr
+    p = files.open(0, 0, "Notes", True, fm.fsRdWrPerm)
+    files.write(p.refnum, build_fork([]))
+    files.close(p.refnum)
+    files.delete(0, 0, "Notes")
+    # A folder made a link after it was seen is not gone through either,
+    # nor is one that a file's resource fork would be moved into.
+    d = files.create(0, 0, "Folder", directory=True)
+    (root / "Folder").rmdir()
+    (root / "Folder").symlink_to("../outside")
+    sub, other = (files.lookup(0, 0, n) for n in ("Sub", "Other"))
+    for change in (lambda: files.create(0, d.cnid, "New"),
+                   lambda: files.move(0, sub.cnid, "Card", other.cnid, None)):
+        with pytest.raises(FileError) as e:
+            change()
+        assert e.value.code == fm.ioErr
+    assert files.lookup_file(0, sub.cnid, "Card").parent is sub
+    assert {q: q.read_bytes() for q in outside.rglob("*") if q.is_file()} == before
+
+
+def test_the_mac_changes_only_host_files_that_are_its_own(qapp, tmp_path):
+    (tmp_path / "README").write_bytes(b"README")
+    (tmp_path / "readme").write_bytes(b"readme")
+    (tmp_path / "Notes.rsrc").write_bytes(b"a file of its own")
+    (tmp_path / "Doc").write_bytes(b"doc")
+    (tmp_path / "Doc.rsrc").write_bytes(build_fork([]))
+    files = host_volume(tmp_path)
+    if (tmp_path / "README").samefile(tmp_path / "readme"):
+        pytest.skip("a host whose names ignore case")
+    with pytest.raises(FileError) as e:
+        files.rename(0, 0, "README", "readme")          # another host file has that name
+    assert e.value.code == fm.dupFNErr
+    assert files.lookup_file(0, 0, "README").name == "README"
+    files.rename(0, 0, "App", "APP")                    # only the case: still just the one file
+    assert (tmp_path / "APP").read_bytes() == b"app"
+    # A file's resource fork goes nowhere another file is, and a new file
+    # has no resource fork beside it but its own.
+    with pytest.raises(FileError) as e:
+        files.rename(0, 0, "Doc", "Notes")
+    assert e.value.code == fm.dupFNErr
+    files.delete(0, 0, "Doc")
+    files.create(0, 0, "Notes")
+    files.rename(0, 0, "Notes", "Jottings")
+    files.delete(0, 0, "Jottings")
+    for name in ("A\0B", "Folder\0"):
+        for make in (lambda: files.create(0, 0, name), lambda: files.rename(0, 0, "APP", name),
+                     lambda: files.create(0, 0, name, directory=True)):
+            with pytest.raises(FileError) as e:
+                make()
+            assert e.value.code == fm.bdNamErr
+    assert sorted(q.name for q in tmp_path.iterdir()) == ["APP", "Notes.rsrc", "README",
+                                                          "readme"]
+    assert [(tmp_path / n).read_bytes() for n in ("README", "readme", "Notes.rsrc")] == [
+        b"README", b"readme", b"a file of its own"]
 
 
 def test_disk_images_change_only_in_memory(qapp, tmp_path):

@@ -362,13 +362,13 @@ class _Walk:
             pack_type, depth, cmp_count = pict.read_pixmap(
                 pict.Reader.of(r.read(pict.PIXMAP_REST)))
             table = table_colors(pict.read_ctab_record(r))
-            width, height = max(bounds.width, 0), max(bounds.height, 0)
+            width, height = bounds.width, bounds.height
+            pict.check_size(width, height, depth)
             rows = pict.read_pixels(r, row_bytes, height, True, pack_type, width, depth,
                                     cmp_count)
-            if depth in (1, 2, 4, 8, 16, 32):
-                colors = pixel_colors(rows, width, height, depth, table, pack_type, cmp_count)
-                self.survey.add_colors(Counter(dict.fromkeys(colors, 1)), depth == 32)
-                self.depth = max(self.depth, depth)
+            colors = pixel_colors(rows, width, height, depth, table, pack_type, cmp_count)
+            self.survey.add_colors(Counter(dict.fromkeys(colors, 1)), depth == 32)
+            self.depth = max(self.depth, depth)
 
     def _bits(self, op: int, r: pict.Reader) -> None:
         direct = op in (0x9A, 0x9B)
@@ -388,9 +388,7 @@ class _Walk:
         if op & 1:
             _sized(r)                       # the mask region
         width, height = bounds.width, bounds.height
-        if (not 0 < width <= pict.MAX_SIDE or not 0 < height <= pict.MAX_SIDE
-                or depth not in (1, 2, 4, 8, 16, 32)):
-            raise pict.PictError(f"a {width}x{height} {depth}-bit bitmap")
+        pict.check_size(width, height, depth)
         rows = pict.read_pixels(r, row_bytes, height, op >= 0x98, pack_type, width, depth,
                                 cmp_count)
         if pixmap:

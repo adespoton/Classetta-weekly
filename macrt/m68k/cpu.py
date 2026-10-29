@@ -21,12 +21,22 @@ the VIA's interrupts in their vector, run() returns every SLICE
 instructions, so the runner can run the tasks a tick has made due, or
 interrupt the application, between two instructions.  Which it is is
 looked at as run() starts: after a trap or exception.
-That's unicorn's instruction count, which stops before an instruction:
-its emu_stop() from another thread doesn't do for this, since the core
-looks for a stop after each load and store, and goes back to the start of
-the instruction it's in, which then runs again, its stores already made.
-An instruction like ADDQ to memory would count twice.  emu_stop() is kept
-for killing a process, where that can't matter.
+That's unicorn's instruction count, which stops before an instruction.
+The clock doesn't stop the core itself: unicorn's emu_stop() from another
+thread has the core look for the stop after each load and store, and go
+back to the start of the instruction it's in, which then runs again, its
+stores already made, so an ADDQ to memory would count twice.  emu_stop() is
+kept for killing a process, where that can't matter.  So in a run without
+slices, a store that may give the runner something to do at each tick is
+held before it's made, and run alone, and the run returns, to go on in
+slices: one to the VIA's interrupt vector or Lvl1DT, or that may turn the
+sound on (see _hold).  A program's own store to a VBL task's count, outside
+the task, is seen at the next trap.  But once a store that's let by has
+had a page held mapped to be written to, for the rest of the run, the
+stores after it aren't seen: if what's at the ticks changes then, the
+clock stops the core, as it did for every such change before this, the
+instruction it's in perhaps run twice, rather than leave a program that
+waits for its own handler with no trap waiting for ever.
 
 The core runs code as fast as the host lets it, far faster than any Mac
 did.  Most programs keep time by the clock, but some early games just
@@ -104,6 +114,7 @@ import re
 import struct
 import threading
 import time
+import weakref
 from contextlib import contextmanager
 from typing import Callable, Iterator, NamedTuple
 
@@ -122,6 +133,9 @@ from . import instructions
 from .cycles import RATE, cycles, untaken
 
 log = logging.getLogger("macrt.cpu")
+_u32, _byref = ctypes.c_uint32, ctypes.byref
+# A long and a signed word from the bytes, for what's looked at each run.
+_long, _signed_word = struct.Struct(">I").unpack_from, struct.Struct(">h").unpack_from
 
 # Exception vector numbers.  QEMU reports exceptions by these numbers.
 BUS_ERROR = 2
@@ -153,7 +167,7 @@ CCR_X, CCR_N, CCR_Z, CCR_V, CCR_C = 0x10, 0x08, 0x04, 0x02, 0x01
 # what the last ADD, SUB or CMP of a byte, word or long, or other
 # instruction, gave, for working out when they're wanted.
 CC_OP_FLAGS, CC_OP_ADD, CC_OP_SUB, CC_OP_CMP, CC_OP_LOGIC = 1, 2, 5, 8, 11
-SR_WORD, CC_WORDS = 17, 22      # in CPUM68KState, after D0-D7, A0-A7 and PC; cc_op on
+PC_WORD, SR_WORD, CC_WORDS = 16, 17, 22     # in CPUM68KState, after D0-D7 and A0-A7; cc_op on
 # Then, after cc_z, FP0-FP7, 16 bytes each: an extended real's mantissa, then
 # its sign and exponent, little-endian; the result of the last, and FPCR and FPSR.
 FREGS = CC_WORDS + 6
@@ -165,11 +179,22 @@ FPCR_WORD = FREGS + 4 * 9
 CORE_ROUNDING = (0, 3, 1, 2)
 CORE_PRECISION = (80, 32, 64, None)
 SLICE = 100_000         # instructions between looks at the clock, while VBL tasks wait
+# Seconds a run goes on in slices after the last reason to.  A program's
+# VBL task that stops counting down when it runs, and is set counting again
+# a moment later, would otherwise have runs switch in and out of slices
+# each tick, and each switch flushes every block the core has translated:
+# Crystal Quest's did so about 65 times a second, with its task stopped
+# for 0.8 ms at the median and 27 ms at most.
+LINGER = 0.5
 SETTLE = 0.0002         # seconds the clock waits past a tick, not to wake just before it
 VBL_COUNT, VBL_TASK_END = 10, 14    # in a VBLTask record
 MAX_VBL_TASKS = 64
 PAGE_BITS = 12          # the core's pages are 4K
 PAGE_SIZE = 1 << PAGE_BITS
+# The words in low memory a store to may give the VIA's interrupts a handler
+# or routine of the program's own: their vector, and Lvl1DT.  Held in a run
+# without slices (see _hold).
+INTERRUPT_WORDS = ((4 * LEVEL_1, 4 * LEVEL_1 + 4), (lowmem.Lvl1DT, lowmem.Lvl1DT + 32))
 READ_WRITE, READ_RUN = UC_PROT_READ | UC_PROT_WRITE, UC_PROT_READ | UC_PROT_EXEC
 # What's known of the ways a page is mapped, since the core last forgot them:
 # whether it may be run from, and written to, and through more than one address.
@@ -265,6 +290,37 @@ def _length(mem, op: int, pc: int) -> int:
 
 
 SIZES = (1, 2, 4)       # the bytes of an operation by its size field, 0 to 2
+
+
+def _operand(op: int) -> tuple[int, int] | None:
+    """Where the extension words of the effective address in the low bits
+    of an instruction's first word, op, start, in bytes after the word, and
+    how many bytes it stores to the address: for an instruction that may
+    store to it, as one that stores does.  None for any other."""
+    group, size = op >> 12, op >> 6 & 3
+    if group == 0:
+        if op & 0x100:                          # BCHG, BCLR, BSET Dn; MOVEP
+            return None if op >> 3 & 7 == 1 else (2, 1)
+        if op >> 8 == 8:                        # BCHG, BCLR, BSET #
+            return 4, 1
+        if op >> 9 & 7 in (0, 1, 2, 3, 5) and size != 3:    # ORI, ANDI, SUBI, ADDI, EORI
+            return (6 if size == 2 else 4), SIZES[size]
+        return None
+    if group == 4:
+        if op & 0xF900 == 0x4000:               # NEGX, CLR, NEG, NOT; MOVE from SR or CCR
+            return 2, SIZES[size] if size != 3 else 2
+        if op & 0xFFC0 in (0x4800, 0x4AC0):     # NBCD, TAS
+            return 2, 1
+        return None
+    if group == 5:                              # ADDQ, SUBQ; Scc
+        return 2, SIZES[size] if size != 3 else 1
+    if group in (8, 9, 0xB, 0xC, 0xD) and op & 0x100 and size != 3:     # OR, SUB, EOR, AND, ADD
+        return 2, SIZES[size]
+    if group == 0xE and size == 3 and not op & 0x800:   # a shift or rotate of memory
+        return 2, 2
+    return None
+
+
 LONGEST = 22            # bytes, a 68020's longest instruction
 REACH = 64              # bytes a MOVEM stores, on from the first
 
@@ -392,6 +448,11 @@ def condition(cc: int, ccr: int) -> bool:
     return test != bool(cc & 1)
 
 
+def _words(array) -> memoryview:
+    """A ctypes array of 32-bit words, as a memoryview of them."""
+    return memoryview(array).cast("B").cast("I")
+
+
 def _ccr(op: int, x: int, n: int, v: int, c: int, z: int) -> int:
     """The condition codes from the core's cc_op, cc_x, cc_n, cc_v, cc_c
     and cc_z.  X is always X; N is in bit 31 of n, Z is n or z being 0, V
@@ -426,6 +487,48 @@ def mac_time() -> int:
     return (calendar.timegm(time.localtime()) + MAC_1904) & 0xFFFFFFFF
 
 
+def _core_calls(uc: Uc):
+    """The core's handle and unicorn's calls to read and write one of its
+    registers, through a pointer to 32 bits, and to stop it, and to copy
+    its state to a context and back: its library's own, made with the
+    interpreter's lock held, as they're over in a moment, if this version
+    of unicorn's Python binding has them where it's looked; or else its
+    wrappers', which take three times as long, and no copying (see
+    CPU._load)."""
+    try:
+        from unicorn.unicorn_py3.unicorn import uclib
+        lib = ctypes.PyDLL(None, handle=uclib._handle)
+        return (uc._uch, lib.uc_reg_read, lib.uc_reg_write, lib.uc_emu_stop,
+                lib.uc_context_save, lib.uc_context_restore)
+    except (ImportError, AttributeError, OSError):
+        pass
+
+    def read(_uch, reg: int, ref) -> int:
+        ref._obj.value = uc.reg_read(reg)
+        return 0
+
+    def write(_uch, reg: int, ref) -> int:
+        uc.reg_write(reg, ref._obj.value)
+        return 0
+
+    def stop(_uch) -> int:
+        uc.emu_stop()
+        return 0
+    return None, read, write, stop, None, None
+
+
+def _clock(cpu: weakref.ref[CPU], closed: threading.Event) -> None:
+    """The clock's thread: a tick at a time until the CPU is closed or
+    gone.  It holds the CPU only for the tick, so that one dropped
+    unclosed, a test's, goes, and its clock with it."""
+    while not closed.wait(to_next_tick() / 60 + SETTLE):
+        held = cpu()
+        if held is None:
+            return
+        held._tick()
+        del held
+
+
 class CPU:
     def __init__(self, mem: RAM):
         self.mem = mem
@@ -436,6 +539,8 @@ class CPU:
         finalizer = getattr(uc, "_Uc__finalizer", None)
         if finalizer is not None:
             finalizer.atexit = False
+        (self._uch, self._reg_read, self._reg_write, self._emu_stop,
+         self._save, self._put_back) = _core_calls(uc)
         uc.ctl_set_cpu_model(UC_CPU_M68K_M68020)
         uc.ctl_set_tlb_mode(UC_TLB_VIRTUAL)
         self._backing = (ctypes.c_char * mem.size).from_buffer(mem._b)
@@ -464,8 +569,21 @@ class CPU:
         uc.hook_add(UC_HOOK_TLB_FILL, self._tlb_fill)
         uc.hook_add(UC_HOOK_EDGE_GENERATED, self._translated)
         uc.hook_add(UC_HOOK_INTR, self._intr)
+        # The registers, as a copy of the core's state in _ctx, between
+        # runs: a trap reads and writes a few, and each call to the core
+        # for one is as long as copying it all (see _load).
+        self._regs = self._cc = None        # D0-D7, A0-A7, PC and SR; cc_op... cc_z
+        self._fresh = False                 # _ctx is the core's state, and the registers' changes
+        self._changed = False               # those, which the core hasn't yet
+        self._live = False                  # the core's running: no copy's kept
         self._ctx = uc.context_save()
         self._state = self._find_state()
+        if self._state is not None and self._save is not None:
+            # As memoryviews, quicker than ctypes' arrays to index.
+            base = ctypes.addressof(self._state) + 4 * self._state_at
+            self._regs = _words((ctypes.c_uint32 * (SR_WORD + 1)).from_address(base))
+            self._cc = _words((ctypes.c_uint32 * 6).from_address(base + 4 * CC_WORDS))
+            self._ctxp = self._ctx.context
         uc.reg_write(UC_M68K_REG_SR, 0x2700)    # SR before A7: it picks the stack
         for n in range(8):
             self.set_d(n, 0)
@@ -478,9 +596,19 @@ class CPU:
         self.rom_interrupts = 0         # what LEVEL_1's vector is until a program sets it
         self.no_handler = 0             # the System's stub for an exception nobody handles
         self.rom_level_1_routines = (0, 0)      # where Lvl1DT's routines are until then
+        self._level_1_seen = (b"", (0, 0), 0)   # Lvl1DT and those, and their flags
         self.short_frames = False       # a 68000's exception frames: SR and PC, no more
         self._counting = False          # whether the last run was in slices
+        self._ticked = float("-inf")    # when a run last had a reason to be
         self._unsliced = False          # a run without them is going on
+        # The pages, other than low memory's, a store to may turn the sound
+        # on, while it's off: held in a run without slices, as low memory's
+        # INTERRUPT_WORDS are.
+        self.watching: Callable[[], list[int]] = lambda: []
+        self._held: dict[int, tuple[tuple[int, int], ...] | None] = {}  # page: its words, or all
+        self._opened: set[int] = set()  # pages mapped to be written to since the core forgot
+        self._alone = False             # running a store held alone
+        self._holding = False           # the core's stopped at one
         self.on_tick: Callable[[], None] | None = None     # called by the clock, each tick
         self._rate: int | None = None   # a 68000's cycles a second at most, or as fast as it goes
         self._pacer: int | None = None  # the hook that counts them
@@ -489,9 +617,11 @@ class CPU:
         self._blocks: dict[int, int] = {}   # each block's cycles, by its address and length
         self._closed = threading.Event()
         self._set_clock()           # now, not a tick on: a program may read Ticks first thing
-        threading.Thread(target=self._clock, name="m68k clock", daemon=True).start()
+        threading.Thread(target=_clock, args=(weakref.ref(self), self._closed),
+                         name="m68k clock", daemon=True).start()
 
     def close(self) -> None:
+        """Stop the clock."""
         self._closed.set()
 
     @property
@@ -515,49 +645,111 @@ class CPU:
     # Registers
     # =====================================================================
     def d(self, n: int) -> int:
-        return self.uc.reg_read(UC_M68K_REG_D0 + n) & 0xFFFFFFFF
+        if self._fresh or self._load():
+            return self._regs[n]
+        v = _u32()
+        self._reg_read(self._uch, UC_M68K_REG_D0 + n, _byref(v))
+        return v.value
 
     def a(self, n: int) -> int:
-        return self.uc.reg_read(UC_M68K_REG_A0 + n) & 0xFFFFFFFF
+        if self._fresh or self._load():
+            return self._regs[8 + n]
+        v = _u32()
+        self._reg_read(self._uch, UC_M68K_REG_A0 + n, _byref(v))
+        return v.value
 
     def set_d(self, n: int, value: int) -> None:
-        self.uc.reg_write(UC_M68K_REG_D0 + n, value & 0xFFFFFFFF)
+        if self._fresh or self._load():
+            self._regs[n] = value & 0xFFFFFFFF
+            self._changed = True
+        else:
+            self._reg_write(self._uch, UC_M68K_REG_D0 + n, _byref(_u32(value)))
 
     def set_a(self, n: int, value: int) -> None:
-        self.uc.reg_write(UC_M68K_REG_A0 + n, value & 0xFFFFFFFF)
+        if self._fresh or self._load():
+            self._regs[8 + n] = value & 0xFFFFFFFF
+            self._changed = True
+        else:
+            self._reg_write(self._uch, UC_M68K_REG_A0 + n, _byref(_u32(value)))
 
     @property
     def pc(self) -> int:
-        return self.uc.reg_read(UC_M68K_REG_PC) & 0xFFFFFFFF
+        if self._fresh or self._load():
+            return self._regs[PC_WORD]
+        v = _u32()
+        self._reg_read(self._uch, UC_M68K_REG_PC, _byref(v))
+        return v.value
 
     @pc.setter
     def pc(self, value: int) -> None:
-        self.uc.reg_write(UC_M68K_REG_PC, value & 0xFFFFFFFF)
+        if self._fresh or self._load():
+            self._regs[PC_WORD] = value & 0xFFFFFFFF
+            self._changed = True
+        else:
+            self._reg_write(self._uch, UC_M68K_REG_PC, _byref(_u32(value)))
 
     @property
     def sp(self) -> int:
-        return self.uc.reg_read(UC_M68K_REG_A7) & 0xFFFFFFFF
+        if self._fresh or self._load():
+            return self._regs[15]
+        v = _u32()
+        self._reg_read(self._uch, UC_M68K_REG_A7, _byref(v))
+        return v.value
 
     @sp.setter
     def sp(self, value: int) -> None:
-        self.uc.reg_write(UC_M68K_REG_A7, value & 0xFFFFFFFF)
+        if self._fresh or self._load():
+            self._regs[15] = value & 0xFFFFFFFF
+            self._changed = True
+        else:
+            self._reg_write(self._uch, UC_M68K_REG_A7, _byref(_u32(value)))
 
     @property
     def sr(self) -> int:
         """SR, the condition codes worked out from a copy of the core's
         state, as unicorn's read of SR wouldn't, and left as they were."""
+        if self._fresh or self._load():
+            return self._regs[SR_WORD] & 0xFFE0 | _ccr(*self._cc)
         if self._state is None:
             return self.uc.reg_read(UC_M68K_REG_SR) & 0xFFFF
-        self.uc.context_update(self._ctx)
-        state, at = self._state, self._state_at
+        state, at = self._view(), self._state_at
         return state[at + SR_WORD] & 0xFFE0 | _ccr(*state[at + CC_WORDS:at + CC_WORDS + 6])
 
     @sr.setter
     def sr(self, value: int) -> None:
         sp = self.sp
-        self.uc.reg_write(UC_M68K_REG_SR, value & 0xFFFF)
+        self._set_sr(value & 0xFFFF)
         self.sp = sp
         self._may_trace = bool(value & T1)
+
+    def _set_sr(self, value: int) -> None:
+        """SR as unicorn sets it, which puts in A7 the stack pointer its S
+        and M bits pick."""
+        self._sync()
+        self._fresh = False
+        self._reg_write(self._uch, UC_M68K_REG_SR, _byref(_u32(value)))
+
+    def _load(self) -> bool:
+        """Copy the core's state, for its registers to be read and changed
+        in the copy, until the core runs: whether it's copied.  It isn't
+        while the core runs, from a hook, or with unicorn's own calls."""
+        if self._live or self._regs is None:
+            return False
+        self._save(self._uch, self._ctxp)
+        self._fresh = True
+        return True
+
+    def _sync(self) -> None:
+        """Put the registers changed in the copy back in the core."""
+        if self._changed:
+            self._put_back(self._uch, self._ctxp)
+            self._changed = False
+
+    def _view(self):
+        """The copy of the core's state, as it is."""
+        if not self._fresh and not self._load():
+            self.uc.context_update(self._ctx)       # as it is now, running
+        return self._state
 
     def _find_state(self):
         """The context's copy of the core's state (QEMU's CPUM68KState), as
@@ -584,8 +776,7 @@ class CPU:
 
     def fp(self, n: int) -> tuple[int, int]:
         """FPn: an extended real's sign and exponent word, and mantissa."""
-        self.uc.context_update(self._ctx)
-        state, at = self._state, self._state_at + FREGS + 4 * n
+        state, at = self._view(), self._state_at + FREGS + 4 * n
         return state[at + 2] & 0xFFFF, state[at + 1] << 32 | state[at]
 
     def set_fp(self, n: int, se: int, mantissa: int) -> None:
@@ -593,14 +784,12 @@ class CPU:
 
     @property
     def fpcr(self) -> int:
-        self.uc.context_update(self._ctx)
-        return self._state[self._state_at + FPCR_WORD]
+        return self._view()[self._state_at + FPCR_WORD]
 
     @fpcr.setter
     def fpcr(self, value: int) -> None:
         """As an FMOVE to it sets it: the core rounds as it says."""
-        self.uc.context_update(self._ctx)
-        state, at = self._state, self._state_at + FPCR_WORD
+        state, at = self._view(), self._state_at + FPCR_WORD
         rounding = state[at + 2] & ~0xFF00 | CORE_ROUNDING[value >> 4 & 3] << 8
         if (precision := CORE_PRECISION[value >> 6 & 3]) is not None:
             rounding = rounding & 0x00FFFFFF | precision << 24
@@ -608,32 +797,46 @@ class CPU:
 
     @property
     def fpsr(self) -> int:
-        self.uc.context_update(self._ctx)
-        return self._state[self._state_at + FPCR_WORD + 1]
+        return self._view()[self._state_at + FPCR_WORD + 1]
 
     @fpsr.setter
     def fpsr(self, value: int) -> None:
         self._set_state(FPCR_WORD + 1, value & 0x0FFFFFF8)
 
     def _set_state(self, word: int, *values: int) -> None:
-        """Set words of the core's state, from word on: in a copy, put back."""
-        self.uc.context_update(self._ctx)
-        at = self._state_at + word
+        """Set words of the core's state, from word on: in the copy, put
+        back before the core runs, or at once if it's running."""
+        state, at = self._view(), self._state_at + word
         for n, value in enumerate(values):
-            self._state[at + n] = value
-        self.uc.context_restore(self._ctx)
+            state[at + n] = value
+        if self._fresh:
+            self._changed = True
+        else:
+            self.uc.context_restore(self._ctx)
 
     def set_cc_from_word(self, value: int) -> None:
-        """TST.W: N and Z from a word, V and C clear, X kept."""
+        """TST.W: N and Z from a word, V and C clear, X kept.  Only the
+        flags change, so not the stack SR's S and M bits pick: A7 is left
+        as it is, without the setter's reading and writing it again."""
         value &= 0xFFFF
-        cc = (0x8 if value & 0x8000 else 0) | (0x4 if value == 0 else 0)
-        self.sr = (self.sr & ~0xF) | cc
+        if self._fresh or self._load():         # as QEMU's cpu_m68k_set_ccr leaves them
+            cc = self._cc
+            cc[0], cc[2], cc[3], cc[4] = CC_OP_FLAGS, 0xFFFFFFFF if value & 0x8000 else 0, 0, 0
+            cc[5] = value != 0
+            self._changed = True
+            self._may_trace = bool(self._regs[SR_WORD] & T1)
+            return
+        sr = self.sr & 0xFFF0 | (0x8 if value & 0x8000 else 0) | (0x4 if value == 0 else 0)
+        self._reg_write(self._uch, UC_M68K_REG_SR, _byref(_u32(sr)))
+        self._may_trace = bool(sr & T1)
 
     def context(self):
+        self._sync()
         return self.uc.context_save()
 
     def restore(self, ctx) -> None:
         self.uc.context_restore(ctx)
+        self._fresh = self._changed = False
         self._may_trace = True
 
     def registers(self) -> str:
@@ -712,6 +915,10 @@ class CPU:
         self._event = None
         rate = self._rate
         slicing = self._interrupted_at_ticks()
+        if slicing:
+            self._ticked = time.monotonic()
+        elif self._counting and time.monotonic() - self._ticked < LINGER:
+            slicing = True              # (see LINGER)
         count = SLICE if slicing else 0
         if rate:
             slicing, count = True, min(count or SLICE, max(1, rate // 60 // CYCLES_EACH))
@@ -722,22 +929,43 @@ class CPU:
         if slicing and not self._counting:
             self.uc.ctl_flush_tb()      # blocks translated before wouldn't count
         self._counting = slicing        # (and unicorn flushes them itself when it stops counting)
-        stop = until
+        stop, alone = until, False
         while True:
             self._let_by, self._rerun = self._rerun, None
             self._unsliced = not slicing
+            solo, alone = alone, False
+            if not slicing and not solo:
+                self._hold()
+            self._alone = solo
             if not self._edged:         # the core shows _translated no block till it's run one
                 self._hook_watched(pc, (pc | PAGE_SIZE - 1) + 1 + LONGEST, None)
             self._until = stop
+            held = False
+            self._sync()
+            self._fresh, self._live = False, True
             try:
                 self.uc.emu_start(pc, stop, count=count)
             except UcError as e:
-                return Event("fault", self.pc, e.errno)
+                self._live = False
+                if not self._holding:
+                    return Event("fault", self.pc, e.errno)
+                held = True
             finally:
-                self._unsliced = False
+                self._live = self._unsliced = self._alone = self._holding = False
                 retranslate, self._retranslate = self._retranslate, None
                 if retranslate is not None:
                     self.uc.ctl_remove_cache(*retranslate)
+            if held:                    # a store held, its instruction not begun: run it alone
+                pc, alone = self.pc, True
+                self._rerun = self._let_by      # as it was, if it's one being run again
+                step = _step(self.mem._b, pc & ADDRESS_MASK)
+                if step is None or step[1]:     # by the count, the blocks it's in dropped
+                    self.uc.ctl_flush_tb()
+                    stop, count = until, 1
+                else:                           # to just past it, its blocks dropped: the
+                    stop = pc + step[0]         # core sees where to stop as it translates
+                    self.uc.ctl_remove_cache(pc, stop)
+                continue
             stopped = self._event, self._trapcc, self._rerun
             if retranslate is not None and stopped == (None, None, None):
                 if self.interrupt_requested:
@@ -749,18 +977,22 @@ class CPU:
             if self._trapcc is not None:
                 at, self._trapcc = self._trapcc, None
                 op = struct.unpack_from(">H", self.mem._b, at & ADDRESS_MASK)[0]
-                if op == JSR_SP:
-                    pc = self.sp
-                    self.push32(at + 2)
+                if op in (JSR_SP, RTR):
+                    sp = self.sp
+                    try:
+                        if op == JSR_SP:
+                            self.push32(at + 2)
+                            pc = sp
+                        else:
+                            ccr = self.mem.r16(sp & ADDRESS_MASK)
+                            pc = self.mem.r32((sp + 2) & ADDRESS_MASK)
+                            self.sr, self.sp = self.sr & 0xFF00 | ccr & 0x1F, sp + 6
+                    except BusError:                    # a stack outside RAM
+                        return Event("exception", at, BUS_ERROR)
                 elif op == TRAPV_WORD:
                     if condition(VS, self.sr):
                         return Event("exception", at, TRAPV)
                     pc = at + 2
-                elif op == RTR:
-                    sp = self.sp
-                    self.sr = self.sr & 0xFF00 | self.mem.r16(sp & ADDRESS_MASK) & 0x1F
-                    pc = self.mem.r32((sp + 2) & ADDRESS_MASK)
-                    self.sp = sp + 6
                 elif is_trapcc(op):
                     if condition(op >> 8 & 0xF, self.sr):
                         return Event("exception", at, TRAPV)
@@ -778,6 +1010,8 @@ class CPU:
                 stop = until
                 continue
             if self._rerun is None:
+                if solo and (count or self._interrupted_at_ticks()):
+                    break               # to go on in slices
                 if (stop == until or self.pc != stop or self.interrupt_requested
                         or self.retrace_pending):
                     break
@@ -839,35 +1073,43 @@ class CPU:
         application's own: not the System's, nor the stub for an exception
         nobody handles, which SimCity 2000's demo moves there when it cycles
         its colours through two NIL handles, copying vectors over vectors."""
-        vector = struct.unpack_from(">I", self.mem._b, 4 * LEVEL_1)[0] & ADDRESS_MASK
+        vector = _long(self.mem._b, 4 * LEVEL_1)[0] & ADDRESS_MASK
         return vector not in (0, self.rom_interrupts, self.no_handler)
 
     def own_level_1_routines(self) -> int:
         """The VIA's flags, as in its vIFR, that the application has put its
         own routine in Lvl1DT for."""
-        lo, hi = self.rom_level_1_routines
-        routines = struct.unpack_from(">8I", self.mem._b, lowmem.Lvl1DT)
-        return sum(1 << n for n, at in enumerate(routines)
-                   if at & ADDRESS_MASK and not lo <= at & ADDRESS_MASK < hi)
+        table = self.mem._b[lowmem.Lvl1DT:lowmem.Lvl1DT + 32]
+        rom = self.rom_level_1_routines
+        seen, seen_rom, flags = self._level_1_seen
+        if table == seen and rom is seen_rom:      # as it was at the last trap, as it mostly is
+            return flags
+        lo, hi = rom
+        routines = struct.unpack(">8I", table)
+        flags = sum(1 << n for n, at in enumerate(routines)
+                    if at & ADDRESS_MASK and not lo <= at & ADDRESS_MASK < hi)
+        self._level_1_seen = (table, rom, flags)
+        return flags
 
     def _interrupted_at_ticks(self) -> bool:
         """Whether there's something to do at each tick: a VBL task
         counting down, a Time Manager task waiting, the application's own
         interrupt handler, or a sound to make or play."""
-        return (self.vbl_counting() or self.timers_waiting() or self.own_interrupts()
-                or self.sound_waiting())
+        return (self.vbl_counting() or self.timers_waiting() or self.own_interrupt_handler()
+                or bool(self.own_level_1_routines()) or self.sound_waiting())
 
     def vbl_counting(self) -> bool:
         """Whether a task in the VBL queue is counting down to run.  One
         that isn't, as the System's own never is, waits for nothing."""
         b = self.mem._b
-        task = struct.unpack_from(">I", b, lowmem.VBLQueue + 2)[0] & ADDRESS_MASK
+        task = _long(b, lowmem.VBLQueue + 2)[0] & ADDRESS_MASK
+        last = len(b) - VBL_TASK_END
         for _ in range(MAX_VBL_TASKS):
             if not task:
                 return False
-            if task + VBL_TASK_END > len(b) or struct.unpack_from(">h", b, task + VBL_COUNT)[0] > 0:
+            if task > last or _signed_word(b, task + VBL_COUNT)[0] > 0:
                 return True
-            task = struct.unpack_from(">I", b, task)[0] & ADDRESS_MASK
+            task = _long(b, task)[0] & ADDRESS_MASK
         return True                     # a queue that goes round: look at each tick
 
     @contextmanager
@@ -918,7 +1160,7 @@ class CPU:
         self.uc.emu_stop()
 
     def _intr(self, uc, intno, _data) -> None:
-        pc = uc.reg_read(UC_M68K_REG_PC) & 0xFFFFFFFF
+        pc = self.pc
         if intno == LINE_A:
             word = struct.unpack_from(">H", self.mem._b, pc & ADDRESS_MASK)[0]
             self._event = Event("trap", pc, word)
@@ -928,7 +1170,7 @@ class CPU:
             self._trapcc = pc               # and these
         else:
             self._event = Event("exception", pc, intno)
-        uc.emu_stop()
+        self._emu_stop(self._uch)
 
     def _done_here(self, pc: int) -> bool:
         """Whether the instruction at pc is one the core doesn't know, done
@@ -967,13 +1209,27 @@ class CPU:
         has written to stays mapped for one or the other.
 
         An address the memory mirrors is mapped to the page it's another
-        way to (see RAM.mirror)."""
+        way to (see RAM.mirror).
+
+        In a run without slices, a page with words held on it (see _hold)
+        is mapped to be read only, so that each store to it comes here, and
+        one that may be to those words is held: the core stops before its
+        instruction, for run() to run it alone.  One that isn't is let be,
+        and the page is mapped to be written to, as any other, until the
+        next run without slices."""
         paddr = vaddr & ADDRESS_MASK
         mem = self.mem
         if mem.mirror_lo <= paddr < mem.mirror_hi:
             paddr -= mem.mirror_by
         entry.paddr = paddr
         page = paddr >> PAGE_BITS
+        if self._unsliced and page in self._held and access != UC_MEM_FETCH and not self._alone:
+            if access != UC_MEM_WRITE:
+                entry.perms = UC_PROT_READ
+                return True
+            if self._held_store(uc, self._held[page]):
+                self._holding = True
+                return False            # the core faults, as for a page not mapped
         top = vaddr >> 24
         state = self._pages[page]
         if not state:
@@ -1009,6 +1265,7 @@ class CPU:
                 self._ran[page] = 0
             state |= WRITTEN
             entry.perms = READ_WRITE
+            self._opened.add(page)
         self._pages[page] = state
         return True
 
@@ -1017,6 +1274,7 @@ class CPU:
         words to stop at in it are noted, for _look_again."""
         entry.perms = UC_PROT_ALL
         self._ran[page] = 1
+        self._opened.add(page)
         self._new_words(page)
         base = page << PAGE_BITS
         self._both[page] = bytes(self.mem._b[base:base + PAGE_SIZE])
@@ -1136,6 +1394,7 @@ class CPU:
         an address with top in its top byte, the one being mapped now."""
         uc.ctl(UC_CTL_TLB_FLUSH, UC_CTL_IO_WRITE)
         self._pages[:] = bytes(len(self._pages))
+        self._opened.clear()
         self._tops[page] = top
         return 0
 
@@ -1179,6 +1438,69 @@ class CPU:
             uc.emu_stop()
         return True
 
+    def _hold(self) -> None:
+        """Before a run without slices: hold the stores that may give the
+        runner something to do at each tick, which it would otherwise see
+        only at the run's trap, and a program may wait for with none.  A
+        store to the VIA's interrupt vector or Lvl1DT, SimCity's handler
+        put in place between traps, and to the pages that may turn the
+        sound on, while it's off (watching), as the Sound Driver's test
+        does before it waits five ticks for the buffer to be heard.  The
+        core's mappings are forgotten, if any of these pages has been
+        mapped to be written to since they last were, as a store to a page
+        so mapped doesn't come to _tlb_fill."""
+        held: dict[int, tuple[tuple[int, int], ...] | None] = {0: INTERRUPT_WORDS}
+        for page in self.watching():
+            held[page] = None
+        if not self._opened.isdisjoint(held):
+            self.uc.ctl(UC_CTL_TLB_FLUSH, UC_CTL_IO_WRITE)
+            self._pages[:] = bytes(len(self._pages))
+            self._opened.clear()
+        self._held = held
+
+    def _held_store(self, uc, words: tuple[tuple[int, int], ...] | None) -> bool:
+        """Whether the store the core's about to make, to a page with words
+        held on it, is to be held: if it's to those words, or may be;
+        always, words None."""
+        if words is None:
+            return True
+        pc = uc.reg_read(UC_M68K_REG_PC) & ADDRESS_MASK
+        if pc + 2 > len(self.mem._b):
+            return True
+        to = self._stores_to(struct.unpack_from(">H", self.mem._b, pc)[0], pc)
+        if to is None:
+            return True
+        lo, hi = to
+        return any(lo < end and start < hi for start, end in words)
+
+    def _stores_to(self, op: int, pc: int) -> tuple[int, int] | None:
+        """The addresses the instruction at pc, op its first word, stores
+        to, from the first to past the last, from the registers as the core
+        has them as it stores: a MOVE's or MOVEM's, or another's that stores
+        to the effective address in its first word's low bits.  Or None,
+        if that can't be told."""
+        mode, reg = op >> 3 & 7, op & 7
+        if 1 <= op >> 12 <= 3:                      # MOVE
+            to, size = self._stored_at(op, pc), (0, 1, 4, 2)[op >> 12]
+        elif op & 0xFB80 == 0x4880:                 # MOVEM to memory
+            to = self._stored_at(op, pc)
+            if to is None:
+                return None
+            mask = struct.unpack_from(">H", self.mem._b, pc + 2)[0]
+            size = bin(mask).count("1") * (2 << (op >> 6 & 1))
+            if mode == 4:                           # down from An
+                to = (self.a(reg) - size) & ADDRESS_MASK
+        else:
+            operand = _operand(op)
+            if operand is None:
+                return None
+            ext, size = operand
+            to = self._address(mode, reg, size, pc + ext)
+        if to is None:
+            return None
+        to = self.mem.physical(to)
+        return to, to + size
+
     def _stored_at(self, op: int, pc: int) -> int | None:
         """Where the MOVE, MOVEM or CLR at pc, op its first word, stores to,
         from the registers as the core has them as it stores, an (An)+ or
@@ -1191,8 +1513,16 @@ class CPU:
             at = pc + 2 + _extension(mem, op >> 3 & 7, op & 7, size, pc + 2)
         elif op & 0xFB80 == 0x4880:
             size, mode, reg, at = 2 << (op >> 6 & 1), op >> 3 & 7, op & 7, pc + 4
-        else:
-            size, mode, reg, at = SIZES[op >> 6 & 3], op >> 3 & 7, op & 7, pc + 2
+        else:                           # CLR, or a MOVE from CCR, a word
+            size, mode, reg, at = (1, 2, 4, 2)[op >> 6 & 3], op >> 3 & 7, op & 7, pc + 2
+        return self._address(mode, reg, size, at)
+
+    def _address(self, mode: int, reg: int, size: int, at: int) -> int | None:
+        """The address an effective address of mode and reg is, for an
+        operand of size bytes, its extension words at at, from the
+        registers as the core has them: or None, for one not in memory or
+        that it can't be told of, a 68020's full extension word."""
+        mem = self.mem._b
         if at + 4 > len(mem) or mode < 2 or mode == 7 and reg > 1:
             return None
         ext = struct.unpack_from(">H", mem, at)[0]
@@ -1235,7 +1565,7 @@ class CPU:
             self.mem.w16(sp + 6, (fmt << 12) | (vector * 4))
         self.mem.w16(sp, sr)
         self.mem.w32(sp + 2, pc)
-        self.uc.reg_write(UC_M68K_REG_SR, (sr | SUPERVISOR) & ~TRACE_BITS)
+        self._set_sr((sr | SUPERVISOR) & ~TRACE_BITS)
         self._may_trace = False
         self.sp = sp
         self.pc = self.mem.r32(vector * 4)
@@ -1249,7 +1579,7 @@ class CPU:
         else:
             fmt = self.mem.r16(sp + 6) >> 12
             size = 8 + {2: 4, 3: 4, 4: 8, 9: 12, 0xA: 24, 0xB: 84}.get(fmt, 0)
-        self.uc.reg_write(UC_M68K_REG_SR, sr)
+        self._set_sr(sr)
         self._may_trace = bool(sr & T1)
         self.sp = sp + size
         self.pc = pc
@@ -1264,21 +1594,24 @@ class CPU:
         struct.pack_into(">I", b, lowmem.Ticks, tick_count() & 0xFFFFFFFF)
         struct.pack_into(">I", b, lowmem.Time, mac_time())
 
-    def _clock(self) -> None:
-        """At each tick, just after it: Ticks is what tick_count() says,
-        and a program that reads it after TickCount sees the ticks gone by
-        since, no fewer."""
-        while not self._closed.wait(to_next_tick() / 60 + SETTLE):
-            self._set_clock()
-            try:
-                if self._interrupted_at_ticks():
-                    self.retrace_pending = True     # for the end of run()'s slice
-                    if self._unsliced:
-                        self.uc.emu_stop()      # a run with none, from before there was this to do
-                if self.interrupt_requested:
-                    self.uc.emu_stop()      # in case the first stop came between runs
-                on_tick = self.on_tick
-                if on_tick is not None:
-                    on_tick()
-            except Exception:           # noqa: BLE001 - the clock goes on
-                log.exception("at a tick")
+    def _tick(self) -> None:
+        """At each tick, from the clock, just after it: Ticks is what
+        tick_count() says, and a program that reads it after TickCount sees
+        the ticks gone by since, no fewer.  A run in slices is told to
+        return at the end of the one it's in, if there's something to do; a
+        run without them, not stopped, is let run to its trap, unless a page
+        held for it has been opened (see the module's docstring)."""
+        self._set_clock()
+        try:
+            if self._interrupted_at_ticks():
+                self.retrace_pending = True     # for the end of run()'s slice
+                if (self._unsliced and not self._alone
+                        and not self._opened.isdisjoint(self._held)):
+                    self.uc.emu_stop()      # a store after one let by, unseen
+            if self.interrupt_requested:
+                self.uc.emu_stop()      # in case the first stop came between runs
+            on_tick = self.on_tick
+            if on_tick is not None:
+                on_tick()
+        except Exception:           # noqa: BLE001 - the clock goes on
+            log.exception("at a tick")

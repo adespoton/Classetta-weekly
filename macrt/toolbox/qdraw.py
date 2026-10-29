@@ -243,8 +243,11 @@ class Region:
             i += 1
             if v == RGN_END:
                 break
-            if prev_v is not None and cur:
-                bands.append((prev_v, v, tuple(sorted(cur))))
+            # an odd number of inversion points leaves the last unpaired:
+            # it's left out
+            xs = tuple(sorted(cur))[:len(cur) & ~1]
+            if prev_v is not None and xs:
+                bands.append((prev_v, v, xs))
             while i < len(words) and words[i] != RGN_END:
                 cur ^= {words[i]}
                 i += 1
@@ -700,6 +703,12 @@ VALUE_TABLES = {d: [0xFF000000 | (255 - i * 255 // ((1 << d) - 1)) * 0x010101
                     for i in range(1 << d)] for d in (1, 2, 4, 8)}
 
 
+@lru_cache(maxsize=64)          # a screen's 480 rows of three: some 56K each
+def _rows(row: str, n: int) -> struct.Struct:
+    """n rows laid out as row (a struct format) is, one after another."""
+    return struct.Struct(">" + row * n)
+
+
 def _mono(data: bytes, width: int, height: int, bpl: int) -> QImage:
     img = QImage(data, width, height, bpl, QImage.Format.Format_Mono)
     img.setColorTable(MONO_TABLE)
@@ -712,8 +721,11 @@ def ink(pat: bytes, mode: int, fg: int = BLACK_RGB,
     """A brush that paints pat in a pattern mode, and how it combines with
     what's there."""
     rows = (bytes(pat) + bytes(8))[:8]
-    img = _mono(b"".join(bytes([r, 0, 0, 0]) for r in rows), 8, 8, 4)
     table, comp = mode_table(mode, fg, bk)
+    if rows in (bytes(8), b"\xFF" * 8):
+        # one colour: a plain brush paints the same, far more quickly
+        return QBrush(QColor.fromRgba(table[rows[0] & 1])), comp
+    img = _mono(b"".join(bytes([r, 0, 0, 0]) for r in rows), 8, 8, 4)
     img.setColorTable(table)
     return QBrush(img.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)), comp
 
@@ -722,8 +734,7 @@ def source_image(src: QImage, mode: int, fg: int = BLACK_RGB,
                  bk: int = WHITE_RGB) -> tuple[QImage, QPainter.CompositionMode]:
     """src, black and white, ready to draw in a source mode (CopyBits,
     text): black is a 1 bit, white a 0."""
-    mono = src.convertToFormat(QImage.Format.Format_Mono, MONO_TABLE,
-                               Qt.ImageConversionFlag.ThresholdDither)
+    mono = pixels.mono(src)
     table, comp = mode_table(mode, fg, bk)
     mono.setColorTable(table)
     return mono.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied), comp
@@ -942,8 +953,7 @@ class WindowSurface:
 
     def mono(self, r: Rect, need: Rect) -> QImage:
         """part(), as a 1-bit image, black 1 as on a Mac."""
-        return self.part(r, need).convertToFormat(QImage.Format.Format_Mono, MONO_TABLE,
-                                                  Qt.ImageConversionFlag.ThresholdDither)
+        return pixels.mono(self.part(r, need))
 
     def pixel(self, pt: Point) -> bool:
         """Whether the pixel at pt isn't white."""
@@ -974,6 +984,10 @@ class MemorySurface:
         self.bounds = bounds
         self.depth = depth
         self.table = table
+        # The screen's: the colours a colour that isn't exactly table's is
+        # matched to, with none for an entry reserved for animation
+        # (Devices.matching; see pixels.encode).
+        self.match: list[int] | None = None
         self.ct = 0                 # a PixMap's, the ColorTable handle table is from
         self.own: list[int] | None = None   # table, while it's drawn on in values
 
@@ -1042,7 +1056,7 @@ class MemorySurface:
                             QImage.Format.Format_MonoLSB):
             # an indexed image's indices would be kept, not its colours matched
             img = img.convertToFormat(QImage.Format.Format_ARGB32)
-        raw, bpl = pixels.encode(img, self.depth, self.own)
+        raw, bpl = pixels.encode(img, self.depth, self.own, self.match)
         return pixels.decode(raw, img.width(), img.height(), bpl, self.depth, self.table)
 
     def _rows(self, area: Rect | None) -> tuple[int, int]:
@@ -1059,11 +1073,20 @@ class MemorySurface:
                 QImage.Format.Format_RGB32)
         return pixels.decode(data, rb * 8 // depth, bottom - top, rb, depth, self.table)
 
+    def _match(self) -> list[int] | None:
+        return self.match if self.own is None else None     # in values, they're as they are
+
     def _encode(self, img: QImage, top: int) -> None:
-        raw, bpl = pixels.encode(img, self.depth, self.table)
-        rb = self.row_bytes
-        rows = b"".join(raw[y * bpl:y * bpl + rb] for y in range(img.height()))
-        self.mem.write(self.base + (top - self.bounds.top) * rb, rows)
+        raw, bpl = pixels.encode(img, self.depth, self.table, self._match())
+        rb, h = self.row_bytes, img.height()
+        at = self.base + (top - self.bounds.top) * rb
+        if bpl >= rb:
+            rows = b"".join(_rows(f"{rb}s{bpl - rb}x", h).unpack_from(raw))
+        else:
+            # rows that end part-way into a pixel: what's after the last as it was
+            rest = _rows(f"{bpl}x{rb - bpl}s", h).unpack(self.mem.read(at, rb * h))
+            rows = b"".join(raw[y * bpl:(y + 1) * bpl] + rest[y] for y in range(h))
+        self.mem.write(at, rows)
 
     def put(self, img: QImage, left: int, r: Region) -> None:
         """Write img's pixels where r is, img's top left at r's top and
@@ -1078,25 +1101,29 @@ class MemorySurface:
         if d == 1:
             data, bpl = pixels.raw(img), img.bytesPerLine()
         else:
-            data, bpl = pixels.encode(img, d, self.table)
-        pre, post = bytes(first), bytes(rb - first - nb)
+            data, bpl = pixels.encode(img, d, self.table, self._match())
         rows = bottom - top
-        src = b"".join([pre + data[y * bpl:y * bpl + nb] + post for y in range(rows)])
+        at = self.base + (top - b.top) * rb
+        # Each row in three: before first, nb bytes from first, and after.
+        parts = list(_rows(f"{first}s{nb}s{rb - first - nb}s", rows).unpack(
+            self.mem.read(at, rows * rb)))
+        src = b"".join(_rows(f"{nb}s{bpl - nb}x", rows).unpack_from(data))
         bits, y, masks = nb * 8, top, []
         for t, bt, xs in r.bands:
             if t > y:
-                masks.append(bytes(rb * (t - y)))
+                masks.append(bytes(nb * (t - y)))
             m = 0
             for i in range(0, len(xs), 2):
                 x0, x1 = (xs[i] - left) * d, (xs[i + 1] - left) * d
                 m |= ((1 << (x1 - x0)) - 1) << (bits - x1)
-            masks.append((pre + m.to_bytes(nb, "big") + post) * (bt - t))
+            masks.append(m.to_bytes(nb, "big") * (bt - t))
             y = bt
-        mask = int.from_bytes(b"".join(masks), "big")
-        at = self.base + (top - b.top) * rb
-        old = int.from_bytes(self.mem.read(at, rows * rb), "big")
-        new = old & ~mask | int.from_bytes(src, "big") & mask
-        self.mem.write(at, new.to_bytes(rows * rb, "big"))
+        if len(r.bands) > 1 or m != (1 << bits) - 1:        # not all of each row's nb
+            mask = int.from_bytes(b"".join(masks), "big")
+            old = int.from_bytes(b"".join(parts[1::3]), "big")
+            src = (old & ~mask | int.from_bytes(src, "big") & mask).to_bytes(rows * nb, "big")
+        parts[1::3] = _rows(f"{nb}s", rows).unpack(src)
+        self.mem.write(at, b"".join(parts))
 
     @contextmanager
     def painter(self, area: Rect | None = None):
@@ -1316,6 +1343,7 @@ class QuickDraw:
                                  devices.table() if depth <= 8 else None)
         if got is not None and depth <= 8:
             got.ct = pm.pm_table & ADDRESS_MASK
+            got.match = devices.matching()
         return got
 
     def _palette(self, port: GrafPort | None) -> Callable[[], list[int] | None] | None:

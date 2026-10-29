@@ -81,6 +81,11 @@ class Toolbox:
     def _gui(self, fn, *args):
         return self._d.bridge.call(fn, *args)
 
+    def _track(self, fn, *args, serve: Callable | None = None):
+        """_gui for a call that follows the mouse, which the application
+        being stopped ends there and then."""
+        return self._d.bridge.call(fn, *args, serve=serve, killed=lambda: self._p.events.killed)
+
     def contents(self, h: int) -> bytes:
         """What a handle holds (68k code would just dereference it)."""
         with self._sys.lock:
@@ -152,11 +157,13 @@ class Toolbox:
         self._p.events.flush(mask, stop_mask)
 
     def Button(self) -> bool:
+        self._p.events.asked()
         return self._d.input.down
 
     def StillDown(self) -> bool:
         """Inside Macintosh I, Toolbox Event Manager: the button is down
         and there are no more mouse events pending in the queue."""
+        self._p.events.asked()
         return self._d.input.down and not self._p.events.peek(MOUSE_EVENTS, self._next_update)[0]
 
     def WaitMouseUp(self) -> bool:
@@ -530,7 +537,7 @@ class Toolbox:
     def DragWindow(self, w: WindowRecord, start: Point, bounds: Rect | None = None) -> None:
         if not self._d.input.modifiers & k.cmdKey:
             self.SelectWindow(w)
-        moved = self._gui(self._d.track_drag, w, bounds, start)
+        moved = self._track(self._d.track_drag, w, bounds, start)
         if moved is not None:
             def gui():
                 view = self._d.views.get(w)
@@ -552,7 +559,7 @@ class Toolbox:
     def _track_box(self, w: WindowRecord, whit: int) -> bool:
         if w.wdef_shaped and self.wdefs is not None:
             return self.wdefs.track(w, whit)        # its WDEF draws the box
-        return bool(self._gui(self._d.track_box, w, whit))
+        return bool(self._track(self._d.track_box, w, whit))
 
     def ZoomWindow(self, w: WindowRecord, part: int, front: bool = False) -> None:
         def gui():
@@ -574,7 +581,7 @@ class Toolbox:
             self.SelectWindow(w)
 
     def GrowWindow(self, w: WindowRecord, pt: Point, size_rect: Rect) -> int:
-        size = int(self._gui(self._d.track_grow, w, size_rect, pt) or 0)
+        size = int(self._track(self._d.track_grow, w, size_rect, pt) or 0)
         if size:
             self._grown = w
         return size
@@ -792,9 +799,7 @@ class Toolbox:
     def MenuSelect(self, pt: Point, serve: Callable | None = None) -> int:
         """serve(what, ...) answers the tracker on this thread while it
         follows the mouse: an application's MBDF and MDEFs (mdefs.Menus)."""
-        if serve is None:
-            return int(self._gui(self._d.track_menu, self._p, pt) or 0)
-        return int(self._d.bridge.call(self._d.track_menu, self._p, pt, serve=serve) or 0)
+        return int(self._track(self._d.track_menu, self._p, pt, serve=serve) or 0)
 
     def PopUpMenuSelect(self, menu: MenuInfo, top: int, left: int, item: int,
                         serve: Callable | None = None) -> int:
@@ -802,9 +807,7 @@ class Toolbox:
         coordinates: the menu's ID and the item chosen, as MenuSelect
         returns them; 0 for none."""
         args = (self._d.track_popup, self._p, menu, Point(top, left), item)
-        if serve is None:
-            return int(self._gui(*args) or 0)
-        return int(self._d.bridge.call(*args, serve=serve) or 0)
+        return int(self._track(*args, serve=serve) or 0)
 
     def MenuKey(self, ch: str | int) -> int:
         if isinstance(ch, int):

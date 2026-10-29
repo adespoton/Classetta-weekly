@@ -20,14 +20,15 @@ from ..toolbox import lowmem, textedit
 from ..toolbox.events import ProcessKilled, tick_count
 from ..toolbox.memmgr import memFullErr, noErr
 from ..toolbox.qdraw import Region, read_rgn, write_rgn
-from ..toolbox.scrap import TEXT, noTypeErr
+from ..toolbox.scrap import TEXT
 from ..toolbox.textedit import (EditRecord, Hooks, Style, Tracker, read_style_scrap, teBitClear,
                                 teBitSet, teFAutoScroll)
 from ..toolbox.types import Point, Rect
 from . import glue_scrap
 from .dispatch import trap
 from .glue_controls import _s16
-from .glue_toolbox import _port, _the_port_var, draw_with, measure_with, shape_proc, text_procs
+from .glue_common import _port, _the_port_var
+from .glue_quickdraw import draw_with, measure_with, shape_proc, text_procs
 
 STYL = b"styl"
 ERASE = 2                       # a GrafVerb
@@ -158,10 +159,8 @@ def do_text(t) -> None:
     cpu = t.cpu
     cpu.pc = cpu.pop32()
     p = cpu.a(3) & ADDRESS_MASK
-    try:
-        h = t.system.heap_of(p).recover_handle(p)
-    except ValueError:
-        h = 0
+    heap = t.system.find_heap(p)
+    h = heap.recover_handle(p) if heap is not None else 0
     rec = edit(t, h)
     if rec is not None:
         offset = rec.do_text(_s16(cpu.d(7)), _s16(cpu.d(3)), _s16(cpu.d(4)))
@@ -204,11 +203,6 @@ def set_text(t, h: int, data: bytes) -> None:
     ed = edit(t, h)
     if ed is not None:
         t.set_mem_err(noErr if ed.set_text(data) else memFullErr)
-
-
-def text(t, h: int) -> bytes:
-    ed = edit(t, h)
-    return ed.text if ed is not None else b""
 
 
 def set_select(t, h: int, start: int, end: int) -> None:
@@ -307,20 +301,6 @@ def insert(t, h: int, data: bytes) -> None:
 
 def text_box(t, data: bytes, r: Rect, just: int, erase: bool = True) -> None:
     textedit.text_box(t.tb.qd, _port(t), data, r, just, erase)
-
-
-def from_scrap(t) -> int:
-    """TEFromScrap: the desk scrap's text into TextEdit's scrap."""
-    found = glue_scrap.get_scrap(t, TEXT)
-    if found is None:
-        return noTypeErr
-    return noErr if textedit.set_te_scrap(t.process.world, t.process.heap, found[1]) \
-        else memFullErr
-
-
-def to_scrap(t) -> int:
-    """TEToScrap: TextEdit's scrap onto the desk scrap (after ZeroScrap)."""
-    return glue_scrap.put_scrap(t, TEXT, textedit.te_scrap(t.process.world, t.mem))
 
 
 # =========================================================================
@@ -621,42 +601,3 @@ def TEStylePaste(t, h):
         styl = glue_scrap.get_scrap(t, STYL)
         runs = read_style_scrap(styl[1]) if styl is not None else None
     t.set_mem_err(noErr if ed.paste(data, runs or None) else memFullErr)
-
-
-# =========================================================================
-# Glue: what the interfaces do without a trap
-# =========================================================================
-def TEFromScrap(t) -> int:
-    return from_scrap(t)
-
-
-def TEToScrap(t) -> int:
-    return to_scrap(t)
-
-
-def TEScrapHandle(t) -> int:
-    return t.process.world.r32(lowmem.TEScrpHandle)
-
-
-def TEGetScrapLength(t) -> int:
-    return textedit.scrap_length(t.process.world)
-
-
-def TESetScrapLength(t, length: int) -> None:
-    textedit.set_scrap_length(t.process.world, length)
-
-
-def TESetClickLoop(t, proc: int, h: int) -> None:
-    ed = edit(t, h)
-    if ed is not None:
-        ed.te.clik_loop = proc
-
-
-def TESetWordBreak(t, proc: int, h: int) -> None:
-    ed = edit(t, h)
-    if ed is not None:
-        ed.te.word_break = proc
-
-
-def GetCaretTime(t) -> int:
-    return t.mem.r32(lowmem.CaretTime)

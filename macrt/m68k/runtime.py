@@ -28,6 +28,7 @@ way MacsBug would.
 from __future__ import annotations
 
 import collections
+import functools
 import logging
 import struct
 import sys
@@ -35,7 +36,7 @@ import threading
 import time
 import traceback
 from contextlib import contextmanager, nullcontext
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from .. import moof
 from ..memory import ADDRESS_MASK, BusError, from_mac, to_mac
@@ -50,12 +51,12 @@ from ..toolbox.types import Point, Rect
 from ..toolbox.windows import WindowRecord
 from . import cpu as m68k
 from . import decompressors, dispatch, timemgr, wdefs
-from .sound import ASC, ASC_BASE, SoundDriver, Speaker, gestaltHasASC
+from .sound import ASC, ASC_BASE, SoundDriver, Speaker, gestaltHasASC, vSndEnb
 from .sound_manager import SoundManager
 from .cpu import CPU
 from .cycles import RATE
 from .hardware import (IWM, IWM_BASE, VIA, VIA_BASE, Clock, map_empty, map_test_rom, vBufA,
-                       vHeadSel)
+                       vBufB, vHeadSel)
 from .segload import Layout, SegmentLoader
 
 if TYPE_CHECKING:
@@ -99,7 +100,10 @@ appOpen = 0                     # the Finder information's message: open the doc
 # processor all the while.  What it asks about changes at a tick or with
 # input, so after SPIN_BUDGET of that it waits for the next tick or for
 # input, letting the others run as at Delay.  The host does many ticks of
-# a Mac's work in that budget.
+# a Mac's work in that budget.  Both are the processor time its thread has
+# had, where the host can tell (see thread_clock), not the clock's: the
+# host giving the processor to something else between two calls, as it
+# does under load, isn't the program doing something else.
 POLLS = frozenset({0xA971, 0xA972, 0xA973, 0xA974, 0xA975, 0xA976, 0xA977,
                    0xA030, 0xA031, 0xA9B4})
 SPIN_GAP = 0.0005               # seconds
@@ -228,7 +232,8 @@ def init_dispatcher(at: int, dispatcher: int) -> bytes:
                        0x21C8, 0x0028)                              # set: MOVE.L A0,$28
 
 
-MAX_RETRACES = 6        # ticks a late retrace catches up on; after a longer gap, one
+MAX_LATE = 20           # ticks a retrace catches up on when the host was late
+MAX_RETRACES = 6        # and after a break (see _retrace_tasks); after a longer gap, one
 MAX_TIME_TASKS = 64     # Time Manager tasks run at one tick, at most
 INTERRUPT_REGISTERS = 32  # what an interrupt handler keeps on the stack: A0-A3 and D0-D3
 
@@ -273,6 +278,16 @@ def after_instruction(mem, pc: int) -> int:
         size = 4 if op & 0xF1C0 == 0x4100 else 2
         return pc + 2 + _extension(mem, pc + 2, op & 0x3F, size)
     return pc + 2                           # TRAPV
+
+
+def thread_clock() -> Callable[[], float]:
+    """A reading of the calling thread's processor time that any thread can
+    take, where the host has one (Linux); elsewhere, as on macOS, the
+    clock's time, which counts the host's other work too."""
+    clock = getattr(time, "pthread_getcpuclockid", None)
+    if clock is None:
+        return time.monotonic
+    return functools.partial(time.clock_gettime, clock(threading.get_ident()))
 
 
 class SystemError68k(Exception):
@@ -323,6 +338,7 @@ class Machine:
         self.speaker = Speaker(self.mem, self.via, system.sound, self.asc)
         self.cpu.sound_waiting = lambda: (self.sound.counting() or self.speaker.waiting
                                           or self.sound_manager.busy())
+        self.cpu.watching = self._quiet_pages
         if system.speed:
             self.cpu.rate = int(system.speed * RATE)
         self.cpu.short_frames = system.model.cpu == 0
@@ -331,6 +347,19 @@ class Machine:
         self.drivers: dict[int, Process] = {}      # unit: whose 68k driver it is
         self._make_stubs()
         self._init_globals()
+
+    def _quiet_pages(self) -> list[int]:
+        """The pages a store to which may turn the sound on, for the CPU to
+        hold in a run without slices: vBufB's while the speaker's off, the
+        chip's while it has nothing to play."""
+        if not self.speaker.outputs:
+            return []
+        pages = []
+        if self.via.regs[vBufB] & vSndEnb:
+            pages.append(VIA_BASE >> m68k.PAGE_BITS)
+        if self.asc is not None and not self.asc.waiting:
+            pages.append(ASC_BASE >> m68k.PAGE_BITS)
+        return pages
 
     def _tick(self) -> None:
         """At each tick, from the clock: the cursor's task, and a look at
@@ -390,6 +419,7 @@ class Machine:
         self.swap_font = ROM_BASE + 492     # JSwapFont's
         self.crsr_task = ROM_BASE + 512     # JCrsrTask's: the input globals do it
         self.load_trap = ROM_BASE + 514     # _LoadSeg's _Debugger, with LoadTrap set
+        self.adb_service = ROM_BASE + 518   # the ADB devices' service routines: an RTS
         self.cpu.rom_interrupts = self.level_1
         self.cpu.no_handler = self.bomb_stub
         self.cpu.rom_level_1_routines = (self.level_1_routines,
@@ -401,6 +431,7 @@ class Machine:
         mem.w16(self.bomb_stub, ILLEGAL_WORD)
         mem.write(self.level_1, LEVEL_1_HANDLER)
         mem.w16(self.sound_task, RTS)
+        mem.w16(self.adb_service, RTS)
         mem.write(self.key_trans, KEY_TRANS)
         mem.write(self.wait_for_io, WAIT_FOR_IO)
         mem.write(self.sound_wait, SOUND_WAIT)
@@ -573,6 +604,7 @@ class Machine:
                 self.cpu.restore(runner.ctx)
                 runner.ctx = None
             runner.process.world.switch_in()
+            runner.catch_up = min(runner.catch_up, MAX_RETRACES)   # another's turn
             self.owner = runner
 
     def release(self) -> None:
@@ -615,6 +647,11 @@ class Machine:
             runner.process.world.switch_out()
             self.owner = None
         self._lock.release()
+
+    def close(self) -> None:
+        """The System's done with: its applications have stopped.  Stop
+        the CPU's clock."""
+        self.cpu.close()
 
 
 def machine_for(system: System) -> Machine:
@@ -659,13 +696,16 @@ class Runner:
         self.history: collections.deque = collections.deque(maxlen=16)
         self.reported: set[str] = set()
         self.unimplemented_calls: collections.Counter = collections.Counter()
+        self.internal_error: str | None = None      # the traceback, if macrt failed running it
         self.temp_handles: set[int] = set()         # TempNewHandle's
         self.trace = False
         self.menu_rect = 0          # mbRect's answer while MenuSelect pulls a menu down
         self.retrace_tick = 0       # when its VBL tasks were last counted down
+        self.catch_up = 1           # the most ticks the next count makes up for
         self.null_tick = -1         # when GetNextEvent last had nothing for it
         self.updated = (None, -1, 0)    # the update event it was last given: window, when, begun
-        self.polled = 0.0           # when the last of POLLS returned, if no other trap since
+        self.cpu_time = time.monotonic  # its thread's processor time, once it runs
+        self.polled = -SPIN_GAP     # when the last of POLLS returned, if no other trap since
         self.spun_from = 0.0        # when it started asking over and over
         self.in_gne_patch = False   # WaitNextEvent is calling a GetNextEvent patch
         self.in_patch: set[int] = set()     # traps the System is calling a patch of
@@ -682,6 +722,7 @@ class Runner:
         self.tb = toolbox
         if toolbox is not None:
             toolbox.wdefs = wdefs.WindowDefinitions(self)
+        self.cpu_time = thread_clock()
         self.machine.acquire(self)
         self.holding = True
         try:
@@ -700,6 +741,7 @@ class Runner:
             raise
         except Exception as e:  # noqa: BLE001 - say so, and stop only this application
             traceback.print_exc()
+            self.internal_error = traceback.format_exc()
             where = (f" in {dispatch.trap_name(self.history[-1][0])}" if self.history else "")
             self._report(SystemError68k(0, f"{type(e).__name__}{where}: {e}"))
         finally:
@@ -726,7 +768,7 @@ class Runner:
             cpu.set_d(n, 0)
         for n in range(7):
             cpu.set_a(n, 0)
-        cpu.uc.reg_write(m68k.UC_M68K_REG_SR, 0x2000)
+        cpu.sr = 0x2000
         cpu.set_a(5, part.a5)
         cpu.sp = part.stack_base
         cpu.push32(self.machine.exit_stub)
@@ -744,7 +786,7 @@ class Runner:
         glue_scrap.desk(self, from_host=True)               # its copy of the scrap (IM I-453)
         glue_aevents.launched(self, documents)
         self.process.resources.load_hook = (
-            lambda m, e, force: glue_toolbox.load_resource(self, m, e, force))
+            lambda m, e, force: glue_resources.load_resource(self, m, e, force))
         self.process.resources.decompressor = lambda data: decompressors.expand(self, data)
         return entry
 
@@ -809,8 +851,7 @@ class Runner:
     def _vertical_retrace(self) -> None:
         """The vertical retrace interrupt, between two instructions: count
         down each VBL task in the application's queue, once for each tick
-        since the last time (if that was a moment ago: after a longer gap,
-        such as another application's turn, once), and run those that
+        since the last time (see _retrace_tasks), and run those that
         reach 0, with A0 pointing at the task.  A task that wants to run
         again sets its count again.  After them at each tick, the Sound
         Driver's task and the Sound Manager's channels make the sound
@@ -819,6 +860,7 @@ class Runner:
         interrupts masked, it waits."""
         cpu = self.cpu
         if cpu.sr & m68k.INTERRUPT_MASK:
+            self.catch_up = min(self.catch_up, MAX_RETRACES)
             return
         cpu.retrace_pending = False
         self.ticks_failed = False
@@ -844,6 +886,7 @@ class Runner:
         again, to meet it there."""
         cpu = self.cpu
         if cpu.sr & m68k.INTERRUPT_MASK:
+            self.catch_up = min(self.catch_up, MAX_RETRACES)
             return
         ctx = cpu.context()
         try:
@@ -853,19 +896,29 @@ class Runner:
             log.debug("%s: a tick while it waited failed", self.process.name, exc_info=True)
             cpu.restore(ctx)
             self.ticks_failed = True
+            self.catch_up = min(self.catch_up, MAX_RETRACES)
 
     def _retrace_tasks(self) -> None:
         """The VBL tasks and the sound of each tick since the last.  A task
         that hasn't set its vblCount again once it's run is taken out of the
         queue, as Inside Macintosh II-350 has it: Dragonworld's music, which
-        it installs again when it plays the next tune."""
+        it installs again when it plays the next tune.
+
+        Ticks the host was late for are made up for, a third of a second
+        of them at most.  After a break, only a few: when the application had
+        interrupts masked, a tick while it waited failed, or another
+        application had its turn.  After a tick that left nothing counting
+        down, just the one, so that a task installed since counts from
+        then.  A longer gap counts once."""
         cpu, mem = self.cpu, self.mem
         now = tick_count()
         ticks = now - self.retrace_tick
-        if ticks > MAX_RETRACES:
+        if ticks <= 0:
+            return
+        if ticks > self.catch_up:
             ticks = 1
         self.retrace_tick = now
-        if ticks > 0 and (mem.r32(lowmem.VBLQueue + 2) or cpu.sound_waiting()):
+        if mem.r32(lowmem.VBLQueue + 2) or cpu.sound_waiting():
             ctx = cpu.context()
             self._interrupt_frame()
             sound, speaker = self.machine.sound, self.machine.speaker
@@ -889,6 +942,7 @@ class Runner:
                 manager.retrace(self)
                 speaker.retrace()
             cpu.restore(ctx)
+        self.catch_up = MAX_LATE if cpu.vbl_counting() or cpu.sound_waiting() else 1
 
     def _via_interrupt(self) -> None:
         """Interrupt the application for the VIA, between two instructions,
@@ -1027,14 +1081,15 @@ class Runner:
         except BusError as e:           # it passed the trap a bad pointer or handle
             raise SystemError68k(1, f"in {dispatch.trap_name(word)} at ${pc & ADDRESS_MASK:06X}: "
                                     f"{e}", pc & ADDRESS_MASK) from None
-        self.polled = time.monotonic() if poll else 0.0
+        self.polled = self.cpu_time() if poll else -SPIN_GAP
 
     def _polling(self) -> None:
         """One of POLLS: if the program has done nothing but ask for
         SPIN_BUDGET, it waits for the next tick or for input.  Not at a
         tick, with interrupts masked, or paced, where the time it takes
-        is the point."""
-        now = time.monotonic()
+        is the point.  The ticker's calls, made while the thread waits,
+        take no time from it."""
+        now = self.cpu_time()
         if now - self.polled >= SPIN_GAP:
             self.spun_from = now
             return
@@ -1044,7 +1099,7 @@ class Runner:
                 and not self.cpu.sr & m68k.INTERRUPT_MASK):
             with self.yielding():
                 self.process.events.nap(to_next_tick() / 60 + 2 * m68k.SETTLE)
-        self.spun_from = time.monotonic()
+        self.spun_from = self.cpu_time()
 
     def _call_os_patch(self, addr: int, word: int, ret: int) -> None:
         """What the OS trap dispatcher does for a patched trap, on the stack
@@ -1319,9 +1374,11 @@ class Runner:
 
 # Register the trap implementations.
 from . import (  # noqa: E402,F401
-    glue_aevents, glue_aliases, glue_color, glue_components, glue_controls, glue_cport, glue_desk,
-    glue_devices, glue_dialogs, glue_editions, glue_files, glue_gworld, glue_icons, glue_intl,
-    glue_lists, glue_menucolors, glue_os, glue_palette, glue_picker, glue_pict, glue_pictinfo,
-    glue_ppc, glue_print, glue_process, glue_sane, glue_scrap, glue_script, glue_scsi, glue_slots,
-    glue_sony, glue_sound, glue_stdfile, glue_textedit, glue_toolbox, glue_video)
+    glue_adb, glue_aevents, glue_aliases, glue_color, glue_common, glue_components, glue_controls,
+    glue_cport, glue_desk, glue_devices, glue_dialogs, glue_editions, glue_events, glue_files,
+    glue_fonts, glue_gworld, glue_help, glue_icons, glue_intl, glue_lists, glue_menucolors,
+    glue_menus, glue_os, glue_palette, glue_picker, glue_pict, glue_pictinfo, glue_ppc, glue_print,
+    glue_process, glue_quickdraw, glue_resources, glue_sane, glue_scrap, glue_script, glue_scsi,
+    glue_slots, glue_sony, glue_sound, glue_stdfile, glue_textedit, glue_utilities, glue_video,
+    glue_windows)
 from . import controlpanel  # noqa: E402 - the host for control panels, which calls the glue

@@ -41,7 +41,9 @@ from ..toolbox.windows import (AUX_CTL_SIZE, AUX_WIN_SIZE, aux_wins, find_aux_wi
 from . import glue_palette
 from .dispatch import trap
 from .glue_color import _argb, _qd_error, _set_argb, cNoMemErr
-from .glue_toolbox import _behind, _port, _the_port_var, init_port, show_cursor
+from .glue_common import _heap, _port, _the_port_var
+from .glue_quickdraw import init_port, show_cursor
+from .glue_windows import _behind
 
 # The parts of a window a 'wctb' gives the colours of (Inside Macintosh V-201).
 wContentColor, wFrameColor, wTextColor, wHiliteColor, wTitleBarColor = range(5)
@@ -64,17 +66,10 @@ def _deref(t, h: int) -> int:
         return 0
 
 
-def _heap(t, h: int):
-    try:
-        return t.system.heap_of(h)
-    except ValueError:
-        return t.process.heap
-
-
 def _copy_handle(t, src: int, dst: int) -> bool:
     """Put a copy of what's in one handle in another, resizing it."""
     p = _deref(t, src)
-    if not p or not dst:
+    if not p:
         return False
     n = _heap(t, src).handle_size(src)
     heap = _heap(t, dst)
@@ -136,17 +131,17 @@ def DisposePixMap(t, h):
 @trap
 def CopyPixMap(t, src, dst):
     """The fields, and a copy of the colour table in the destination's
-    own; the pixels stay where they are."""
-    s, d = _deref(t, src), _deref(t, dst)
-    if not s or not d:
+    own; the pixels stay where they are.  One that can't have a copy
+    keeps its own table as it was, never the source's."""
+    d = _deref(t, dst)
+    if not _deref(t, src) or not d:
         return
-    table = PixMap(t.mem, d).pm_table
-    t.mem.move(s, d, PIXMAP_SIZE)
-    src_table = PixMap(t.mem, s).pm_table
-    if not table:
-        table = _heap(t, dst).new_handle(0)
-    if table and _copy_handle(t, src_table, table):
-        PixMap(t.mem, _deref(t, dst)).pm_table = table
+    table = PixMap(t.mem, d).pm_table or _heap(t, dst).new_handle(0)
+    s = _deref(t, src)
+    t.mem.move(s, _deref(t, dst), PIXMAP_SIZE)
+    if table:
+        _copy_handle(t, PixMap(t.mem, s).pm_table, table)
+    PixMap(t.mem, _deref(t, dst)).pm_table = table
 
 
 # =========================================================================
@@ -465,16 +460,16 @@ def _default_aux(t, head: int = lowmem.AuxWinHead) -> int:
         return h
     kind, size, standard = _AUX[head]
     heap = t.process.heap
-    ct = t.process.resources.GetResource(kind, 0)
-    if not ct or not _deref(t, ct):
-        ct = heap.new_handle(0)
-        data = color_table(standard)
-        if not ct or not heap.set_handle_size(ct, len(data)):
-            return 0
-        t.mem.write(heap.deref(ct), data)
     h = heap.new_handle(size, clear=True)
     if not h:
         return 0
+    ct = t.process.resources.GetResource(kind, 0)
+    if not ct or not _deref(t, ct):
+        data = color_table(standard)
+        ct = heap.new_handle_with(data)
+        if not ct:
+            heap.dispose_handle(h)
+            return 0
     t.mem.w32(heap.deref(h) + 8, ct)
     last = 0
     for last in aux_wins(t.mem, head):

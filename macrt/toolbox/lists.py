@@ -163,19 +163,15 @@ class ListRec:
 
     def rebuild(self, cells: list[tuple[bytes, bool]], bounds: Rect) -> bool:
         """Make the list's cells these, row by row in bounds: what adding
-        and deleting rows and columns does.  False, with nothing changed,
-        if there's no room."""
+        and deleting rows and columns does, so there's never more data
+        than there was, only more offsets.  False, with nothing changed,
+        if there's no room for them."""
         data = b"".join(d for d, _ in cells)
-        if len(data) > MAX_DATA:
-            return False
         lh, ch = self.handle, self.cells & ADDRESS_MASK
         l_heap, c_heap = self.system.heap_of(lh), self.system.heap_of(ch)
         old_l, new_l = l_heap.handle_size(lh), CELL_ARRAY + 2 * (len(cells) + 1)
         old_c, new_c = c_heap.handle_size(ch), len(data)
         if new_l > old_l and not l_heap.set_handle_size(lh, new_l):
-            return False
-        if new_c > old_c and not c_heap.set_handle_size(ch, new_c):
-            l_heap.set_handle_size(lh, old_l)
             return False
         self.data_bounds = bounds
         self.max_index = 2 * len(cells)
@@ -219,7 +215,7 @@ class ListRec:
         """LGetSelect's search: the first selected cell at or after cell,
         row by row."""
         b = self.data_bounds
-        if cell.v < b.top or (cell.v == b.top and cell.h < b.left):
+        if cell.v < b.top:
             cell = b.top_left
         elif cell.h < b.left:
             cell = Point(cell.v, b.left)

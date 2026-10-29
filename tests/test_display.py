@@ -376,6 +376,8 @@ def test_hierarchical_menus(harness):
     h.release(sh, sv)
     h.wait_until(lambda: app.last("MenuSelect") is not None, what="MenuSelect")
     assert app.last("MenuSelect") == ("MenuSelect", (100 << 16) | 2)
+    # The app takes the highlight off after logging it, on its own thread.
+    h.wait_until(lambda: bar.hilite_id == 0, what="the app's HiliteMenu(0)")
     assert app.tb.MenuKey("s") == (100 << 16) | 2
     h.wait_until(lambda: bar.hilite_id == Recorder.EDIT, what="the menu it hangs from")
     app.tb.HiliteMenu(0)
@@ -664,6 +666,24 @@ def test_drag_and_grow_follow_the_mouse_from_the_click(harness):
     h.release(gh + 80, gv + 40)
     h.wait_until(lambda: (rec.content.width, rec.content.height) == (w0 + 80, h0 + 40),
                  what="the new size")
+
+
+@pytest.mark.parametrize("where", ["title", "menu"])
+def test_an_app_stopped_while_it_follows_the_mouse_goes_at_once(harness, where):
+    """Not when the button comes up: its drag or menu goes with it."""
+    h = harness()
+    h.launch(Recorder("Other"))                          # keeps the display up
+    app = Recorder("App")
+    proc = h.launch(app)
+    point = (h.title_point(proc.windows[0]) if where == "title"
+             else h.menu_title_point(bar_for(h, proc), "File"))
+    h.press(*point)
+    h.wait_until(lambda: h.d.tracker is not None and h.d.tracker.owner is proc,
+                 what="the drag or menu")
+    proc.kill()
+    h.wait_until(lambda: proc not in h.d.processes, what="the app to go")
+    assert h.d.tracker is None and QApplication.activePopupWidget() is None
+    h.release(*point)
 
 
 class TakesNoSize(Recorder):

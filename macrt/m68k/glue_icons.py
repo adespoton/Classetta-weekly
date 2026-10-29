@@ -20,7 +20,8 @@ from ..toolbox.resources import resNotFound
 from ..toolbox.types import Rect
 from .dispatch import trap
 from .glue_controls import scratch
-from .glue_toolbox import _port, _set_rgn
+from .glue_common import _port
+from .glue_quickdraw import _set_rgn
 
 paramErr = -50
 noSuchIconErr = -2582

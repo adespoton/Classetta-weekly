@@ -85,6 +85,7 @@ from ..toolbox.files import paramErr
 from ..toolbox.memmgr import memFullErr, noErr
 from .sound import FRAME, SILENCE, SILENT_FRAME, fill, mix
 
+notEnoughHardware = -201
 badChannel = -205
 queueFull = -203
 resProblem = -204
@@ -130,6 +131,7 @@ MAC_RATE = rate22khz / 0x10000
 MAX_COMMANDS = 256                  # a frame's, for callbacks that queue more callbacks
 MAX_REQUESTS = 64                   # requestNextCmds in a row
 MAX_SAMPLES = 1 << 24               # a sound header's that isn't nonsense
+MAX_CHANNELS = 64                   # open at once, macrt's own limit
 
 Command = tuple[int, int, int]      # cmd, param1 (as a word), param2
 
@@ -839,8 +841,8 @@ class SoundManager:
     def busy(self) -> bool:
         """Whether a channel has a command to come to, or sound to make."""
         m = self.mem
-        return self.active or any(ch.voice is not None or ch.busy(m)
-                                  for ch in self.channels.values())
+        return self.active or bool(self.channels) and any(
+            ch.voice is not None or ch.busy(m) for ch in self.channels.values())
 
     def retrace(self, t) -> None:
         """A tick: each channel's next frame, added to the Sound Driver's
@@ -948,9 +950,11 @@ def parse_snd(data: bytes) -> tuple[int, int, list[Command]] | None:
         commands = [struct.unpack_from(">HHI", data, at + 8 * i) for i in range(max(n, 0))]
     except struct.error:
         return None
-    for i, (cmd, p1, p2) in enumerate(commands):
-        if cmd & ~dataPointerFlag == soundCmd and not any(
-                c & ~dataPointerFlag in (noteCmd, freqCmd, bufferCmd) for c, _, _ in commands[i:]):
+    playing = [i for i, (c, _, _) in enumerate(commands)
+               if c & ~dataPointerFlag in (noteCmd, freqCmd, bufferCmd)]
+    for i in range(playing[-1] + 1 if playing else 0, len(commands)):
+        cmd, p1, p2 = commands[i]
+        if cmd & ~dataPointerFlag == soundCmd:
             commands.insert(i + 1, (cmd & dataPointerFlag | bufferCmd, p1, p2))
             break
     return synth, init, commands
@@ -986,7 +990,7 @@ def parse_aiff(data: bytes) -> tuple[bytes, float] | int:
     compression = b"NONE"
     if data[8:12] == b"AIFC" and size >= 22:
         compression = bytes(data[comm + 18:comm + 22])
-    if channels < 1 or not 1 <= bits <= 32 or not rate > 0:
+    if channels < 1 or not 1 <= bits <= 32 or not 0 < rate < math.inf:
         return badFileFormat
     if compression in SILENT_TYPES:
         return bytes([SILENCE]) * min(frames, MAX_SAMPLES), rate

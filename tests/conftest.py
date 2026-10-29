@@ -6,6 +6,7 @@ import time
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
+from PyQt6 import sip
 from PyQt6.QtCore import QPoint, Qt
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication
@@ -172,6 +173,8 @@ class Harness:
     # -- mouse, in Mac global coordinates ----------------------------------
     def _target(self, h, v):
         g = self.d.global_from_mac(Point(v, h))
+        if self._held is not None and sip.isdeleted(self._held):
+            self._held = None               # its window closed while the button was down
         w = QApplication.activePopupWidget() or self._held or QApplication.widgetAt(g)
         assert w is not None, f"nothing at ({h}, {v})"
         return w, w.mapFromGlobal(g)
@@ -240,9 +243,7 @@ class Harness:
 
     def close(self):
         self.d.shutdown(quit_app=False)
-        for proc in list(self.d.launch_order):
-            if proc.thread is not None:
-                proc.thread.join(2)
+        self.d.join(2 * max(1, len(self.d.launch_order)))
         QApplication.processEvents()
 
 

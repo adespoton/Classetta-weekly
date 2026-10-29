@@ -193,6 +193,14 @@ def _tokens(text: bytes) -> list[tuple[str, int, int]]:
     return out
 
 
+def _read_number(token: bytes) -> int:
+    """A run of digits as a number: past what any field can be, a
+    billion, whose date or time is invalid (and too long for Python to
+    read, at thousands of digits)."""
+    token = token.lstrip(b"0")
+    return int(token or b"0") if len(token) <= 9 else 10 ** 9
+
+
 def _names(intl1: bytes, at: int, count: int) -> list[bytes]:
     return [intl1[at + 16 * i + 1:at + 16 * i + 1 + intl1[at + 16 * i]].lower()
             for i in range(count)]
@@ -245,7 +253,7 @@ def parse_date(text: bytes, intl0: bytes, intl1: bytes, today: DateTime) -> Pars
             seps.append(token)
             continue
         if kind == "number" and len(numbers) < (2 if month else 3):
-            numbers.append((int(token), end - start))
+            numbers.append((_read_number(token), end - start))
         elif kind == "word" and not month and _named(token, months, abbr):
             month = _named(token, months, abbr)
         elif kind == "word" and not (numbers or month or day_name) and _named(token, days, abbr):
@@ -319,7 +327,7 @@ def parse_time(text: bytes, intl0: bytes) -> Parsed:
         if kind == "space":
             continue
         if kind == "number" and len(numbers) < 3 and pm is None:
-            numbers.append(int(token))
+            numbers.append(_read_number(token))
             used = end
             continue
         if kind == "sep" and numbers and pm is None and len(numbers) < 3 \

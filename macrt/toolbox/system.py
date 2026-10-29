@@ -145,6 +145,7 @@ class Model:
     hardware: int
     color: bool = False     # Color QuickDraw, and a screen of more than one bit a pixel
     slots: bool = False     # NuBus slots: the Slot Manager's VBL calls, the Start Manager's video
+    adb: bool = False       # the Apple Desktop Bus: the ADB Manager's keyboard and mouse
     # The ROM's Toolbox trap table's entries: 512 in the 128K ROM, from
     # $C00 to $13FF, whose dispatcher takes a Toolbox trap number from
     # bits 0-8 of the word, bit 9 being "reserved for future use" (Inside
@@ -156,7 +157,7 @@ MODELS = {
     "plus": Model("Macintosh Plus", 0, False, gestalt=4, environs=2, rom=0x0075, keyboard=3,
                   hardware=0x91, toolbox_traps=512),
     "ii": Model("Macintosh II", 2, True, gestalt=6, environs=4, rom=0x0178, keyboard=5,
-                hardware=0x9B, color=True, slots=True),
+                hardware=0x9B, color=True, slots=True, adb=True),
 }
 
 RTS = 0x4E75
@@ -633,7 +634,9 @@ class System:
         zone = self._zones.get(start)
         return zone[0] if zone else None
 
-    def heap_of(self, addr: int) -> Heap:
+    def find_heap(self, addr: int) -> Heap | None:
+        """The heap addr is in; None for one in none, such as a handle
+        whose master pointer is in a program's globals."""
         a = addr & ADDRESS_MASK
         for heap, _ in self._zones.values():
             if heap.contains(a):
@@ -645,7 +648,13 @@ class System:
         for p in self._partitions:
             if p.heap.contains(a):
                 return p.heap
-        raise ValueError(f"${a:06X} is not in a heap")
+        return None
+
+    def heap_of(self, addr: int) -> Heap:
+        heap = self.find_heap(addr)
+        if heap is None:
+            raise ValueError(f"${addr & ADDRESS_MASK:06X} is not in a heap")
+        return heap
 
     # =====================================================================
     # Canonical views: one Python object per port, so a WindowPtr that
@@ -930,8 +939,7 @@ class System:
         with self.lock:
             items = []
             for kind, rid, data, *name in resources:
-                h = self.sys_heap.new_handle(len(data))
-                self.mem.write(self.sys_heap.deref(h), data)
+                h = self.sys_heap.new_handle_with(data)
                 self.sys_heap.set_state(h, LOCKED | RESOURCE)
                 items.append(Item(restype(kind), rid, to_mac(name[0]) if name else None,
                                   resSysHeap | resLocked, UNWRITTEN, h))

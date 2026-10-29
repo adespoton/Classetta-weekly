@@ -265,9 +265,8 @@ class MenuInfo(MenuBase):
         """What a handle holds, for the bar to find a title's icon in; None
         for one that's NIL, purged or not a handle."""
         h &= ADDRESS_MASK
-        try:
-            heap = self.system.heap_of(h)
-        except ValueError:
+        heap = self.system.find_heap(h)
+        if heap is None:
             return None
         p = heap.deref(h) if heap.is_handle(h) else 0
         return self.mem.read(p, heap.handle_size(h)) if p else None
@@ -553,10 +552,7 @@ def mct_key(entry: bytes) -> tuple[int, int]:
 def mct_entries(system: System, h: int) -> list[bytes]:
     """The table's entries, but its last."""
     h &= ADDRESS_MASK
-    try:
-        heap = system.heap_of(h) if h else None
-    except ValueError:
-        return []
+    heap = system.find_heap(h) if h else None
     p = heap.deref(h) if heap is not None else 0
     if not p:
         return []
