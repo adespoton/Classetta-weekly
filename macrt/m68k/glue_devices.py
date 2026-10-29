@@ -320,11 +320,8 @@ def _remove(t, unit: int, code: bool = True) -> None:
         e = system.sys_map.find_handle(h)
         if e is not None and e.offset == UNWRITTEN:
             return                          # a disk System's, only in memory: kept
-        try:
-            heap = system.heap_of(h)
-        except ValueError:
-            return
-        if heap.is_handle(h):
+        heap = system.find_heap(h)
+        if heap is not None and heap.is_handle(h):
             heap.unlock(h)
             heap.set_purgeable(h, True)
 

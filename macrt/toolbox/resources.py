@@ -316,10 +316,9 @@ def load_map(system: System, heap: Heap, fork: bytes, refnum: int, next_map: int
     raw = bytearray(fork[fm.map_offset:fm.map_offset + fm.map_length])
     raw[0:16] = fork[0:16]
     struct.pack_into(">Ih", raw, M_NEXT, next_map, refnum)
-    h = heap.new_handle(len(raw))
+    h = heap.new_handle_with(bytes(raw))
     if not h:
         return 0
-    system.mem.write(heap.deref(h), bytes(raw))
     for e in ResourceMap(system.mem, h).entries():
         e.handle = 0
     return h

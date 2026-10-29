@@ -53,11 +53,9 @@ def _record(t, h: int) -> al.Alias:
 def _new_handle(t, a: al.Alias, alias_p: int) -> int:
     t.w32(alias_p, 0)
     data = a.pack()
-    heap = t.process.heap
-    h = heap.new_handle(len(data))
+    h = t.process.heap.new_handle_with(data)
     if not h:
         return memFullErr
-    t.mem.write(heap.deref(h), data)
     t.w32(alias_p, h)
     return noErr
 

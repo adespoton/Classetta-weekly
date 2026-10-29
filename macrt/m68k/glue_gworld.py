@@ -52,8 +52,8 @@ from ..toolbox.gdevice import (DEPTH_MODES, GDEVICE_SIZE, ITAB_RES, PIXMAP_SIZE,
 from ..toolbox.quickdraw import CPORT_VERSION, BitMap, GrafPort, set_rect_rgn
 from ..toolbox.types import Rect
 from .dispatch import trap
-from .glue_color import _new_colors, _qd_error, cNoMemErr, noErr
-from .glue_toolbox import _the_port_var
+from .glue_color import _make_itable, _new_colors, _qd_error, cNoMemErr, noErr
+from .glue_common import _heap, _the_port_var
 
 pixPurge, noNewDevice, useTempMem, keepLocal = 1, 2, 4, 8
 pixelsPurgeable, pixelsLocked = 0x40, 0x80
@@ -75,15 +75,8 @@ def _deref(t, h: int) -> int:
         return 0
 
 
-def _heap_of(t, h: int):
-    try:
-        return t.system.heap_of(h)
-    except ValueError:
-        return None
-
-
 def _dispose(t, h: int) -> None:
-    heap = _heap_of(t, h) if h else None
+    heap = t.system.find_heap(h) if h else None
     if heap is not None and heap.is_handle(h & ADDRESS_MASK):
         heap.dispose_handle(h & ADDRESS_MASK)
 
@@ -110,15 +103,8 @@ def _table_data(t, depth: int, ct_h: int) -> bytes:
     data = standard_table(depth)
     if data is None:
         res = t.process.resources.GetResource("clut", depth)
-        data = t.tb.contents(res) if res and t.mem.r32(res) & ADDRESS_MASK else None
+        data = t.tb.contents(res) if res else None     # (b"" if it's purged)
     return data or standard_table(32 + depth) or color_table([])
-
-
-def _new_handle(t, heap, data: bytes) -> int:
-    h = heap.new_handle(len(data))
-    if h:
-        t.mem.write(heap.deref(h), data)
-    return h
 
 
 def _new_pixels(t, size: int, flags: int) -> int:
@@ -137,9 +123,10 @@ def _new_pixels(t, size: int, flags: int) -> int:
 
 
 def _pixels_handle(t, pm: PixMap) -> int:
-    """The handle a world's pixels are in, from its baseAddr."""
+    """The handle a screen buffer's pixels are in, from its baseAddr.  (A
+    world keeps its own: a program may point its baseAddr elsewhere.)"""
     base = pm.base_addr & ADDRESS_MASK
-    heap = _heap_of(t, base) if base else None
+    heap = t.system.find_heap(base) if base else None
     return heap.recover_handle(base) if heap is not None else 0
 
 
@@ -167,15 +154,10 @@ def _new_itable(t, heap, gdh: int) -> bool:
     mem = t.mem
     gd = GDevice(mem, _deref(t, gdh))
     pm = PixMap(mem, _deref(t, gd.pmap))
-    ct = _deref(t, pm.pm_table)
-    data = make_itable(read_table(mem, pm.pm_table), mem.r32(ct) if ct else 0)
     if gd.i_table:
-        ih_heap = _heap_of(t, gd.i_table) or heap
-        if not ih_heap.set_handle_size(gd.i_table, len(data)):
-            return False
-        mem.write(ih_heap.deref(gd.i_table), data)
-        return True
-    ih = _new_handle(t, heap, data)
+        return _make_itable(t, pm.pm_table, gd.i_table, gd.res_pref or ITAB_RES)
+    ct = _deref(t, pm.pm_table)
+    ih = heap.new_handle_with(make_itable(read_table(mem, pm.pm_table), mem.r32(ct) if ct else 0))
     gd = GDevice(mem, _deref(t, gdh))      # the heap may have moved it
     gd.i_table = ih
     return bool(ih)
@@ -198,9 +180,7 @@ def _depth_and_table(t, depth: int, ct_h: int) -> tuple[int, bytes] | None:
     the deepest screen's, and a copy of its table."""
     if depth == 0:
         main = _main(t)
-        if main is None:
-            return None
-        return main.pixel_size, _table_data(t, main.pixel_size, main.pm_table)
+        depth, ct_h = (main.pixel_size, main.pm_table) if main is not None else (0, 0)
     if depth not in DEPTH_MODES:
         return None
     return depth, _table_data(t, depth, ct_h)
@@ -241,7 +221,7 @@ def _new_gworld(t, gw_p: int, depth: int, bounds: Rect, table: bytes, device: in
     mem, heap = t.mem, t.process.heap
     row_bytes = _row_bytes(bounds.width, depth)
     pix = _new_pixels(t, row_bytes * bounds.height, flags)
-    ct = _new_handle(t, heap, table)
+    ct = heap.new_handle_with(table)
     pm_h = heap.new_handle(PIXMAP_SIZE, clear=True)
     port_p = heap.new_ptr(GrafPort.SIZE, clear=True)
     made = [h for h in (pix, ct, pm_h) if h]
@@ -283,6 +263,7 @@ def _new_gworld(t, gw_p: int, depth: int, bounds: Rect, table: bytes, device: in
     set_rect_rgn(heap, port.vis_rgn, bounds)
     port.gw_device = device
     port.gw_own_device = own
+    port.gw_pixels = pix
     t.system.register(port)
     t.w32(gw_p, port_p)
     return noErr
@@ -312,6 +293,7 @@ def _new_basic_gworld(t, gw_p: int, depth: int, bounds: Rect, flags: int) -> int
     port = GrafPort(mem, port_p)
     port.open(heap, BitMap(base, row_bytes, bounds))
     port.gw_pix_map = pm_h
+    port.gw_pixels = pix
     t.system.register(port)
     t.w32(gw_p, port_p)
     return noErr
@@ -337,18 +319,17 @@ def DisposeGWorld(t, gw):
     pm_h = _pix_map_h(port)
     p = _deref(t, pm_h)
     if p:
-        pm = PixMap(mem, p)
-        _dispose(t, _pixels_handle(t, pm))
-        _dispose(t, pm.pm_table)
+        _dispose(t, PixMap(mem, p).pm_table)
+    _dispose(t, port.gw_pixels)
     if port.gw_own_device:
         _dispose_device(t, port.gw_device)
     _dispose(t, pm_h)
     if port.is_color:
         port.port_pix_map = 0
-    heap = _heap_of(t, gw) or t.process.heap
-    port.close((_heap_of(t, port.vis_rgn) or heap) if port.vis_rgn else heap)
+    heap = _heap(t, gw)
+    port.close((t.system.find_heap(port.vis_rgn) or heap) if port.vis_rgn else heap)
     t.system.unregister(port)
-    port.gw_device = port.gw_pix_map = 0
+    port.gw_device = port.gw_pix_map = port.gw_pixels = 0
     if heap.contains(gw & ADDRESS_MASK):
         heap.dispose_ptr(gw & ADDRESS_MASK)
 
@@ -445,12 +426,11 @@ def UpdateGWorld(t, gw_p, depth, bounds_p, ct_h, gdh, flags):
     if not pix:
         _qd_error(t, cNoMemErr)
         return gwFlagErr
-    old_pix = _pixels_handle(t, pm)
     old_image = pixels.decode(mem.read(pm.base_addr & ADDRESS_MASK, old_rb * old_bounds.height),
                               old_bounds.width, old_bounds.height, old_rb, old_depth,
                               old_table).convertToFormat(QImage.Format.Format_ARGB32)
     if pm.pm_table:
-        heap = _heap_of(t, pm.pm_table) or t.process.heap
+        heap = _heap(t, pm.pm_table)
         if not heap.set_handle_size(pm.pm_table, len(table)):
             _dispose(t, pix)
             _qd_error(t, cNoMemErr)
@@ -471,7 +451,8 @@ def UpdateGWorld(t, gw_p, depth, bounds_p, ct_h, gdh, flags):
         keep = clipPix if keep & clipPix else stretchPix
         _redraw(t, pm, old_image, old_bounds, keep)
         done |= keep
-    _dispose(t, old_pix)
+    _dispose(t, port.gw_pixels)
+    port.gw_pixels = pix
     _move(t, port, bounds)
     gd = GDevice(mem, _deref(t, port.gw_device))
     if port.gw_own_device and gd.addr:
@@ -494,7 +475,7 @@ def _move(t, port: GrafPort, bounds: Rect) -> None:
         port.port_bits_row_bytes = pm.row_bytes & ROW_BYTES_MASK
         port.port_bits_bounds = bounds
     port.port_rect = bounds
-    heap = _heap_of(t, port.vis_rgn)
+    heap = t.system.find_heap(port.vis_rgn)
     if heap is not None:
         set_rect_rgn(heap, port.vis_rgn, bounds)
     p = _deref(t, port.gw_device)
@@ -609,7 +590,7 @@ def CTabChanged(t, ct_h):
         return
     t.mem.w32(ct, devices.next_seed())
     for port in list(t.system.ports.values()):
-        if port.gw_device and port.gw_own_device:
+        if port.gw_own_device:
             p = _deref(t, port.port_pix_map)
             if p and PixMap(t.mem, p).pm_table & ADDRESS_MASK == ct_h & ADDRESS_MASK:
                 _new_itable(t, t.process.heap, port.gw_device)

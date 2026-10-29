@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
+import re
 import signal
 import sys
 import time
@@ -324,7 +326,22 @@ def parse_args(argv=None):
         ap.error("a Mac Plus's screen is black and white: --depth needs --model ii")
     if args.row_bytes is not None and (args.row_bytes & 1 or not 0 < args.row_bytes < 0x4000):
         ap.error("--row-bytes is an even number of bytes, less than 16384")
+    if args.size is not None:
+        args.size = _screen_size(args.size)
+        if args.size is None:
+            ap.error("--size is a width and height in pixels, e.g. 640x480, each 1 to 32767")
+    if args.speed is not None and not 0 < args.speed < math.inf:
+        ap.error("--speed is a number of times a Mac Plus's speed, more than 0")
     return args
+
+
+def _screen_size(text: str) -> tuple[int, int] | None:
+    """WxH as a size, or None: QuickDraw's coordinates are INTEGERs."""
+    m = re.fullmatch(r"\s*(\d{1,5})\s*[xX]\s*(\d{1,5})\s*", text)
+    if m is None:
+        return None
+    w, h = int(m[1]), int(m[2])
+    return (w, h) if 0 < w <= 0x7FFF and 0 < h <= 0x7FFF else None
 
 
 def open_targets(args):
@@ -385,13 +402,17 @@ def main(argv=None) -> int:
     app = QApplication.instance() or QApplication(sys.argv[:1])
     from .ui import theme
     theme.RAINBOW_APPLE = args.rainbow
-    size = tuple(int(n) for n in args.size.lower().split("x")) if args.size else None
-    display = Display(DisplayConfig(host=args.host, menu_bar=args.menubar, screen_size=size,
-                                    sticky_menus=not args.classic_menus,
-                                    system_file=system_file, speed=args.speed,
-                                    model=args.model, depth=args.depth,
-                                    row_bytes=args.row_bytes, disks=disks,
-                                    sound=not args.no_sound, record_sound=args.record_sound))
+    try:
+        display = Display(DisplayConfig(host=args.host, menu_bar=args.menubar,
+                                        screen_size=args.size,
+                                        sticky_menus=not args.classic_menus,
+                                        system_file=system_file, speed=args.speed,
+                                        model=args.model, depth=args.depth,
+                                        row_bytes=args.row_bytes, disks=disks,
+                                        sound=not args.no_sound, record_sound=args.record_sound))
+    except (OSError, ValueError) as e:      # a screen too big, a WAV file that can't be made
+        print(f"macrt: {e}", file=sys.stderr)
+        return 2
     display.show()
     if targets or filers:
         logging.basicConfig(format="macrt: %(message)s")

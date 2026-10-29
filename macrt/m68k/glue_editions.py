@@ -284,10 +284,7 @@ def _unregister(t, st: Editions, s: Section) -> None:
 
 
 def _dispose(t, h: int) -> None:
-    try:
-        t.system.heap_of(h).dispose_handle(h)
-    except ValueError:
-        pass
+    t.system.sys_heap.dispose_handle(h)     # refnums and control blocks are the system's
 
 
 def _opener(t, st: Editions) -> int:
@@ -397,9 +394,15 @@ def _target(t, p: int, document: fm.Node | None = None) -> tuple[al.Alias | None
 
 def _edition_alias(data: bytes) -> tuple[al.Alias, int] | None:
     """An 'alis' format's alias to the publisher's document and the
-    publisher's section ID."""
-    a = al.Alias.parse(data[:-4]) if len(data) > 4 else None
-    return (a, struct.unpack(">l", data[-4:])[0]) if a is not None else None
+    publisher's section ID; None if it isn't one, which a publisher that
+    writes the format itself may make."""
+    if len(data) <= 4:
+        return None
+    try:
+        a = al.Alias.parse(data[:-4])
+    except FileError:
+        return None
+    return a, struct.unpack(">l", data[-4:])[0]
 
 
 # =========================================================================
@@ -580,6 +583,8 @@ def _standard_io(t, verb: int, pb: int) -> int:
     if data is None:
         return noTypeErr
     offset, n = m.r32(pb + ioOffset), max(m.r32s(pb + ioBuffLen), 0)
+    if offset + n > max(len(data), fm.ROOM):
+        return fm.dskFulErr                 # more than the edition's volume can hold
     if len(data) < offset:
         data.extend(bytes(offset - len(data)))
     data[offset:offset + n] = m.read(m.r32(pb + ioBuffPtr) & ADDRESS_MASK, n)
@@ -1168,12 +1173,15 @@ def GetStandardFormats(t, container, preview_format, preview, publisher_alias, f
         for h, kinds in wanted:
             if not h:
                 continue
+            errors = []
             for fmt in kinds:
                 data = _read_all(t, o, fmt)
                 if not isinstance(data, int):
                     break
+                errors.append(data)
             else:
-                result = noTypeErr
+                # none there, or why one that is couldn't be read
+                result = next((e for e in errors if e != noTypeErr), noTypeErr)
                 continue
             heap = t.system.heap_of(h)
             if not heap.set_handle_size(h, len(data)):

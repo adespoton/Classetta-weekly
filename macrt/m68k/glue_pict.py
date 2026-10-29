@@ -8,7 +8,7 @@ The pictures themselves are macrt.toolbox.pict's.
 A port's grafProcs, when it has them, decide where a picture's bytes
 come from and go to (getPicProc and putPicProc, for pictures spooled to
 and from disk) and who sees its comments (commentProc), and its text is
-drawn and measured with its textProc and txMeasProc (glue_toolbox); the
+drawn and measured with its textProc and txMeasProc (glue_quickdraw); the
 other procs are left to themselves, since QuickDraw here draws directly.
 """
 
@@ -30,7 +30,10 @@ from ..toolbox.types import Point, Rect
 from .dispatch import trap
 from .glue_color import _argb, _device, _gd, _rgb, _set_argb
 from .glue_controls import scratch
-from .glue_toolbox import _custom_proc, _port, _rgn, _swap_port_font
+from .glue_common import _port
+from .glue_fonts import _swap_port_font
+from .glue_os import DisposeHandle
+from .glue_quickdraw import _custom_proc, _rgn
 
 VERBS = pict.VERBS
 SPOOL = 4096                # bytes per call to a getPicProc or putPicProc
@@ -47,7 +50,7 @@ CQD_EXTRA = 7                # a CQDProcs' opcodeProc and newProc1 to 6
 
 
 # =========================================================================
-# Pictures (Inside Macintosh I-189, V-88)
+# Pictures (Inside Macintosh I and V, QuickDraw and Color QuickDraw)
 # =========================================================================
 @trap
 def DrawPicture(t, h, r):
@@ -79,9 +82,7 @@ def DrawPicture(t, h, r):
     proc = _custom_proc(t, port, COMMENT_PROC, 0xA8F1)
 
     def comment(kind: int, data: bytes | None) -> None:
-        dh = heap.new_handle(len(data)) if data else 0
-        if dh:
-            t.mem.write(heap.deref(dh), data)
+        dh = heap.new_handle_with(data) if data else 0
         t.call(proc, (("h", kind), ("h", len(data) if dh else 0), ("p", dh)))
         if dh:
             heap.dispose_handle(dh)
@@ -98,18 +99,12 @@ def _picture_heap(t, h: int, p: int) -> tuple:
     such as Microsoft BASIC's run-time makes on its stack for a picture it
     has read in, isn't in a heap: the picture's size is then its block's,
     or failing that its picSize."""
-    try:
-        heap = t.system.heap_of(h)
-    except ValueError:
-        heap = None
+    heap = t.system.find_heap(h)
     if heap is not None and heap.is_handle(h):
         return heap, heap.handle_size(h)
-    size = t.mem.r16(p)
-    try:
-        size = t.system.heap_of(p).ptr_size(p) or size
-    except ValueError:
-        pass
-    return t.process.heap, size
+    heap = t.system.find_heap(p)
+    size = heap.ptr_size(p) if heap is not None else 0
+    return t.process.heap, size or t.mem.r16(p)
 
 
 def _open(t, rec: pict.Recorder) -> int:
@@ -156,7 +151,8 @@ def OpenCPicture(t, params):
 def ClosePicture(t):
     """Stop recording and put the picture in its handle, or hand it to
     the port's putPicProc, which spools it.  Its picSize is mod 64K, as
-    always; GetHandleSize is the real size."""
+    always; GetHandleSize is the real size.  A handle the program has
+    disposed of or purged in the meantime is left as it is."""
     qd = t.tb.qd
     port = _port(t)
     if port is None or port.addr not in qd.pictures:
@@ -167,6 +163,8 @@ def ClosePicture(t):
     data = rec.picture()
     h = rec.handle
     heap = t.system.heap_of(h)
+    if not heap.is_handle(h) or not heap.deref(h):
+        return
     put_pic = _custom_proc(t, port, PUT_PIC_PROC, 0xA8F0)
     if put_pic:
         t.mem.write(heap.deref(h), data[:10])
@@ -181,14 +179,14 @@ def ClosePicture(t):
     elif heap.set_handle_size(h, len(data)):
         t.mem.write(heap.deref(h), data)
     else:                               # no room: an empty picture
-        t.mem.write(heap.deref(h), rec.picture()[:10])
+        t.mem.write(heap.deref(h), struct.pack(">H", 10) + data[2:10])
 
 
 @trap
 def KillPicture(t, h):
-    """DisposeHandle for a picture.  One that's a resource (programs do
-    kill what GetPicture gave them) is released instead, so the resource
-    map doesn't keep a handle that's gone."""
+    """DisposeHandle for a picture, MemErr and all.  One that's a resource
+    (programs do kill what GetPicture gave them) is released instead, so
+    the resource map doesn't keep a handle that's gone."""
     if not h:
         return
     for addr, rec in list(t.tb.qd.pictures.items()):
@@ -197,7 +195,7 @@ def KillPicture(t, h):
     if t.process.resources.is_resource(h):
         t.process.resources.ReleaseResource(h)
     else:
-        t.system.heap_of(h).dispose_handle(h)
+        DisposeHandle(t, h)
 
 
 @trap
@@ -213,7 +211,7 @@ def PicComment(t, kind, size, h):
 
 
 # =========================================================================
-# The standard procedures (Inside Macintosh I-197)
+# The standard procedures (Inside Macintosh I, QuickDraw)
 # =========================================================================
 @trap
 def SetStdProcs(t, procs):
@@ -321,10 +319,11 @@ def StdComment(t, kind, size, h):
 
 
 # =========================================================================
-# Masked copies (Inside Macintosh IV-24, V-80)
+# Masked copies (Inside Macintosh IV and V, QuickDraw and Color QuickDraw)
 # =========================================================================
 def _mask(t, mask_bm: int, mask_r: Rect, dst_r: Rect) -> Region | None:
-    """The 1 bits of mask_r in a mask BitMap, mapped onto dst_r."""
+    """The 1 bits of mask_r in a mask BitMap, mapped onto dst_r; None, no
+    mask, for one QuickDraw can't draw in or an empty mask_r."""
     surface, _ = t.tb.qd.bitmap(mask_bm)
     if surface is None or mask_r.empty:
         return None

@@ -15,6 +15,7 @@ reads a plain number.  Text is Mac Roman bytes throughout.
 
 from __future__ import annotations
 
+import decimal
 import struct
 from typing import NamedTuple
 
@@ -265,7 +266,8 @@ def _digits(x: sane.Num, places: int) -> tuple[bytes, bytes]:
     zeros (none for 0), and its decimals."""
     n, _ = sane._scaled(x, -places, sane.TONEAREST)
     whole, frac = divmod(n, 10 ** places)
-    return (str(whole).encode() if whole else b""), \
+    # Decimal writes an Extended's thousands of whole digits, which str won't
+    return (str(decimal.Decimal(whole)).encode() if whole else b""), \
         (str(frac).encode().rjust(places, b"0") if places else b"")
 
 

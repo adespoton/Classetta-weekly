@@ -99,9 +99,8 @@ def menu_of(t, c: Control):
 
 
 def _kept(t, h: int, menu_id: int):
-    try:
-        heap = t.system.heap_of(h)
-    except ValueError:
+    heap = t.system.find_heap(h)
+    if heap is None:
         return None
     m = t.menu(h) if heap.is_handle(h) else None
     return m if m is not None and m.id == menu_id else None

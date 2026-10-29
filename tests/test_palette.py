@@ -1,5 +1,5 @@
-"""The Palette Manager: palettes, the screen colours a front window's
-palette gives it, and colour animation (Inside Macintosh V-151 to V-166)."""
+"""The Palette Manager (Inside Macintosh V): palettes, the screen colours
+a front window's palette gives it, and colour animation."""
 
 import struct
 
@@ -10,12 +10,13 @@ from macrt.m68k.glue_palette import (pmAllUpdates, pmAnimated, pmBkUpdates, pmCo
                                      pmExplicit, pmFgUpdates, pmNoUpdates, pmTolerant)
 from macrt.resfork import Resource
 from macrt.toolbox.color import CT_PALETTE, color_table
-from macrt.toolbox.gdevice import deref, write_pixmap
+from macrt.toolbox.gdevice import GDevice, deref, write_pixmap
+from macrt.toolbox.memmgr import noErr
 from macrt.toolbox.quickdraw import GrafPort
 from macrt.toolbox.types import Rect
 from macrt.toolbox.windows import WindowRecord
 
-from guest import Guest
+from guest import Guest, Room
 
 WHITE, BLACK = (0xFFFF, 0xFFFF, 0xFFFF), (0, 0, 0)
 RED, BLUE = (0xFFFF, 0, 0), (0, 0, 0xFFFF)
@@ -25,10 +26,10 @@ ODDEST = (0x5678, 0x9ABC, 0x1234)
 pmInhibitC8 = 0x2000
 
 
-def guest(resources=()) -> Guest:
+def guest(resources=(), model="ii", **system) -> Guest:
     """A Mac II's trap context, whose windows are on the screen, with no
     views to show what's drawn in them."""
-    g = Guest(resources, model="ii")
+    g = Guest(resources, model=model, **system)
     g.tb.qd.repaint = lambda port: None
     g.system.screen.attach(g.process, lambda w: None)
     return g
@@ -78,6 +79,14 @@ def clut(g) -> list[tuple[int, int, int, int]]:
 def seed(g) -> int:
     devices = g.system.devices
     return g.mem.r32(deref(g.mem, devices.pixmap(devices.main).pm_table))
+
+
+def low_memory(g) -> bytes:
+    """Make what's at address 0 on, where a NIL handle's master pointer
+    would be, something other than zeros, as the vectors there would be;
+    what's there."""
+    g.mem.write(0, bytes(i % 255 + 1 for i in range(0x100)))
+    return g.mem.read(0, 0x100)
 
 
 def screen(g, rect: Rect) -> set[int]:
@@ -130,8 +139,8 @@ def test_a_palette_s_entries(g):
 def test_get_new_palette_reads_a_pltt_and_clears_what_s_private(qapp):
     entry = struct.pack(">HHHHH", *ODD, pmTolerant, 0x0100) + b"\xAB" * 6
     pltt = struct.pack(">h", 1) + b"\xCD" * 14 + entry
-    g = guest([Resource(b"pltt", 128, pltt)])
-    assert g("GetNewPalette", 129) == 0
+    g = guest([Resource(b"pltt", 128, pltt), Resource(b"pltt", 130, b"\x01")])
+    assert g("GetNewPalette", 129) == g("GetNewPalette", 130) == 0
     h = g("GetNewPalette", 128)
     assert g.contents(h) == struct.pack(">h", 1) + bytes(14) + entry[:10] + bytes(6)
 
@@ -234,6 +243,17 @@ def test_animated_entries_reserve_indexes_that_are_drawn_in_and_animated(g):
     assert g("GetPalette", w.addr) == 0
 
 
+def test_set_entries_changes_an_animated_entry_whatever_the_devices_gdid(g):
+    w = window(g)
+    g("NSetPalette", w.addr, palette(g, [RED], pmAnimated), pmAllUpdates)
+    (index,) = g.system.devices.reserved
+    gd = GDevice(g.mem, deref(g.mem, g("GetMainDevice")))
+    gd.id = gd.id + 1
+    spec = g.ptr(struct.pack(">HHHH", 0, *BLUE))
+    g("SetEntries", index, 0, spec)
+    assert g("QDError") == 0 and clut(g)[index][1:] == BLUE
+
+
 def test_a_pixmap_whose_colour_table_is_of_palette_entries(g):
     """A colour table whose ctFlags have bit 14 set gives each pixel value
     an entry of a palette, \"instead of its rgb values\" (Apple's Out of
@@ -297,6 +317,84 @@ def test_a_pixmap_in_the_screens_colours_is_copied_to_a_window_as_its_values(g):
             [shown[1], shown[2], shown[3], argb(BLACK)]
     for i, c in zip((1, 2, 3), (RED, BLUE, ODD)):       # (each told apart, a step at most)
         assert all(abs((shown[i] >> s & 0xFF) - (argb(c) >> s & 0xFF)) <= 1 for s in (0, 8, 16))
+
+
+@pytest.mark.parametrize("near", [False, True])
+def test_a_colour_copied_from_a_pixmap_of_its_own_colours_is_no_animated_entry(g, near):
+    """CopyBits from a PixMap with a colour table of its own matches its
+    colours to the screen's as Color2Index does: never to an entry
+    reserved for animation, whether the colour is near the entry's or
+    the same, so what's copied doesn't change as it's animated.  What's
+    drawn in the entry does."""
+    w = window(g)
+    blue = (0x1000, 0x2000, 0xE000)
+    h = palette(g, [blue], pmAnimated)
+    g("NSetPalette", w.addr, h, pmAllUpdates)
+    devices = g.system.devices
+    (index, _), = devices.reserved.items()
+    colour = (0x1100, 0x2200, 0xDD00) if near else blue
+    value = g("Color2Index", rgb(g, colour))
+    assert value != index
+    pm = g.handle(bytes(50))
+    write_pixmap(g.mem, deref(g.mem, pm), g.ptr(bytes([1]) * 8), 4, Rect(0, 0, 2, 4), 8,
+                 g.handle(color_table([WHITE, colour])))
+    r = Rect(10, 50, 12, 54)
+    g("CopyBits", deref(g.mem, pm), w.addr + 2, g.rect_ptr(Rect(0, 0, 2, 4)), g.rect_ptr(r),
+      0, 0)
+    g("PmForeColor", 0)
+    g("PaintRect", g.rect_ptr(Rect(20, 50, 22, 54)))
+    at = r.offset(w.content.left, w.content.top)
+    drawn = Rect(20, 50, 22, 54).offset(w.content.left, w.content.top)
+    assert screen(g, at) == {value} and screen(g, drawn) == {index}
+    g("AnimateEntry", w.addr, 0, rgb(g, RED))
+    g.system.screen.look()
+    with w.backing.lock:
+        assert w.backing.image.pixel(51, 10) | 0xFF000000 == devices.table()[value]
+        assert abs((w.backing.image.pixel(51, 20) >> 16 & 0xFF) - 0xFF) <= 1
+
+
+@pytest.mark.parametrize("color_port", [False, True])
+def test_a_colour_copied_to_the_screen_s_own_bits_is_no_animated_entry(g, color_port):
+    """The same, copied to a BitMap of the screen's own pixels, in a
+    colour window's port (drawn in pixel values) or an old GrafPort."""
+    w = window(g)
+    blue = (0x1000, 0x2000, 0xE000)
+    g("NSetPalette", w.addr, palette(g, [blue], pmAnimated), pmAllUpdates)
+    (index, _), = g.system.devices.reserved.items()
+    if not color_port:
+        port = g.ptr(bytes(GrafPort.SIZE))
+        g("OpenPort", port)
+    near = (0x1100, 0x2200, 0xDD00)
+    pm = g.handle(bytes(50))
+    write_pixmap(g.mem, deref(g.mem, pm), g.ptr(bytes([1, 2]) * 4), 4, Rect(0, 0, 2, 4), 8,
+                 g.handle(color_table([WHITE, near, blue])))
+    bits = g.system.screen_bits
+    bm = g.ptr(struct.pack(">LH4h", bits.base, bits.row_bytes, *bits.bounds))
+    r = Rect(300, 300, 302, 304)
+    g("CopyBits", deref(g.mem, pm), bm, g.rect_ptr(Rect(0, 0, 2, 4)), g.rect_ptr(r), 0, 0)
+    values = {g("Color2Index", rgb(g, c)) for c in (near, blue)}
+    assert index not in values and screen(g, r) == values
+
+
+def test_an_animated_entry_back_in_its_index_s_old_colour_is_still_no_match(g):
+    """An entry animated to the colour its index had before it was
+    reserved: a colour copied in that colour is matched to the screen's
+    colours as they are now, with the entry left out, not as they were."""
+    w = window(g)
+    before = clut(g)
+    g("NSetPalette", w.addr, palette(g, [BLUE], pmAnimated), pmAllUpdates)
+    (index, _), = g.system.devices.reserved.items()
+    was = before[index][1:]
+    g("AnimateEntry", w.addr, 0, rgb(g, was))
+    value = g("Color2Index", rgb(g, was))
+    assert value != index
+    pm = g.handle(bytes(50))
+    write_pixmap(g.mem, deref(g.mem, pm), g.ptr(bytes([1]) * 8), 4, Rect(0, 0, 2, 4), 8,
+                 g.handle(color_table([WHITE, was])))
+    r = Rect(10, 50, 12, 54)
+    g("CopyBits", deref(g.mem, pm), w.addr + 2, g.rect_ptr(Rect(0, 0, 2, 4)), g.rect_ptr(r),
+      0, 0)
+    assert screen(g, r.offset(w.content.left, w.content.top)) == {value}
 
 
 def test_drawing_while_restore_entries_has_the_screen_all_black(g):
@@ -409,3 +507,140 @@ def test_windows_that_want_colour_updates_get_them_when_the_colours_change(g):
     updates()
     g("AnimateEntry", front.addr, 0, rgb(g, BLUE))
     assert updates() == (False, False)
+
+
+def test_what_isnt_a_palette_a_table_or_an_entry_is_passed_over(g):
+    bogus = g.mem.size - 2                              # not a handle
+    w = window(g)
+    g("InitPalettes")
+    h = palette(g, [RED, BLUE], pmCourteous)
+    other = palette(g, [ODD], pmCourteous)
+    ct = g.handle(color_table([WHITE]))
+    g("NSetPalette", w.addr, h, pmAllUpdates)
+    g("RGBForeColor", rgb(g, ODDER))
+    before = g.contents(h), g.contents(other), g.contents(ct), w.rgb_fg_color
+    low = low_memory(g)
+    out = g.ptr(bytes(6))
+    g("GetEntryColor", g("NewPalette", 1, bogus, pmCourteous, 0), 0, out)
+    assert read_rgb(g, out) == BLACK                    # no table: black
+    g("DisposePalette", 0)
+    assert g.heap.error == noErr
+    g("SetEntryUsage", h, 2, pmAnimated, 0)
+    g("AnimateEntry", w.addr, 2, rgb(g, ODD))
+    g("PmForeColor", 2)
+    for table, pal in ((0, h), (bogus, h), (ct, 0), (ct, bogus)):
+        g("CTab2Palette", table, pal, pmAnimated, 0)
+        g("Palette2CTab", pal, table)
+    for src, dst, src_entry, dst_entry, n in ((0, other, 0, 0, 1), (h, 0, 0, 0, 1),
+                                              (bogus, other, 0, 0, 1), (h, bogus, 0, 0, 1),
+                                              (h, other, 0, 0, 0), (h, other, 0, 0, -1),
+                                              (h, other, -1, 0, 3), (h, other, 0, -1, 2),
+                                              (h, other, 2, 5, 1)):
+        g("CopyPalette", src, dst, src_entry, dst_entry, n)
+    assert (g.contents(h), g.contents(other), g.contents(ct), w.rgb_fg_color) == before
+    assert g.mem.read(0, 0x100) == low
+    g("SetPort", 0)
+    g("PmForeColor", 0)
+    assert g("Entry2Index", 0) == 0
+
+
+def test_with_no_room_a_palette_or_table_is_left_as_it_was(g, monkeypatch):
+    room = Room(monkeypatch, g)
+    h = palette(g, [RED], pmCourteous)
+    longer = palette(g, [RED, BLUE, ODD], pmTolerant)
+    ct, three = g.handle(color_table([WHITE])), g.handle(color_table([BLUE, RED, WHITE]))
+    before = g.contents(h), g.contents(ct)
+    room.limit(0)
+    g("CTab2Palette", three, h, pmCourteous, 0)
+    g("Palette2CTab", longer, ct)
+    g("CopyPalette", longer, h, 0, 0, 3)
+    assert (g.contents(h), g.contents(ct)) == before
+
+
+def test_pm_fore_and_back_colour_by_an_entry_s_usage(g):
+    w = window(g)
+    h = palette(g, [ODD, RED, ODDER], pmCourteous)
+    g("SetEntryUsage", h, 1, pmAnimated, 0)
+    g("SetEntryUsage", h, 2, pmCourteous | pmExplicit, 0)
+    g("NSetPalette", w.addr, h, pmAllUpdates)
+    (index,) = g.system.devices.reserved
+    g("PmForeColor", 0)                                 # courteous: as RGBForeColor sets it
+    assert (w.rgb_fg_color, w.fg_color) == (ODD, g("Color2Index", rgb(g, ODD)))
+    g("PmBackColor", 1)                                 # animated: its index
+    assert (w.rgb_bk_color, w.bk_color) == (RED, index)
+    g("PmForeColor", 2)                                 # explicit: index 2, in its colour
+    assert (w.rgb_fg_color, w.fg_color) == (clut(g)[2][1:], 2)
+
+
+@pytest.mark.parametrize("model, depth", [("plus", None), ("ii", 32)])
+def test_with_no_screen_table_to_change_an_entry_is_just_its_colour(qapp, model, depth):
+    """On a Plus, which has no devices, and on a screen of direct colours,
+    which has no colour table, a palette changes none of the screen's
+    colours; drawing in an entry draws in its colour."""
+    entry = struct.pack(">HHHHH6x", *ODD, pmTolerant, 0)
+    g = guest([Resource(b"pltt", 128, struct.pack(">h", 1) + bytes(14) + entry)],
+              model=model, depth=depth)
+    w = window(g, color=model == "ii")
+    glue_palette.new_window(g, None, 128)
+    glue_palette.new_window(g, w, 128)                  # a Plus has no 'pltt' for it
+    assert (w.addr & 0xFFFFFF in g.process.palettes) == (model == "ii")
+    h = palette(g, [ODD, RED], pmAnimated)
+    g("NSetPalette", w.addr, h, pmAllUpdates)
+    g("ActivatePalette", w.addr)
+    g("AnimateEntry", w.addr, 0, rgb(g, BLUE))
+    out = g.ptr(bytes(6))
+    g("GetEntryColor", h, 0, out)
+    assert read_rgb(g, out) == BLUE
+    g("RGBForeColor", rgb(g, RED))
+    red = w.fg_color
+    g("RGBForeColor", rgb(g, BLUE))
+    g("PmForeColor", 1)
+    assert w.fg_color == red
+    assert g("Entry2Index", 1) == g("Color2Index", rgb(g, RED))
+    g("SetEntryUsage", h, 1, pmCourteous | pmExplicit, 0)
+    assert g("Entry2Index", 1) == g("Color2Index", rgb(g, RED))
+    if g.system.devices is not None:
+        assert not g.system.devices.reserved
+
+
+def test_the_palettes_of_windows_that_have_gone_are_forgotten(g):
+    back, w = window(g), window(g)
+    h = palette(g, [ODD], pmTolerant)
+    g("NSetPalette", w.addr, h, pmAllUpdates)
+    assert w.addr & 0xFFFFFF in g.process.palettes
+    g.process.windows.remove(w)                         # as DisposeWindow takes it out
+    g("NSetPalette", back.addr, palette(g, [ODDER], pmTolerant), pmAllUpdates)
+    assert w.addr & 0xFFFFFF not in g.process.palettes and g.heap.is_handle(h)
+
+
+def test_when_the_screen_has_no_index_left_an_entry_goes_without(g):
+    """255 animated entries, one more than there are indexes between white
+    and black, then tolerant white, black and an odd colour."""
+    w = window(g)
+    h = palette(g, [ODDEST] * 255 + [WHITE, BLACK, ODD], pmAnimated)
+    for e in range(255, 258):
+        g("SetEntryUsage", h, e, pmTolerant, 0)
+    g("NSetPalette", w.addr, h, pmAllUpdates)
+    reserved = g.system.devices.reserved
+    assert sorted(reserved) == list(range(1, 255))
+    assert sorted(e for _, e in reserved.values()) == list(range(254))
+    table = clut(g)
+    assert table[0][1:] == WHITE and table[255][1:] == BLACK
+    assert ODD not in [c[1:] for c in table]
+
+
+def test_a_screen_whose_colour_table_isnt_there_keeps_its_colours(g):
+    devices = g.system.devices
+    pm = devices.pixmap(devices.main)
+    ct, w = pm.pm_table, window(g)
+    h = palette(g, [ODD], pmTolerant)
+    low = low_memory(g)
+    pm.pm_table = g.mem.size - 2
+    try:
+        g("NSetPalette", w.addr, h, pmAllUpdates)
+        g("SetEntryUsage", h, 0, pmAnimated, 0)
+        g("AnimateEntry", w.addr, 0, rgb(g, ODDER))
+        assert not devices.reserved and g.mem.read(0, 0x100) == low
+    finally:
+        pm.pm_table = ct
+    assert ODD not in [c[1:] for c in clut(g)]

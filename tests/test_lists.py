@@ -2,12 +2,15 @@
 application's list followed through clicks and its scroll bar."""
 
 import struct
+import time
 from pathlib import Path
 
 import pytest
 from conftest import NO_MODS, Recorder
-from guest import Guest
+from guest import Guest, Processor, Room
 from PyQt6.QtCore import Qt
+from test_control_traps import CONTENT, Window
+from test_controls import _dragging
 
 from macrt.macfile import open_application
 from macrt.resfork import Resource
@@ -15,6 +18,7 @@ from macrt.toolbox import constants as k
 from macrt.toolbox import lowmem
 from macrt.toolbox.controls import Control
 from macrt.toolbox.lists import CELL_ARRAY, ListRec
+from macrt.toolbox.memmgr import memFullErr
 from macrt.toolbox.qdraw import Region, write_rgn
 from macrt.toolbox.types import Point, Rect
 
@@ -95,6 +99,24 @@ def test_cells_keep_their_data_where_the_rom_does(qapp):
     assert g.contents(lst.cells) == b"Second"
 
 
+def test_a_cell_past_the_32k_the_offsets_reach_is_left_as_it_was(qapp):
+    g = Guest()
+    lst = new_list(g, bounds=(0, 0, 2, 1))
+    put(g, lst, 0, 0, bytes(0x7FF0))
+    put(g, lst, 1, 0, b"x" * 0x10)
+    assert g.mem_err == memFullErr and texts(g, lst)[1] == [b""]
+    put(g, lst, 1, 0, b"x" * 0xF)
+    assert g.mem_err == 0 and offsets(g, lst)[1:] == [0x7FF0, 0x7FFF]
+
+
+def test_records_of_one_list_are_the_same_list(qapp):
+    g = Guest()
+    lst, other = new_list(g), new_list(g)
+    same = ListRec(g.system, lst.handle)
+    assert same == lst and len({lst, same, other}) == 2 and lst != other
+    assert f"${lst.handle:06X}" in repr(lst)
+
+
 def test_the_selection_is_each_cells_high_bit(qapp):
     g = Guest()
     lst = new_list(g, bounds=(0, 0, 3, 2))
@@ -143,6 +165,26 @@ def test_rows_and_columns_come_and_go_with_their_data(qapp):
     g("LDelRow", 0, 0, lst.handle)                                # 0: all of them
     assert lst.data_bounds == Rect(0, 0, 0, 2) and offsets(g, lst) == [0]
     assert g.heap.handle_size(lst.cells) == 0
+
+
+def test_rows_and_columns_past_what_a_list_can_hold_are_refused(qapp):
+    g = Guest()
+    lst = new_list(g, bounds=(0, 0, 2, 2))
+    put(g, lst, 0, 0, b"a")
+    start = time.monotonic()
+    assert g("LAddRow", 0x7FFF, 0, lst.handle) == 0             # dataBounds would wrap
+    assert g.mem_err == memFullErr
+    assert g("LAddColumn", 0x7FFF, 0, lst.handle) == 0
+    assert g.mem_err == memFullErr
+    assert g("LAddRow", 0x3FFE // 2, 0, lst.handle) == 0        # more cells than maxIndex reaches
+    assert g.mem_err == memFullErr
+    assert time.monotonic() - start < 1
+    assert lst.data_bounds == Rect(0, 0, 2, 2) and texts(g, lst)[0] == [b"a", b""]
+    assert g("LAddRow", 0x3FFF // 2 - 2, 2, lst.handle) == 2     # as many as it reaches
+    assert g.mem_err == 0 and lst.count == 0x3FFF // 2 * 2
+    assert g("LNew", g.rect_ptr(Rect(0, 0, 30, 40)), g.rect_ptr(Rect(0, 0, 0x4000, 1)),
+             Point(0, 0), 0, lst.port, False, False, False, False) == 0
+    assert g.mem_err == memFullErr
 
 
 def test_lnextcell_goes_along_rows_or_down_columns(qapp):
@@ -350,11 +392,392 @@ class _ProcsAt(dict):
 
 
 # =========================================================================
+# Scroll bars, sizes and activation, in a window of the program's own
+# =========================================================================
+def windowed(g, win, view=(4, 10, 40, 100), bounds=(0, 0, 10, 6), size=Point(12, 40),
+             draw=True, grow=False, h_bar=True, v_bar=True) -> ListRec:
+    h = g("LNew", g.rect_ptr(view), g.rect_ptr(bounds), size, 0, win.w.addr, draw, grow,
+          h_bar, v_bar)
+    assert h
+    return ListRec(g.system, h)
+
+
+def bars(lst: ListRec) -> list[Control]:
+    return [Control(lst.mem, h) for h in (lst.v_scroll, lst.h_scroll)]
+
+
+def settings(c: Control) -> tuple[int, int, int]:
+    return c.min, c.value, c.max
+
+
+V_BAR, H_BAR = (3, 100, 41, 116), (40, 9, 56, 101)       # windowed()'s
+BOTH = k.lDoVAutoscroll | k.lDoHAutoscroll
+
+
+def test_a_lists_scroll_bars_are_outside_rview_and_keep_to_how_far_it_scrolls(qapp):
+    g = Guest()
+    win = Window(g)
+    lst = windowed(g, win, grow=True)
+    v, h = bars(lst)
+    assert lst.visible == Rect(0, 0, 3, 3)                       # the third column in part
+    assert lst.list_flags & BOTH == BOTH
+    assert v.rect == Rect(*V_BAR) and h.rect == Rect(*H_BAR)    # no grow box between two
+    assert settings(v) == (0, 0, 7) and settings(h) == (0, 0, 4)
+    assert v.ref_con == h.ref_con == lst.handle
+    assert win.inked(V_BAR) and win.inked(H_BAR)
+    lone = windowed(g, win, view=(4, 130, 40, 180), grow=True, h_bar=False)
+    assert bars(lone)[0].rect == Rect(3, 180, 41 - 15, 196)     # room left for it
+    assert not lone.h_scroll and lone.list_flags & BOTH == k.lDoVAutoscroll
+
+    g("LScroll", 2, 3, lst.handle)
+    assert lst.visible == Rect(3, 2, 6, 5)
+    assert settings(v) == (0, 3, 7) and settings(h) == (0, 2, 4)
+    win.clear()
+    g("LScroll", 0, 0, lst.handle)
+    assert not win.inked((0, 0, 60, 200))
+
+    g("LCellSize", Point(9, 40), lst.handle)
+    assert lst.cell_size == Point(9, 40) and lst.visible == Rect(3, 2, 7, 5)
+    assert settings(v) == (0, 3, 6) and settings(h) == (0, 2, 4)
+    ascent, descent, _, leading = g.tb.GetFontInfo()
+    line = ascent + descent + leading
+    g("LCellSize", Point(0, 0), lst.handle)                     # rView's width shared, a line
+    assert lst.cell_size == Point(line, 15)
+    assert lst.visible.left == 0 and settings(h) == (0, 0, 0)  # all six columns fit now
+    assert v.value == lst.visible.top <= v.max
+
+    g("LCellSize", Point(12, 40), lst.handle)
+    win.w.update_pending = False
+    g("LSize", 80, 24, lst.handle)
+    assert lst.r_view == Rect(4, 10, 28, 90) and lst.visible == Rect(3, 0, 5, 2)
+    assert v.rect == Rect(3, 90, 29, 106) and h.rect == Rect(28, 9, 44, 91)
+    assert settings(v) == (0, 3, 8) and settings(h) == (0, 0, 4)
+    old_and_new = Rect(3, 9, 56, 116).offset(CONTENT.left, CONTENT.top)
+    assert win.w.update == Region.rect(old_and_new)             # left to an update event
+    g("LScroll", 0, 9, lst.handle)
+    assert lst.visible.top == 8
+    g("LSize", 80, 60, lst.handle)                              # taller: scrolled back
+    assert lst.visible.top == v.value == v.max == 5
+
+    g("LActivate", False, lst.handle)
+    assert not lst.active and not v.visible and not h.visible
+    g("LActivate", True, lst.handle)
+    assert lst.active and v.visible and h.visible
+    handles = lst.v_scroll, lst.h_scroll
+    g("LDispose", lst.handle)
+    assert not any(g.heap.is_handle(b) for b in handles)
+    assert win.w.control_list == lone.v_scroll
+
+
+def test_drawing_off_and_on_again_draws_the_scroll_bars_but_leaves_the_cells(qapp):
+    g = Guest()
+    win = Window(g)
+    lst = windowed(g, win)
+    put(g, lst, 0, 0, b"Hi")
+    g("LSetDrawingMode", False, lst.handle)
+    assert lst.list_flags & k.lDrawingModeOff
+    win.clear()
+    g("LScroll", 0, 1, lst.handle)
+    g("LActivate", False, lst.handle)
+    assert not lst.active and all(c.visible for c in bars(lst))  # not drawing: left as they are
+    g("LSetDrawingMode", True, lst.handle)                       # inactive: not drawn
+    g("LSetDrawingMode", False, lst.handle)
+    g("LActivate", True, lst.handle)
+    assert lst.active and not win.inked((0, 0, 60, 200))
+    g("LSetDrawingMode", True, lst.handle)
+    assert not lst.list_flags & k.lDrawingModeOff
+    assert win.inked(V_BAR) and win.inked(H_BAR)
+    assert not win.inked((4, 10, 40, 100))                       # the cells are LUpdate's
+    win.clear()
+    g("LSetDrawingMode", True, lst.handle)                       # on already: nothing
+    assert not win.inked((0, 0, 60, 200))
+
+    hidden = windowed(g, win, view=(4, 130, 40, 180), draw=False)
+    assert not any(c.visible for c in bars(hidden))
+    g("LSetDrawingMode", True, hidden.handle)
+    assert all(c.visible for c in bars(hidden))
+
+
+def test_a_click_in_a_scroll_bar_scrolls_the_list(qapp):
+    """Dragging the thumb, holding the mouse in an arrow, clicking beside
+    the thumb: the list scrolls with its bar, and LClick is FALSE."""
+    g = Guest()
+    win = Window(g)
+    lst = windowed(g, win, view=(4, 10, 40, 180), bounds=(0, 0, 1, 40), size=Point(36, 30),
+                   v_bar=False)
+    bar = bars(lst)[1]
+    assert lst.visible == Rect(0, 0, 1, 6) and settings(bar) == (0, 0, 35)
+    at = win.at
+
+    def click(h, path):
+        _dragging(g, [at(*p) for p in path])
+        assert g("LClick", Point(path[0][1], path[0][0]), 0, lst.handle) is False
+        assert bar.value == lst.visible.left and lst.selected() == []
+        return bar.value
+
+    assert click(0, [(30, 48), (60, 48), (92, 48)]) == 17        # the thumb, 62 of 124
+    assert click(0, [(175, 48), (175, 48)]) > 17                  # the right arrow, held
+    left = bar.value
+    assert click(0, [(160, 48)]) == left + 2 * 5                  # a page: one column kept
+    assert click(0, [(190, 58)]) == left + 10                     # outside it all
+    assert lst.last_click == Point(-1, -1)
+
+
+def test_dragging_past_the_last_column_scrolls_but_selects_no_cell_there(qapp):
+    g = Guest()
+    win = Window(g)
+    lst = windowed(g, win, view=(4, 10, 40, 180), bounds=(0, 0, 1, 40), size=Point(36, 30),
+                   v_bar=False)
+    _dragging(g, [win.at(20, 20)] + [win.at(180, 20)] * 40)    # rView's right edge on
+    assert g("LClick", Point(20, 20), 0, lst.handle) is False
+    assert lst.visible.left == bars(lst)[1].value == 35          # as far as it goes
+    assert lst.selected() == [39]                                # the last there is
+
+
+def test_shift_without_rectangles_and_extend_drag_without_shift(qapp):
+    g = Guest()
+    g.port(64, 64)
+    lst = new_list(g, bounds=(0, 0, 5, 1), view=(0, 0, 50, 40), size=Point(10, 40))
+
+    def drag(rows, mods=0):
+        _dragging(g, [Point(10 * r + 5, 5) for r in rows])
+        g("LClick", Point(10 * rows[0] + 5, 5), mods, lst.handle)
+        return lst.selected()
+
+    lst.sel_flags = k.lNoRect
+    drag([0])
+    assert drag([2, 4], k.shiftKey) == [0, 2, 4]                 # what the mouse passes
+    lst.sel_flags = k.lNoRect | k.lUseSense
+    assert drag([4, 3], k.shiftKey) == [0, 2]                    # the sense of the first
+    lst.sel_flags = k.lExtendDrag
+    assert drag([1, 3]) == [1, 2, 3]                             # a rectangle from the first
+    assert drag([4, 3]) == [3, 4]                                # the old one let go
+    lst.sel_flags = k.lNoExtend
+    drag([0])
+    assert drag([3], k.shiftKey) == [0, 3]                       # not grown from the old one
+
+
+class Clicking(Processor):
+    """A Processor whose calls to 68k code from the trap glue run it."""
+
+    def _jsr(self, addr: int) -> None:
+        back = self.ptr(bytes(2))
+        pc = self.cpu.pc
+        self.cpu.push32(back)
+        self.cpu.pc = addr
+        ev = self.cpu.run(back)
+        assert ev.kind == "until", ev
+        self.cpu.pc = pc
+
+
+def test_lclikloop_is_called_as_the_mouse_moves_and_false_ends_the_click(qapp):
+    m = Clicking()
+    m.port(64, 64)
+    lst = new_list(m, bounds=(0, 0, 5, 1), view=(0, 0, 50, 40), size=Point(10, 40))
+    calls = m.ptr(bytes(2))
+    lst.clik_loop = m.ptr(bytes.fromhex(f"5279{calls:08X}"               # ADDQ.W #1,calls
+                                        f"0C790003{calls:08X}"           # CMPI.W #3,calls
+                                        "56C0"                           # SNE D0
+                                        "4E75"))                         # RTS
+    _dragging(m, [Point(5 + 10 * row, 5) for row in range(5)])
+    m.cpu.set_d(0, 0x1234)
+    assert m("LClick", Point(5, 5), 0, lst.handle) is False
+    assert m.mem.r16(calls) == 3                                 # FALSE the third time
+    assert lst.selected() == [1] and lst.mouse_loc == Point(25, 5)
+    assert m.cpu.d(0) == 0x1234 and m.cpu.sp == m.stack_top
+
+
+# =========================================================================
+# What can't be done
+# =========================================================================
+@pytest.mark.parametrize("empty", [False, True])
+def test_calls_on_no_list_do_nothing(qapp, empty):
+    g = Guest()
+    h = g.handle(bytes(4)) if empty else 0
+    if empty:
+        g("EmptyHandle", h)
+    cell, r, length = g.ptr(bytes(4)), g.rect_ptr((1, 2, 3, 4)), g.ptr(b"\x00\x05")
+    rgn = g.heap.new_handle(10)
+    write_rgn(g.heap, rgn, Region.rect(Rect(0, 0, 50, 50)))
+    assert g("LGetSelect", True, cell, h) is False
+    assert g("LNextCell", True, True, cell, h) is False
+    assert g("LSearch", g.ptr(b"a"), 1, 0, cell, h) is False
+    assert g("LClick", Point(0, 0), 0, h) is False
+    assert g("LAddRow", 1, 0, h) == 0 and g("LAddColumn", 1, 0, h) == 0
+    assert g("LLastClick", h) == 0xFFFFFFFF
+    g("LRect", r, Point(0, 0), h)
+    assert g.rect(r) == Rect(0, 0, 0, 0)
+    g("LGetCell", g.ptr(bytes(5)), length, Point(0, 0), h)
+    assert g.mem.r16(length) == 0
+    data = g.ptr(b"x")
+    for name, *args in (("LDelRow", 1, 0), ("LDelColumn", 1, 0), ("LSetCell", data, 1, 0),
+                        ("LAddToCell", data, 1, 0), ("LClrCell", 0), ("LSetSelect", True, 0),
+                        ("LDraw", 0), ("LUpdate", rgn), ("LSetDrawingMode", True),
+                        ("LActivate", False), ("LCellSize", Point(10, 10)), ("LScroll", 1, 1),
+                        ("LAutoScroll",), ("LSize", 10, 10), ("LDispose",)):
+        assert g(name, *args, h) is None, name
+    assert g.heap.is_handle(h) == empty
+
+
+def test_lgetselect_with_no_cell_to_start_from(qapp):
+    g = Guest()
+    lst = new_list(g)
+    g("LSetSelect", True, Point(1, 0), lst.handle)
+    assert g("LGetSelect", True, 0, lst.handle) is False
+
+
+def test_lgetselect_from_a_cell_outside_the_list(qapp):
+    g = Guest()
+    lst = new_list(g, bounds=(2, 1, 4, 3))
+    g("LSetSelect", True, Point(2, 1), lst.handle)
+    g("LSetSelect", True, Point(3, 1), lst.handle)
+    cell = g.ptr(bytes(4))
+    for start, found in ((Point(0, 5), Point(2, 1)),         # above: from the first cell
+                         (Point(3, -4), Point(3, 1)),        # left of a row: from its first
+                         (Point(3, 3), None)):               # past the last
+        g.set_point(cell, start)
+        assert g("LGetSelect", True, cell, lst.handle) is (found is not None)
+        assert g.point(cell) == (found or start)
+
+
+def test_short_of_room_a_list_is_left_as_it_was(qapp, monkeypatch):
+    g = Guest()
+    lst = new_list(g, bounds=(0, 0, 2, 1))
+    put(g, lst, 0, 0, b"a")
+    view, bounds, more = g.rect_ptr((0, 0, 30, 40)), g.rect_ptr((0, 0, 3, 1)), g.ptr(b"more")
+    room = Room(monkeypatch, g)
+    for n in (0, 1):                                             # the record, then its cells
+        room.limit(n)
+        assert g("LNew", view, bounds, Point(0, 0), 0, lst.port, False, False, False,
+                 False) == 0
+        assert g.mem_err == memFullErr and room.given_back()
+    room.limit(0)
+    g.set_mem_err(0)
+    assert g("LAddRow", 1, 2, lst.handle) == 2 and g.mem_err == memFullErr
+    g.set_mem_err(0)
+    g("LSetCell", more, 4, Point(1, 0), lst.handle)
+    assert g.mem_err == memFullErr
+    room.limit(None)
+    assert lst.data_bounds == Rect(0, 0, 2, 1) and texts(g, lst) == [[b"a"], [b""]]
+    assert g("LAddRow", 1, 2, lst.handle) == 2 and g.mem_err == 0
+
+
+def test_a_list_in_no_port_keeps_its_cells_and_scrolls_with_nothing_drawn(qapp):
+    g = Guest()
+    h = g("LNew", g.rect_ptr((0, 0, 32, 64)), g.rect_ptr((0, 0, 5, 1)), Point(16, 64), 0, 0,
+          True, False, False, False)
+    lst = ListRec(g.system, h)
+    put(g, lst, 0, 0, b"x")
+    g("LScroll", 0, 1, h)
+    assert lst.visible == Rect(1, 0, 3, 1) and texts(g, lst)[0] == [b"x"]
+
+
+# =========================================================================
+# Rows coming and going in view; the definition procedure's code
+# =========================================================================
+def test_rows_added_or_deleted_in_view_are_drawn_again(qapp):
+    g = Guest()
+    port, bits = g.port(64, 32)
+    lst = new_list(g, bounds=(0, 0, 4, 1), view=(0, 0, 32, 64), size=Point(16, 64), draw=True)
+    for v in range(4):
+        put(g, lst, v, 0, b"#" * (v + 1))
+    before = g.rows(port)
+    assert g("LAddRow", 1, 0, lst.handle) == 0
+    after = g.rows(port)
+    assert black(after, Rect(0, 0, 16, 64)) == 0 and after[16:32] == before[0:16]
+    assert g("LAddRow", 0, 9, lst.handle) == 5                   # none, where they'd have gone
+    g("LScroll", 0, 99, lst.handle)
+    assert lst.visible.top == 3                                  # ### and ####
+    shown = g.rows(port)
+    g.mem.write(bits, b"\xff" * (8 * 32))
+    g("LDelRow", 2, 0, lst.handle)                               # ## ### ####: scrolled back
+    assert lst.visible.top == 1 and g.rows(port) == shown
+    for count, at in ((1, 99), (-1, 1)):                         # past the end; fewer than none
+        g("LDelRow", count, at, lst.handle)
+        assert lst.data_bounds == Rect(0, 0, 3, 1)
+    g.mem.write(bits, b"\xff" * (8 * 32))
+    g("LDelRow", 2, 1, lst.handle)                               # what's left below is erased
+    assert black(g.rows(port), Rect(16, 0, 32, 64)) == 0
+
+
+def test_the_ldef_a_list_calls(qapp):
+    """Loaded again if it's been purged; not called if the program's
+    taken it away, or if it's only an RTS."""
+    g = Guest([Resource(b"LDEF", 128, bytes.fromhex("4E71 4E75")),
+               Resource(b"LDEF", 129, bytes.fromhex("4E75"))])
+    g.port(64, 48)
+    seen = []
+    g.procs = _ProcsAt(lambda addr: lambda msg, *_: seen.append(msg))
+    lst = new_list(g, proc=128, draw=True)
+    g("EmptyHandle", lst.def_proc)
+    g("LDraw", Point(0, 0), lst.handle)
+    assert seen[-1] == k.lDrawMsg and g.heap.deref(lst.def_proc)
+    assert g.calls[-1][0] == g.heap.deref(lst.def_proc)
+    lst.def_proc = 0
+    calls = len(g.calls)
+    g("LDraw", Point(0, 0), lst.handle)
+    stub = new_list(g, proc=129, draw=True)
+    g("LDraw", Point(0, 0), stub.handle)
+    assert len(g.calls) == calls
+
+
+def ldef_call(m, ldef_id, msg, select, r, cell, offset, length, h) -> None:
+    """JSR to the System's LDEF code with its parameters on the stack."""
+    entry = m.system.sys_heap.deref(m.system.defproc("LDEF", ldef_id))
+    m.run(bytes.fromhex(f"3F3C{msg:04X}"
+                        f"3F3C{0x100 if select else 0:04X}"
+                        f"2F3C{r:08X}"
+                        f"2F3C{cell.v << 16 | cell.h:08X}"
+                        f"3F3C{offset:04X}"
+                        f"3F3C{length:04X}"
+                        f"2F3C{h:08X}"
+                        f"207C{entry:08X}4E90"))                 # JSR the code
+    assert m.cpu.sp == m.stack_top and m.missing == []
+
+
+def test_68k_code_can_call_ldef_0_and_ldef_19_itself(qapp):
+    m = Processor()
+    port, _ = m.port(96, 64)
+    lst = new_list(m, bounds=(0, 0, 1, 1), view=(0, 0, 16, 64), size=Point(16, 64))
+    put(m, lst, 0, 0, b"Hi")
+    cell = Rect(0, 0, 16, 64)
+    ldef_call(m, 0, k.lDrawMsg, True, m.rect_ptr(cell), Point(0, 0), 0, 2, lst.handle)
+    assert black(m.rows(port), cell) > 16 * 64 * 3 // 4          # drawn selected
+
+    icons = new_list(m, bounds=(0, 0, 1, 1), view=(16, 0, 64, 96), size=Point(48, 96),
+                     proc=19)
+    put(m, icons, 0, 0, struct.pack(">L", m.handle(b"\xff" * 256)))
+    where = Rect(16 + 8, 32, 16 + 40, 64)
+    ldef_call(m, 19, k.lDrawMsg, False, m.rect_ptr((16, 0, 64, 96)), Point(0, 0), 0, 4,
+              icons.handle)
+    assert black(m.rows(port), where) == 32 * 32
+    ldef_call(m, 19, k.lDrawMsg, False, m.rect_ptr((16, 0, 64, 96)), Point(0, 0), 0, 4, 0)
+    assert black(m.rows(port), where) == 32 * 32                 # no list: nothing done
+
+
+def test_ldef_19_draws_an_icon_suite_and_nothing_of_less_than_a_handle(qapp):
+    g = Guest()
+    port, bits = g.port(96, 64)
+    lst = new_list(g, bounds=(0, 0, 1, 2), view=(0, 0, 60, 96), size=Point(60, 48), proc=19,
+                   draw=True)
+    out = g.ptr(bytes(4))
+    assert g("NewIconSuite", out) == 0
+    suite = g.mem.r32(out)
+    assert g("AddIconToSuite", g.handle(b"\xff" * 256), suite,
+             int.from_bytes(b"ICN#", "big")) == 0
+    put(g, lst, 0, 0, struct.pack(">L", suite))
+    assert black(g.rows(port), Rect(14, 8, 46, 40)) == 32 * 32
+    g.mem.write(bits, b"\xff" * (12 * 64))
+    put(g, lst, 0, 1, b"ab")
+    assert black(g.rows(port), Rect(0, 48, 60, 96)) == 0         # erased, and that's all
+
+
+# =========================================================================
 # Lists (tests/apps/lists.s): a 68k application's list, clicked with
 # synthetic input
 # =========================================================================
 APPS = Path(__file__).parent / "apps"
-LIST, CLICKS, DOUBLES = -238, -240, -242
+LIST, CLICKS, DOUBLES, UPDATES = -238, -240, -242, -264
 SHIFT, COMMAND = Qt.KeyboardModifier.ShiftModifier, Qt.KeyboardModifier.ControlModifier
 
 
@@ -372,7 +795,8 @@ class App:
         self.a5 = self.proc.partition.a5
         h.wait_until(lambda: self.mem.r32(self.a5 + LIST), what="the list")
         self.list = ListRec(self.system, self.mem.r32(self.a5 + LIST))
-        h.wait_until(lambda: self.ink(self.position(0)) and self.black(19, 9), what="it drawn")
+        h.wait_until(lambda: self.word(UPDATES) and not self.window.update_pending,
+                     what="it drawn")
 
     def word(self, offset):
         return self.mem.r16s(self.a5 + offset)
@@ -405,12 +829,17 @@ class App:
         c = self.window.content
         self.h.click(c.left + h, c.top + v, mods)
 
+    def followed(self, h, v, mods=NO_MODS, what="the click"):
+        """A click, and LClick returned from it, with what it drew."""
+        clicks = self.word(CLICKS)
+        self.click(h, v, mods)
+        self.h.wait_until(lambda: self.word(CLICKS) == clicks + 1, what=what)
+
     def click_row(self, row: int, mods=NO_MODS):
         r = self.row_rect(row)
         assert r.height, f"row {row} isn't in view"
-        clicks = self.word(CLICKS)
-        self.click((r.left + r.right) // 2, (r.top + r.bottom) // 2, mods)
-        self.h.wait_until(lambda: self.word(CLICKS) == clicks + 1, what=f"the click on {row}")
+        self.followed((r.left + r.right) // 2, (r.top + r.bottom) // 2, mods,
+                      what=f"the click on {row}")
 
     def selected(self) -> list[int]:
         with self.system.lock:
@@ -435,9 +864,8 @@ def test_the_list_is_made_and_drawn(app):
     assert [lst.data(i) for i in range(20)] == [str(n).encode() for n in range(1, 21)]
     assert lst.list_flags & k.lDrawingModeOff == 0
     rows = range(120 // height)
-    # The fixture saw the first row drawn; the program may still be drawing the rest.
-    app.h.wait_until(lambda: all(app.ink(app.position(p)) for p in rows) and
-                     app.black(120, 70) and app.black(135, 70), what="the rows and the bar")
+    assert all(app.ink(app.position(p)) for p in rows) and app.black(19, 9)
+    assert app.black(120, 70) and app.black(135, 70)    # the bar
     assert not any(app.shown(row) for row in rows)
     bar = Control(app.mem, lst.v_scroll)
     assert bar.rect == Rect(9, 120, 131, 136) and bar.vis
@@ -495,16 +923,13 @@ def test_the_scroll_bar_scrolls_the_list(app):
     lst, height = app.list, app.list.cell_size.v
     whole = 120 // height
     before = {row: app.picture(app.position(row)) for row in range(whole)}
-    app.click(128, 123)                                 # the down arrow
-    app.h.wait_until(lambda: lst.visible.top >= 1, what="a line down")
-    app.h.settle()
+    app.followed(128, 123, what="a line down")          # the down arrow
     top = lst.visible.top
-    assert Control(app.mem, lst.v_scroll).value == top
+    assert top >= 1 and Control(app.mem, lst.v_scroll).value == top
     for row in range(top, whole):                       # moved up, not redrawn differently
         assert app.picture(app.position(row - top)) == before[row]
-    app.click(128, 110)                                 # below the thumb: a page
-    app.h.wait_until(lambda: lst.visible.top >= top + whole - 1, what="a page down")
-    app.h.settle()
+    app.followed(128, 110, what="a page down")          # below the thumb
+    assert lst.visible.top >= top + whole - 1
     top = lst.visible.top
     assert Control(app.mem, lst.v_scroll).value == top
     data = lst.data(lst.index(Point(top, 0)))

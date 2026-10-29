@@ -239,10 +239,9 @@ class WindowRecord(GrafPort):
         aux = find_aux_win(self.mem, self.addr)
         if aux:
             unlink_aux_win(self.mem, aux)
-            try:
-                self.system.heap_of(aux).dispose_handle(aux)
-            except ValueError:
-                pass
+            heap = self.system.find_heap(aux)
+            if heap is not None:
+                heap.dispose_handle(aux)
         super().close(self.heap)
 
     def dispose(self) -> None:

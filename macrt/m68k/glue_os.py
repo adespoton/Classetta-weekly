@@ -19,9 +19,10 @@ from ..toolbox.events import EventRecord, ProcessKilled, tick_count
 from ..toolbox.files import File, FileError
 from ..toolbox.gdevice import VIDEO_SLOT
 from ..toolbox.memmgr import MIN_BLOCK, ZONE_HEADER, memWZErr, nilHandleErr, noErr
-from ..toolbox.system import DEFAULT_PARTITION, RAM_SIZE
+from ..toolbox.system import DEFAULT_PARTITION, DEFAULT_STACK, RAM_SIZE
 from . import decompressors, dispatch, glue_components, glue_desk, glue_sony, segload, timemgr
 from .dispatch import raw, trap
+from .glue_common import _heap
 
 memFullErr = -108
 envBadVers = -5501
@@ -40,19 +41,15 @@ SYSENV_SIZE = 16
 def _zone(t, sys: bool):
     if sys:
         return t.system.sys_heap
-    try:
-        return t.system.heap_of(t.process.world.r32(lowmem.TheZone))
-    except ValueError:
-        return t.process.heap
+    return _heap(t, t.process.world.r32(lowmem.TheZone))
 
 
 def _heap_of(t, addr: int):
     """The heap a block is in, None (with MemErr set) if it's in none."""
-    try:
-        return t.system.heap_of(addr)
-    except ValueError:
+    heap = t.system.find_heap(addr)
+    if heap is None:
         t.set_mem_err(memWZErr)
-        return None
+    return heap
 
 
 def _done(t, heap, value=None):
@@ -247,10 +244,14 @@ def InitApplZone(t):
 def SetApplLimit(t, p):
     """How far the application heap may grow.  Below where it already
     ends is too low (memFullErr), though ApplLimit still says what was
-    asked for; above the stack's base it grows no further than that."""
+    asked for.  Past the stack's base is past the partition, and the
+    heap stops where it began, the default stack below the base: grown to the
+    base, the next segment loaded lands on the stack in use (Macify 2.7
+    asks for 128K past ApplZone in its 75K partition, then MaxApplZone)."""
     proc, p = t.process, p & ADDRESS_MASK
     proc.world.w32(lowmem.ApplLimit, p)
-    proc.heap.set_limit(min(p, proc.partition.stack_base))
+    stack_base = proc.partition.stack_base
+    proc.heap.set_limit(p if p <= stack_base else stack_base - DEFAULT_STACK)
     t.set_mem_err(noErr if p >= proc.heap.end else memFullErr)
 
 
@@ -298,9 +299,10 @@ def MaxBlock(t, sys):
 
 @trap
 def MaxMem(t, sys):
-    """The zone compacted, its largest free block and how far it can grow
-    (Inside Macintosh II-38; it doesn't purge yet)."""
+    """The zone purged of every purgeable block and compacted, its largest
+    free block and how far it can grow (Inside Macintosh II-38)."""
     heap = _zone(t, sys)
+    heap.purge_for()
     heap.compact()
     t.set_mem_err(noErr)
     return heap.max_block(grow=False), heap.room_to_grow()     # D0 largest block, A0 growth
@@ -318,8 +320,9 @@ def CompactMem(t, size, sys):
 
 @trap
 def PurgeMem(t, size, sys):
-    heap = _zone(t, sys)
-    t.set_mem_err(noErr if heap.max_block() >= size else memFullErr)
+    """Purgeable blocks purged until there's a free block of size, which
+    the zone may grow for; nothing moves (Inside Macintosh II-40)."""
+    t.set_mem_err(noErr if _zone(t, sys).purge_for(size) else memFullErr)
 
 
 @trap
@@ -388,11 +391,8 @@ def BlockMove(t, src, dst, n, no_flush):
 
 
 def _copy_to_new_handle(t, data: bytes) -> int:
-    heap = t.process.heap
-    h = heap.new_handle(len(data))
-    if h:
-        t.mem.write(heap.deref(h), data)
-    t.set_mem_err(heap.error)
+    h = t.process.heap.new_handle_with(data)
+    t.set_mem_err(t.process.heap.error)
     return h
 
 
@@ -468,6 +468,9 @@ QD32TRAP = 0xAB03
 # GetVideoDefault for the slot to give it.
 SLOT_TRAPS = {0xA06E, 0xA06F, 0xA070,           # SlotManager, SlotVInstall, SlotVRemove,
               0xA080, 0xA081}                   # Get/SetVideoDefault
+# Nor has macrt's Plus the ADB Manager, which Inside Macintosh V puts in
+# the 256K ROM: CountADBs, GetIndADB, GetADBInfo, SetADBInfo.
+ADB_TRAPS = {0xA077, 0xA078, 0xA079, 0xA07A}
 
 
 def _trap_key(num: int, new: bool, toolbox: bool) -> int:
@@ -483,7 +486,8 @@ def trap_address(t, key: int) -> int:
     if patch is not None:
         return patch
     if ((key == QD32TRAP and not t.system.model.color)
-            or (key in SLOT_TRAPS and not t.system.model.slots)):
+            or (key in SLOT_TRAPS and not t.system.model.slots)
+            or (key in ADB_TRAPS and not t.system.model.adb)):
         return t.machine.stub_for(UNIMPLEMENTED)
     if (dispatch.implemented(key) and key not in HIDDEN) or key == UNIMPLEMENTED:
         return t.machine.stub_for(key)
@@ -731,6 +735,7 @@ def ShutDwnRemove(t, proc):
 # =========================================================================
 @trap
 def Delay(t, ticks):
+    t.process.events.timed()
     t.sleep(ticks)
     return None, tick_count()
 
@@ -851,7 +856,9 @@ def Enqueue(t, elem, header):
 def Dequeue(t, elem, header):
     mem = t.mem
     prev, cur = 0, mem.r32(header + 2)
-    while cur:
+    seen = set()                        # a queue that goes round (an element enqueued twice)
+    while cur and cur not in seen:
+        seen.add(cur)
         if cur == elem:
             nxt = mem.r32(cur)
             if prev:

@@ -252,20 +252,37 @@ def line_break(text: bytes, start: int, end: int, avail: float, first: bool,
     run = width(text[start:end])
     if run <= avail:
         return smBreakOverflow, end, avail - run
-    # After a run of blanks, which can hang past the edge
-    for p in range(end, start, -1):
-        if is_blank(text[p - 1]) and (p == len(text) or not is_blank(text[p])):
-            q = p
-            while q > start and is_blank(text[q - 1]):
-                q -= 1
-            if width(text[start:q]) <= avail:
-                return smBreakWord, p, avail
+    # After a run of blanks, which can hang past the edge: the last whose
+    # words before it fit.  (More of the text is never narrower, so the
+    # last that fits is found by halving.)
+    breaks = []                 # each run's end, and where it starts
+    blanks = None
+    for p in range(start + 1, end + 1):
+        if not is_blank(text[p - 1]):
+            blanks = None
+            continue
+        if blanks is None:
+            blanks = p - 1
+        if p == len(text) or not is_blank(text[p]):
+            breaks.append((p, blanks))
+    i = _last(-1, len(breaks) - 1, lambda i: width(text[start:breaks[i][1]]) <= avail)
+    if i >= 0:
+        return smBreakWord, breaks[i][0], avail
     if not first:
         return smBreakWord, start, avail
-    fit = start + 1
-    while fit < end and width(text[start:fit + 1]) <= avail:
-        fit += 1
-    return smBreakChar, fit, avail
+    return smBreakChar, _last(start + 1, end, lambda f: width(text[start:f]) <= avail), avail
+
+
+def _last(lo: int, hi: int, fits: Callable[[int], bool]) -> int:
+    """The last of lo+1..hi that fits, those that do coming first; lo
+    if none does."""
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if fits(mid):
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
 
 
 def truncate(text: bytes, avail: int, where: int, width: Callable[[bytes], int]) -> bytes | None:

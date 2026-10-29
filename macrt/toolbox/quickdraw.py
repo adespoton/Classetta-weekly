@@ -237,6 +237,7 @@ class GrafPort(Record):
         self.gw_device = 0                      # a GWorld's GDevice (glue_gworld)
         self.gw_own_device = False              # whether the GWorld made it
         self.gw_pix_map = 0                     # a basic-QuickDraw GWorld's 1-bit one
+        self.gw_pixels = 0                      # the handle a GWorld's pixels are in
 
     @property
     def is_color(self) -> bool:

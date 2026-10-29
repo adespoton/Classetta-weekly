@@ -41,6 +41,7 @@ from .glue_controls import (DisposeControl, HideControl, MoveControl, SetControl
                             _the_port_var, new_control, scratch)
 
 GROW_BOX = 15               # what a size box takes from a lone scroll bar
+MAX_CELLS = 0x7FFF // 2     # as many as maxIndex, an INTEGER of 2 bytes a cell, reaches
 
 
 # =========================================================================
@@ -323,7 +324,8 @@ def _scroll_to_bars(t, lst: ListRec) -> None:
 
 def _set_cell_size(t, lst: ListRec, size: Point) -> None:
     """LCellSize: zero is the default, rView's width shared among the
-    columns, and a line of the port's font."""
+    columns, and a line of the port's font.  What's in view is scrolled
+    back if the list can no longer scroll as far."""
     width, height = size.h, size.v
     if not width:
         width = lst.r_view.width // max(1, lst.columns)
@@ -333,6 +335,7 @@ def _set_cell_size(t, lst: ListRec, size: Point) -> None:
         height = ascent + descent + leading
     lst.cell_size = Point(height, width)
     lst.fit_visible()
+    _keep_in_range(lst)
     _sync_bars(t, lst)
 
 
@@ -354,10 +357,10 @@ def _bar_rects(lst: ListRec, vertical: bool, horizontal: bool) -> tuple[Rect, Re
 def LNew(t, r_view, data_bounds, c_size, the_proc, window, draw_it, has_grow, scroll_h,
          scroll_v):
     view, bounds = t.rect(r_view), t.rect(data_bounds)
-    n = max(bounds.width, 0) * max(bounds.height, 0)
+    n = _cells(bounds)
     heap = t.process.heap
     ldef = t.process.resources.defproc("LDEF", the_proc)
-    h = heap.new_handle(CELL_ARRAY + 2 * (n + 1), clear=True) if ldef else 0
+    h = heap.new_handle(CELL_ARRAY + 2 * (n + 1), clear=True) if ldef and n <= MAX_CELLS else 0
     cells = heap.new_handle(0) if h else 0
     if not cells:
         if h:
@@ -417,18 +420,23 @@ def _add(t, lst: ListRec, count: int, at: int, rows: bool) -> int:
     at = max(b.top, min(at, b.bottom)) if rows else max(b.left, min(at, b.right))
     if count <= 0:
         return at
+    if rows:
+        bounds = Rect(b.top, b.left, b.bottom + count, b.right)
+    else:
+        bounds = Rect(b.top, b.left, b.bottom, b.right + count)
+    if max(bounds.bottom, bounds.right) > 0x7FFF or _cells(bounds) > MAX_CELLS:
+        t.set_mem_err(memFullErr)               # more than dataBounds or maxIndex can hold
+        return at
     cells, cols = lst.all(), lst.columns
     empty = [(b"", False)]
     if rows:
         i = (at - b.top) * cols
         cells[i:i] = empty * (count * cols)
-        bounds = Rect(b.top, b.left, b.bottom + count, b.right)
     else:
         j = at - b.left
         cells = [c for r in range(lst.rows)
                  for c in cells[r * cols:r * cols + j] + empty * count
                  + cells[r * cols + j:(r + 1) * cols]]
-        bounds = Rect(b.top, b.left, b.bottom, b.right + count)
     if not lst.rebuild(cells, bounds):
         t.set_mem_err(memFullErr)
         return at
@@ -436,6 +444,10 @@ def _add(t, lst: ListRec, count: int, at: int, rows: bool) -> int:
     _sync_bars(t, lst)
     _redraw(t, lst, _from(lst, at, rows))
     return at
+
+
+def _cells(bounds: Rect) -> int:
+    return max(bounds.width, 0) * max(bounds.height, 0)
 
 
 def _from(lst: ListRec, at: int, rows: bool) -> Rect:
@@ -793,8 +805,6 @@ def _track_bar(t, lst: ListRec, bar: int, pt: Point, part: int) -> None:
 
     def step(h, part):
         c = _ctl(t, h)
-        if c is None:
-            return
         vis = lst.visible
         page = max((vis.height if h == lst.v_scroll & ADDRESS_MASK else vis.width) - 1, 1)
         delta = {k.inUpButton: -1, k.inDownButton: 1, k.inPageUp: -page,
@@ -831,12 +841,9 @@ class _Selection:
             self.sense = not was if shift and flags & k.lUseSense else True
             self.keep = shift and bool(flags & (k.lUseSense | k.lNoExtend))
             self.anchor = self._clamp(start)
-            if shift and not self.keep and self.before:
+            if shift and not self.keep:
                 for j in self.before:
-                    c = lst.cell(j)
-                    self.anchor = self._span(self.anchor, c)
-            elif not shift:
-                self.before = set()
+                    self.anchor = self._span(self.anchor, lst.cell(j))
         else:
             self.mode = "one"
 

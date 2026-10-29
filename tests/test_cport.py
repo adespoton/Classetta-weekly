@@ -12,17 +12,17 @@ from macrt.m68k.glue_cport import STANDARD_CCTB, STANDARD_WCTB
 from macrt.resfork import Resource
 from macrt.toolbox import lowmem
 from macrt.toolbox.color import STANDARD_8BIT, color_rgb, color_table
-from macrt.toolbox.constants import pushButProc, redColor
-from macrt.toolbox.gdevice import (PIXMAP_SIZE, PixMap, PixPat, RGBPat, deref, device_pixmap,
-                                   oldPat, pixPat, write_pixmap)
+from macrt.toolbox.constants import pushButProc, redColor, whiteColor
+from macrt.toolbox.gdevice import (PIX_PAT_SIZE, PIXMAP_SIZE, PixMap, PixPat, RGBPat, deref,
+                                   device_pixmap, oldPat, pixPat, write_pixmap)
 from macrt.toolbox.quickdraw import BLACK_PAT, GRAY_PAT, LT_GRAY_PAT, WHITE_PAT, GrafPort
 from macrt.toolbox.types import Point, Rect
-from macrt.toolbox.windows import WindowRecord, find_aux_win
+from macrt.toolbox.windows import AUX_WIN_SIZE, WindowRecord, find_aux_win
 from macrt.ui import chrome
 
 from builders import wind
 from conftest import Recorder
-from guest import Guest
+from guest import Guest, Room
 from test_dialogs import NoDisplay
 
 WHITE, BLACK = (0xFFFF, 0xFFFF, 0xFFFF), (0, 0, 0)
@@ -118,6 +118,34 @@ def test_init_cport_resets_a_colour_port_and_leaves_a_grafport(g):
     assert g.mem.read(plain.addr, GrafPort.SIZE) == before
 
 
+def test_close_cport_disposes_of_what_open_cport_made(g):
+    """Its regions, PixMap, patterns and GrafVars, but not the device's
+    colour table; a GrafPort is left as it is."""
+    port = cport(g)
+    table = pixmap(g, port.port_pix_map).pm_table
+    made = (port.vis_rgn, port.clip_rgn, port.port_pix_map, port.graf_vars,
+            port.bk_pix_pat, port.pn_pix_pat, port.fill_pix_pat)
+    assert all(g.heap.is_handle(h) for h in made)
+    g("CloseCPort", port.addr)
+    assert g.system.port_at(port.addr) is None
+    assert not any(g.heap.is_handle(h) for h in made)
+    assert g.system.heap_of(table).is_handle(table)
+    plain, _ = g.port()
+    g("CloseCPort", plain.addr)
+    assert g.system.port_at(plain.addr) is not None and g.heap.is_handle(plain.vis_rgn)
+
+
+def test_open_cport_with_no_room_gives_back_what_it_made(g, monkeypatch):
+    the_port = g.mem.r32(g.mem.r32(g.process.partition.a5))
+    p = g.ptr(bytes(GrafPort.SIZE))
+    room = Room(monkeypatch, g)
+    room.limit(3)
+    g("OpenCPort", p)
+    assert g("QDError") == -152 and room.given_back()            # cNoMemErr
+    assert g.system.port_at(p) is None
+    assert g.mem.r32(g.mem.r32(g.process.partition.a5)) == the_port
+
+
 def test_pen_pat_and_pen_pix_pat(g):
     port = cport(g)
     own = port.pn_pix_pat
@@ -183,6 +211,8 @@ def test_dispose_pix_pat_takes_it_out_of_the_ports_that_have_it(g):
     assert port.pn_pix_pat == port.bk_pix_pat == 0
     g("PenPat", g.ptr(GRAY_PAT))
     assert port.pn_pix_pat and port.pn_pat == GRAY_PAT
+    for h in (0, g.mem.size - 2):                       # NIL, and not a handle
+        g("DisposePixPat", h)
 
 
 def test_get_pix_pat_reads_a_ppat_and_draws_it(qapp):
@@ -205,6 +235,42 @@ def test_get_pix_pat_reads_a_ppat_and_draws_it(qapp):
     assert screen_colors(g, r) == [[red] * 8, [blue] * 8] * 2     # rows 10 to 13: 2, 3, 4, 5
 
 
+def test_get_pix_pat_with_no_room_gives_back_what_it_made(qapp, monkeypatch):
+    g = Guest([Resource(b"ppat", 128, ppat(STRIPES, [WHITE, RED, BLUE, BLACK])),
+               Resource(b"ppat", 130, b"\x00\x01"),
+               Resource(b"ppat", 131, ppat(b"", [WHITE, RED, BLUE, BLACK]))], model="ii")
+    assert g("GetPixPat", 130) == 0                     # too short to say where its parts are
+    assert g("GetPixPat", 131) == 0                     # no pixels
+    assert g("GetPixPat", 128)                          # and now the resource is in memory
+    room = Room(monkeypatch, g)
+    for blocks in range(20):
+        room.limit(blocks)
+        h = g("GetPixPat", 128)
+        if h:
+            break
+        assert room.given_back()
+    assert blocks == 8 and g.contents(pix_pat(g, h).pat_data) == STRIPES
+
+
+def test_copy_pix_pat_copies_into_the_destinations_own_handles(qapp):
+    colors = [WHITE, RED, BLUE, BLACK]
+    g = Guest([Resource(b"ppat", 128, ppat(STRIPES, colors))], model="ii")
+    src, dst = g("GetPixPat", 128), g("NewPixPat")
+    d = pix_pat(g, dst)
+    d.pat_x_valid = 0
+    own = (d.pat_data, d.pat_map, pixmap(g, d.pat_map).pm_table)
+    g("CopyPixPat", src, dst)
+    d = pix_pat(g, dst)
+    assert (d.pat_type, d.pat1_data, d.pat_x_valid) == (pixPat, GRAY_PAT, -1)
+    assert (d.pat_data, d.pat_map, pixmap(g, d.pat_map).pm_table) == own
+    assert g.contents(d.pat_data) == STRIPES and g.contents(own[2]) == color_table(colors)
+    assert pixmap(g, d.pat_map).pixel_size == 2
+    was = g.mem.read(deref(g.mem, dst), PIX_PAT_SIZE)
+    for a, b in ((0, dst), (src, 0)):
+        g("CopyPixPat", a, b)
+    assert g.mem.read(deref(g.mem, dst), PIX_PAT_SIZE) == was
+
+
 def test_make_rgb_pat(g):
     h = g("NewPixPat")
     g("MakeRGBPat", h, rgb(g, *BLUE))
@@ -223,7 +289,43 @@ def test_make_rgb_pat(g):
         assert pix_pat(g, h).pat1_data == pat
 
 
-def test_copy_pix_map_copies_into_the_destinations_own_colour_table(g):
+def test_make_rgb_pat_leaves_a_pattern_it_cannot_make(g, monkeypatch):
+    """With nothing in its PixMap handle, or no room for the colour
+    table, the pattern stays as it was."""
+    g("MakeRGBPat", 0, rgb(g, *BLUE))
+    h = g("NewPixPat")
+    g("EmptyHandle", pix_pat(g, h).pat_map)
+    g("MakeRGBPat", h, rgb(g, *BLUE))
+    assert pix_pat(g, h).pat_type == pixPat
+    h = g("NewPixPat")
+    table = pixmap(g, pix_pat(g, h).pat_map).pm_table
+    Room(monkeypatch, g).limit(0)
+    g("MakeRGBPat", h, rgb(g, *BLUE))
+    assert pix_pat(g, h).pat_type == pixPat and g.heap.handle_size(table) == 8
+
+
+def test_fill_c_rgn_and_fill_c_poly_fill_with_a_pixel_pattern(g):
+    h = g("NewPixPat")
+    g("MakeRGBPat", h, rgb(g, *BLUE))
+    cport(g)
+    blue = g.system.devices.nearest(argb(BLUE))
+    rgn = g("NewRgn")
+    g("RectRgn", rgn, g.rect_ptr(Rect(20, 20, 24, 30)))
+    g("FillCRgn", rgn, h)
+    assert screen_colors(g, Rect(19, 19, 25, 31)) == \
+        [[argb(WHITE)] * 12] + [[argb(WHITE)] + [blue] * 10 + [argb(WHITE)]] * 4 + \
+        [[argb(WHITE)] * 12]
+    poly = g("OpenPoly")
+    for call, v, h_ in (("MoveTo", 40, 40), ("LineTo", 40, 50), ("LineTo", 44, 50),
+                        ("LineTo", 44, 40), ("LineTo", 40, 40)):
+        g(call, h_, v)
+    g("ClosePoly")
+    g("FillCPoly", poly, h)
+    assert screen_colors(g, Rect(40, 40, 44, 50)) == [[blue] * 10] * 4
+    assert screen_colors(g, Rect(45, 40, 46, 50)) == [[argb(WHITE)] * 10]
+
+
+def test_copy_pix_map_copies_into_the_destinations_own_colour_table(g, monkeypatch):
     src, dst = g("NewPixMap"), g("NewPixMap")
     table = color_table([WHITE, RED, BLUE, BLACK], seed=7)
     ct = pixmap(g, src).pm_table
@@ -237,6 +339,29 @@ def test_copy_pix_map_copies_into_the_destinations_own_colour_table(g):
     assert d.pm_table == dst_table != ct
     assert (d.bounds, d.pixel_size, d.row_bytes & 0xFFFF) == (Rect(0, 0, 20, 30), 2, 0x8008)
     assert g.contents(dst_table) == table
+
+    pixmap(g, dst).pm_table = 0                         # one with none is given one
+    g("CopyPixMap", src, dst)
+    own = pixmap(g, dst).pm_table
+    assert own not in (0, ct, dst_table) and g.contents(own) == table
+    # One that can't have a copy keeps its own table as it was.
+    bigger = color_table([WHITE, RED, BLUE, BLACK] * 4)
+    assert g.heap.set_handle_size(ct, len(bigger))
+    g.mem.write(g.heap.deref(ct), bigger)
+    room = Room(monkeypatch, g)
+    room.limit(0)
+    g("CopyPixMap", src, dst)
+    assert pixmap(g, dst).pm_table == own and g.contents(own) == table
+    room.limit(None)
+    g("EmptyHandle", ct)
+    g("CopyPixMap", src, dst)
+    assert pixmap(g, dst).pm_table == own and g.contents(own) == table
+    was = g.mem.read(deref(g.mem, dst), PIXMAP_SIZE)
+    g("CopyPixMap", g.mem.size - 2, dst)               # not a handle
+    assert g.mem.read(deref(g.mem, dst), PIXMAP_SIZE) == was
+    g("DisposePixMap", dst)
+    assert not g.heap.is_handle(dst) and not g.heap.is_handle(own)
+    g("DisposePixMap", 0)
 
 
 def offscreen(g, rows: list[bytes], table: int) -> int:
@@ -371,6 +496,66 @@ def test_colour_windows_auxiliary_records(g):
     assert find_aux_win(g.mem, w.addr)
     w.close()
     assert not find_aux_win(g.mem, w.addr) and find_aux_win(g.mem, 0) == default
+
+
+def test_set_win_color_on_a_record_with_no_room_or_without_a_table(g, monkeypatch):
+    """A window with a record of its own has its table changed in it; one
+    there's no room to make a record for has none (though its background
+    is the table's content colour); one given what isn't a table keeps the
+    background it had; and a black-and-white window's stays white."""
+    lilac = (0x8000, 0x8000, 0xFFFF)
+    first = g.handle(color_table([lilac, BLACK, BLACK, BLACK, WHITE]))
+    second = g.handle(color_table([RED, BLACK, BLACK, BLACK, WHITE]))
+    w, other = (WindowRecord.new(g.system, g.process, g.heap, 0, Rect(40, 40, 100, 200), "W",
+                                 True, 0, False, 0, color=True) for _ in range(2))
+    pp = g.ptr(bytes(4))
+    g("SetWinColor", w.addr, first)
+    g("GetAuxWin", w.addr, pp)
+    aux = g.mem.r32(pp)
+    g("SetWinColor", w.addr, second)
+    assert g("GetAuxWin", w.addr, pp) and g.mem.r32(pp) == aux
+    assert g.mem.r32(deref(g.mem, aux) + 8) == second and w.rgb_bk_color == RED
+
+    room = Room(monkeypatch, g)
+    room.limit(0)
+    head = g.mem.r32(lowmem.AuxWinHead)
+    g("SetWinColor", other.addr, first)
+    assert not g("GetAuxWin", other.addr, pp) and other.rgb_bk_color == lilac
+    assert g.mem.r32(lowmem.AuxWinHead) == head
+    room.limit(None)
+    g("SetWinColor", other.addr, g.mem.size - 2)
+    assert other.rgb_bk_color == lilac
+    plain = WindowRecord.new(g.system, g.process, g.heap, 0, Rect(40, 40, 100, 200), "Plain",
+                             True, 0, False, 0)
+    g("SetWinColor", plain.addr, second)
+    assert plain.bk_color == whiteColor
+
+
+def test_the_default_record_is_made_at_the_end_of_the_list_or_not_at_all(qapp, monkeypatch):
+    g = Guest([Resource(b"wctb", 0, color_table(STANDARD_WCTB))], model="ii")
+    g.process.resources.GetResource("wctb", 0)          # and its table is in memory
+    pp = g.ptr(bytes(4))
+    vectors = g.mem.read(0, 0x100)
+    room = Room(monkeypatch, g)
+    room.limit(0)
+    assert g("GetAuxWin", 0, pp) and g.mem.r32(pp) == 0
+    assert room.given_back() and not g.mem.r32(lowmem.AuxWinHead)
+    assert g.mem.read(0, 0x100) == vectors
+    g = Guest(model="ii")                               # with a table to make
+    pp = g.ptr(bytes(4))
+    room = Room(monkeypatch, g)
+    for blocks in (0, 1):                               # the record, then its table
+        room.limit(blocks)
+        assert g("GetAuxWin", 0, pp) and g.mem.r32(pp) == 0
+        assert room.given_back() and not g.mem.r32(lowmem.AuxWinHead)
+    room.limit(None)
+    own = g.handle(bytes(AUX_WIN_SIZE))                 # one an application put there
+    g.mem.w32(deref(g.mem, own) + 4, 0x1234)
+    g.mem.w32(lowmem.AuxWinHead, own)
+    g("GetAuxWin", 0, pp)
+    default = g.mem.r32(pp)
+    assert default not in (0, own) and g.mem.r32(deref(g.mem, own)) == default
+    assert g.mem.r32(lowmem.AuxWinHead) == own
 
 
 def test_get_new_c_window_shows_its_content_in_its_content_colour(qapp):

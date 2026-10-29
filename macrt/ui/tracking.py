@@ -20,11 +20,14 @@ from PyQt6.QtWidgets import QWidget
 from ..toolbox.types import Point, Rect
 
 if TYPE_CHECKING:
+    from ..process import Process
     from .display import Display
     from .window import MacWindowView
 
 
 class Tracker:
+    owner: Process | None = None        # the application waiting for it, if one is
+
     def __init__(self, display: Display, future: Future):
         self.display = display
         self.future = future

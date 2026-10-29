@@ -33,9 +33,12 @@ is no telling how much of the stack is its.
 
 from __future__ import annotations
 
+import functools
 import logging
+import struct
 from dataclasses import dataclass
-from typing import Callable
+from functools import cached_property
+from typing import Callable, NamedTuple
 
 from ..memory import BusError
 from ..toolbox import lowmem
@@ -96,6 +99,12 @@ EXTRA_FUNCTIONS = {
     # Toolbox Essentials, the Menu Manager), which the interfaces haven't.
     "InsertFontResMenu": (0xA825, "MenuDispatch", 0x0400, "phh", "", (), None, ""),
     "InsertIntlResMenu": (0xA825, "MenuDispatch", 0x0601, "plhh", "", (), None, ""),
+    # Its menuID is an INTEGER and its resID a VAR one: three words, as its
+    # selector counts (the interfaces give both as pointers).
+    "HMGetMenuResID": (0xA830, "Pack14", 0x0314, "hp", "e", (), None, ""),
+    # Its iconIndex is a Byte, which Pascal pushes as a word with the value
+    # in its low byte (C's interface declares it a short).
+    "SetItemIcon": (0xA940, None, None, "phH", "", (), None, ""),
     # A Pack6 routine the interfaces macrt has don't name, which Text (System
     # 7.5's control panel) calls with TextOrder's parameters to put the
     # items of its menus in order.
@@ -138,6 +147,13 @@ RENAMED = {"ROMlib_Fpstr2dec": "PStr2Dec", "ROMlib_Fcstr2dec": "CStr2Dec",
            "ClearIntlResourceCache": "IUClearCache", "GetIntlResourceTable": "IUGetItlTable"}
 
 
+# Pascal procedures after which macrt leaves D0 as the caller had it,
+# rather than 0 or, for the Resource Manager's, ResErr (RESERR_FLAGS):
+# DeadEnd 1.0's checksum routine, a C function, works its sum out in D0,
+# ends with ReleaseResource and returns whatever D0 holds.
+KEEPS_D0 = frozenset({"ReleaseResource"})
+
+
 def is_toolbox(word: int) -> bool:
     return bool(word & 0x0800)
 
@@ -164,13 +180,53 @@ class Signature:
         return sum(SIZES[c] for c in self.stack)
 
     @property
-    def outs(self) -> list[str]:
-        return [r[4:-1] for r, _ in self.regs if r.startswith("Out<") or r.startswith("InOut<")]
-
-    @property
     def os_style(self) -> bool:
         """Registers in, D0 out: everything but Pascal stack calls."""
         return bool(self.regs) or self.result_reg is not None or not is_toolbox(self.trap)
+
+    @cached_property
+    def plan(self) -> Plan:
+        """How call() is to call it, worked out once."""
+        os_style = self.os_style
+        d0 = None
+        if "ReturnMemErrConditional" in self.extras:
+            d0 = "mem_err_if_any"
+        elif "ReturnMemErr" in self.extras:
+            d0 = "mem_err"
+        elif "ClearD0" in self.extras:
+            d0 = "clear"
+        elif not self.result and not os_style and self.name not in KEEPS_D0:
+            d0 = "clear_if_implemented"
+        result_reg = None
+        if self.result and self.result_reg != "D0Minus1Boolean" and (self.result_reg or os_style):
+            result_reg = (self.result_reg or "D0", self.result)
+        return Plan(
+            stack=self.stack,
+            reads=tuple(_reader(reg, code) for reg, code in self.regs
+                        if not reg.startswith("Out<")),
+            stack_result=self.result if self.result and not os_style else "",
+            unimplemented=unimpErr if self.result in ("e", "E") else 0,
+            outs=tuple((reg[reg.index("<") + 1:-1], code) for reg, code in self.regs
+                       if reg.startswith("Out<") or reg.startswith("InOut<")),
+            minus1_boolean=self.result_reg == "D0Minus1Boolean",
+            result_reg=result_reg,
+            move_a1_to_a0="MoveA1ToA0" in self.extras,
+            d0=d0,
+            cc_from_d0="CCFromD0" in self.extras)
+
+
+class Plan(NamedTuple):
+    """A Signature as call() goes through it."""
+    stack: str                  # the Pascal arguments' codes
+    reads: tuple                # a reader(cpu, word) for each register argument
+    stack_result: str           # the result's code, if it's left on the stack
+    unimplemented: int          # the result with no implementation
+    outs: tuple                 # (register, code) for each Out or InOut
+    minus1_boolean: bool        # a Boolean in D0, 0 for TRUE
+    result_reg: tuple | None    # (register, code) the result goes in
+    move_a1_to_a0: bool
+    d0: str | None              # what's left in D0 after: see call()
+    cc_from_d0: bool
 
 
 def _signatures() -> dict[str, Signature]:
@@ -276,20 +332,27 @@ class UnknownTrap(Exception):
                          + (f": {detail}" if detail else ""))
 
 
-def _read_reg(cpu, reg: str, code: str, word: int):
+def _reader(reg: str, code: str) -> Callable:
+    """A function of the CPU and the trap word that reads an argument from
+    a register (or the trap word's bits)."""
     if reg.startswith("TrapBit<"):
         mask = reg[8:-1]
-        return bool(word & (TRAP_BITS[mask] if mask in TRAP_BITS else int(mask, 0)))
+        bit = TRAP_BITS[mask] if mask in TRAP_BITS else int(mask, 0)
+        return lambda cpu, word: bool(word & bit)
     if reg.startswith("InOut<"):
         reg = reg[6:-1]
-    if reg == "D0LowWord":
-        v = cpu.d(0) & 0xFFFF
-        return v - 0x10000 if code == "h" and v & 0x8000 else v
-    if reg == "D0HighWord":
-        v = cpu.d(0) >> 16
-        return v - 0x10000 if code == "h" and v & 0x8000 else v
-    v = cpu.d(int(reg[1])) if reg[0] == "D" else cpu.a(int(reg[1]))
-    return _from_long(v, code)
+    if reg in ("D0LowWord", "D0HighWord"):
+        shift = 16 if reg == "D0HighWord" else 0
+        signed = code == "h"
+
+        def half(cpu, word):
+            v = cpu.d(0) >> shift & 0xFFFF
+            return v - 0x10000 if signed and v & 0x8000 else v
+        return half
+    n = int(reg[1])
+    if reg[0] == "D":
+        return lambda cpu, word: _from_long(cpu.d(n), code)
+    return lambda cpu, word: _from_long(cpu.a(n), code)
 
 
 def _from_long(v: int, code: str):
@@ -307,6 +370,8 @@ def _from_long(v: int, code: str):
 
 
 def _to_long(v, code: str) -> int:
+    if type(v) is int:
+        return v & 0xFFFFFFFF
     if v is None or v is False:
         return 0
     if v is True:
@@ -335,32 +400,38 @@ def _write_reg(cpu, reg: str, code: str, value) -> None:
         cpu.set_a(int(reg[1]), v)
 
 
+# How an argument of each code is on the stack, for struct: a byte's in
+# the high byte of its word, and a Point is its v, then its h.
+STACK_FORMATS = {"b": "bx", "B": "Bx", "h": "h", "H": "H", "e": "h", "P": "hh", "l": "i",
+                 "E": "i"}
+
+
+@functools.cache
+def _stack_layout(codes: str) -> tuple[struct.Struct, bool]:
+    """Arguments of codes as they are on the stack, from the last, at the
+    top, to the first; and whether there's a Point among them."""
+    return (struct.Struct(">" + "".join(STACK_FORMATS.get(c, "I") for c in reversed(codes))),
+            "P" in codes)
+
+
 def pop_args(mem, sp: int, codes: str) -> tuple[list, int]:
     """Pascal arguments from the stack, in declaration order, and the
     address just past them (where the result goes)."""
-    args = [None] * len(codes)
-    at = sp
-    for i in range(len(codes) - 1, -1, -1):
-        c = codes[i]
-        if c in "hHe":
-            args[i] = mem.r16(at) if c == "H" else mem.r16s(at)
-            at += 2
-        elif c == "b":
-            args[i] = mem.r8s(at)
-            at += 2
-        elif c == "B":
-            args[i] = mem.r8(at)
-            at += 2
-        elif c == "P":
-            args[i] = Point(mem.r16s(at), mem.r16s(at + 2))
-            at += 4
-        elif c in "lE":
-            args[i] = mem.r32s(at)
-            at += 4
-        else:
-            args[i] = mem.r32(at)
-            at += 4
-    return args, at
+    layout, points = _stack_layout(codes)
+    values = mem.unpack(layout, sp)
+    if not points:
+        args = list(values)
+    else:
+        args, i = [], 0
+        for c in reversed(codes):
+            if c == "P":
+                args.append(Point(values[i], values[i + 1]))
+                i += 2
+            else:
+                args.append(values[i])
+                i += 1
+    args.reverse()
+    return args, sp + layout.size
 
 
 def put_result(mem, at: int, code: str, value) -> None:
@@ -380,51 +451,53 @@ def call(t, sig: Signature, word: int) -> None:
     """Run sig's implementation, or skip it, with the CPU at the trap's
     arguments and PC already where the trap returns to."""
     cpu, mem = t.cpu, t.mem
+    plan = sig.plan
     impl = IMPLEMENTATIONS.get(sig.name)
-    sp = cpu.sp
-    args, result_at = pop_args(mem, sp, sig.stack)
-    for reg, code in sig.regs:
-        if not reg.startswith("Out<"):
-            args.append(_read_reg(cpu, reg, code, word))
+    if plan.stack or plan.stack_result:
+        args, result_at = pop_args(mem, cpu.sp, plan.stack)
+    else:
+        args, result_at = [], 0
+    for read in plan.reads:
+        args.append(read(cpu, word))
+    outs = plan.outs
     if impl is None:
         t.unimplemented(sig.name, word)
-        value = unimpErr if sig.result in ("e", "E") else 0
-        outs = [0] * len(sig.outs)
+        value = plan.unimplemented
+        outs_values = [0] * len(outs)
     else:
         value = impl(t, *args)
-        outs = []
-        if sig.outs:
-            value, *outs = value
+        outs_values = ()
+        if outs:
+            value, *outs_values = value
     # Pascal: drop the arguments, leave the result
-    if sig.stack:
+    if plan.stack:
         cpu.sp = result_at
-    if sig.result and not sig.os_style:
-        put_result(mem, result_at, sig.result, value)
-    out_regs = [r for r, _ in sig.regs if r.startswith("Out<") or r.startswith("InOut<")]
-    for reg, out in zip(out_regs, outs):
-        code = dict(sig.regs)[reg]
-        _write_reg(cpu, reg[reg.index("<") + 1:-1], code, out)
-    if sig.result_reg == "D0Minus1Boolean":
+    if plan.stack_result:
+        put_result(mem, result_at, plan.stack_result, value)
+    for (reg, code), out in zip(outs, outs_values):
+        _write_reg(cpu, reg, code, out)
+    if plan.minus1_boolean:
         cpu.set_d(0, 0 if value else 0xFFFFFFFF)      # 0 for TRUE, as the OS returns it
-    elif sig.result and (sig.result_reg or sig.os_style):
-        _write_reg(cpu, sig.result_reg or "D0", sig.result, value)
-    if "MoveA1ToA0" in sig.extras:
+    elif plan.result_reg is not None:
+        _write_reg(cpu, plan.result_reg[0], plan.result_reg[1], value)
+    if plan.move_a1_to_a0:
         cpu.set_a(0, cpu.a(1))
-    if "ReturnMemErrConditional" in sig.extras:
+    d0 = plan.d0
+    if d0 is None:
+        pass
+    elif d0 == "mem_err_if_any":
         if t.mem_err:                                   # a size on success, else the error
             cpu.set_d(0, t.mem_err & 0xFFFFFFFF)
-    elif "ReturnMemErr" in sig.extras:
+    elif d0 == "mem_err":
         cpu.set_d(0, t.mem_err & 0xFFFFFFFF)
-    elif "ClearD0" in sig.extras:
-        cpu.set_d(0, 0)
-    elif not sig.result and not sig.os_style and impl is not None:
+    elif d0 == "clear" or impl is not None:
         # A Pascal routine with no result leaves D0 as it likes: stack-based
         # traps keep only A2-A6 and D3-D7 (IM I, Using Assembly Language).
         # macrt leaves 0 there, not what the caller had, for C functions
         # that fall off their end after one and return whatever D0 holds
         # (BMAPEdit's bitmap routine, ending with SetPort).
         cpu.set_d(0, 0)
-    if "CCFromD0" in sig.extras:
+    if plan.cc_from_d0:
         # HandToHand and the like are numbered as Toolbox traps but end as
         # the OS's do, with the flags set from D0: Radical Castle branches on
         # them straight after.

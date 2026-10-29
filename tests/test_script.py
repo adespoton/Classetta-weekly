@@ -97,6 +97,17 @@ def test_line_breaks():
     assert sm.line_break(b"abcdefgh", 2, 8, 20, False, mono) == (sm.smBreakWord, 2, 20)
 
 
+def test_a_line_break_in_a_long_paragraph_is_found_at_once():
+    text = b"word " * 6553
+    measured = []
+
+    def width(part):
+        measured.append(len(part))
+        return 6 * len(part)
+    assert sm.line_break(text, 0, len(text), 300, True, width) == (sm.smBreakWord, 50, 300)
+    assert sum(measured) < 50 * len(text)       # not every word's width from the start
+
+
 def test_truncation():
     assert sm.truncate(b"short", 30, sm.smTruncEnd, mono) is None
     assert sm.truncate(b"truncated", 30, sm.smTruncEnd, mono) == b"trun\xc9"
@@ -221,6 +232,11 @@ def test_string_to_date_and_time(qapp):
     assert parse("StringToTime", b"1:05:09 PM")[2][4:7] == (13, 5, 9)
     assert parse("StringToTime", b"12:30 AM")[2][4:7] == (0, 30, 0)
     assert parse("StringToTime", b"25:00")[0] == intl.dateTimeInvalid
+    # A number too large for any field, or for Python to read
+    for text in (b"1/2/2147483648", b"March 2147483648, 1993", b"1/2/" + b"9" * 5000):
+        assert parse("StringToDate", text)[0] == intl.dateTimeInvalid, text[:20]
+    assert parse("StringToDate", b"0000000000009/1/1987")[2][1:4] == (1987, 9, 1)
+    assert parse("StringToTime", b"1:" + b"5" * 5000)[0] == intl.dateTimeInvalid
 
 
 def test_transliterate_sizes_the_destination(qapp):

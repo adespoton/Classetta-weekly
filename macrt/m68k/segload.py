@@ -96,7 +96,10 @@ def code0(app: MacFile, expand: Callable[[bytes], bytes | None] | None = None) -
     entry = fm.find(b"CODE", 0)
     if entry is None:
         return None
-    data = fm.raw(entry)
+    try:
+        data = fm.raw(entry)
+    except InvalidForkError as e:
+        raise SegmentError(f"CODE 0 can't be read ({e})") from e
     # It can be compressed, as the Resource Manager reads it (Script Editor's).
     if entry.attrs & resCompressed and data[:4] == COMPRESSED_TAG:
         try:

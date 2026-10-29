@@ -4,8 +4,10 @@ the errors, and ResourceViewer standing in for the app's code."""
 import struct
 import threading
 
+import pytest
+
 from builders import alrt, ditl, dlog, menu, pstr, size_res, vers, wind
-from macrt.demo import main
+from macrt.demo import main, parse_args
 from macrt.m68k.segload import why_no_code
 from macrt.macfile import MacFile
 from macrt.resfork import Resource, build_fork
@@ -118,6 +120,25 @@ def test_why_an_application_has_no_68k_code():
     assert why_no_code(MacFile("Copied", code, b"")) == \
         "no CODE resources: its resource fork is in its data fork"
     assert why_no_code(MacFile("Plain", b"", APP_FORK)) == "no CODE resources"
+
+
+def test_screen_size_and_speed_options(tmp_path, capsys, qapp):
+    assert parse_args(["--size", "640x480"]).size == (640, 480)
+    assert parse_args(["--size", " 512 X 342 "]).size == (512, 342)
+    assert parse_args(["--speed", "2.5"]).speed == 2.5
+    for bad in (["--size", "abc"], ["--size", "0x0"], ["--size", "640x480x8"],
+                ["--size", "40000x10"], ["--size", "9" * 5000 + "x1"],
+                ["--speed", "inf"], ["--speed", "nan"], ["--speed", "0"], ["--speed", "-1"]):
+        with pytest.raises(SystemExit):
+            parse_args(bad)
+    err = capsys.readouterr().err
+    assert "--size is a width and height in pixels" in err and "--speed is a number" in err
+    # What the machine can't be built with is said, not a traceback
+    assert main(["--size", "32000x32000", "--host", "screen", "--no-sound"]) == 2
+    assert "a 32000x32000 screen leaves no room for applications" in capsys.readouterr().err
+    assert main(["--record-sound", str(tmp_path / "no" / "such.wav"),
+                 "--host", "screen", "--no-sound"]) == 2
+    assert "No such file" in capsys.readouterr().err
 
 
 def test_an_app_too_big_for_memory(tmp_path, capsys, qapp):

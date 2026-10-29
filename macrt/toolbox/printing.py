@@ -250,7 +250,7 @@ class Job:
 
     def write(self) -> Path | None:
         """The PDF, if any pages were printed: each page as many times as
-        there are copies."""
+        there are copies.  OSError if it can't be written."""
         if not self.pages:
             return None
         w, h = self.setup.size
@@ -261,6 +261,8 @@ class Job:
                                      QPageSize.SizeMatchPolicy.ExactMatch))
         writer.setPageMargins(QMarginsF(0, 0, 0, 0))
         p = QPainter(writer)
+        if not p.isActive():                # Qt couldn't open the file
+            raise OSError(f"can't write {self.path}")
         p.setRenderHint(QPainter.RenderHint.LosslessImageRendering)    # not JPEG
         try:
             first = True
@@ -275,6 +277,9 @@ class Job:
         return self.path
 
 
+NAME_BYTES = 240
+
+
 def unique(path: Path) -> Path:
     """path, or the first of "name 2.pdf", "name 3.pdf"... that isn't there."""
     n = 1
@@ -287,5 +292,7 @@ def unique(path: Path) -> Path:
 
 def pdf_name(title: str) -> str:
     """A file name for a document's PDF, from its window's title."""
-    name = "".join("-" if ch in '/\\:*?"<>|' or ord(ch) < 32 else ch for ch in title).strip()
+    name = "".join("-" if ch in '/\\:*?"<>|' or ord(ch) < 32 else ch for ch in title)
+    # no longer than a host name can be, with unique's number and ".pdf"
+    name = name.encode()[:NAME_BYTES].decode(errors="ignore").strip()
     return (name or "Printout") + ".pdf"

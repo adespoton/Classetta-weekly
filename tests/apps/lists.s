@@ -15,7 +15,8 @@ CLICKS      = -240              | calls to LClick
 DOUBLES     = -242              | those that were double clicks
 PT          = -246              | the click, local
 TEXT        = -262              | a cell's text, made by NumToString
-GLOBALS     = 262
+UPDATES     = -264              | update events done with
+GLOBALS     = 264
 
 mouseDown   = 1
 updateEvt   = 6
@@ -90,6 +91,7 @@ fill:   move.l  d3,d0
         _Pack0
         clr.w   CLICKS(a5)
         clr.w   DOUBLES(a5)
+        clr.w   UPDATES(a5)
 
 loop:
         clr.w   -(sp)
@@ -119,6 +121,7 @@ update:
         _Pack0
         move.l  EVENT+2(a5),-(sp)
         _EndUpdate
+        addq.w  #1,UPDATES(a5)
         bra.s   loop
 
 mouse:
@@ -138,10 +141,11 @@ mouse:
         move.l  LIST(a5),-(sp)
         move.w  #lClick,-(sp)
         _Pack0
-        addq.w  #1,CLICKS(a5)
         move.b  (sp)+,d0
-        beq     loop
+        beq.s   counted
         addq.w  #1,DOUBLES(a5)
+counted:
+        addq.w  #1,CLICKS(a5)            | last, for whoever waits on it
         bra     loop
 
 view_r:     .short 10, 20, 130, 120

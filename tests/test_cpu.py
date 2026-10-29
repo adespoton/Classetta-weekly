@@ -3,6 +3,7 @@ for the VBL tasks or a kill, at an instruction's end and not in the
 middle of it; holding it to a speed; TRAPcc and tracing, which the core
 gets wrong; and leaving the interpreter with code still running."""
 
+import gc
 import random
 import struct
 import subprocess
@@ -73,6 +74,49 @@ def test_a_vbl_task_not_counting_down_waits_for_nothing():
     mem.w16(TASK + 0x20 + 10, 3)
     assert cpu._interrupted_at_ticks()
     cpu.close()
+
+
+def test_runs_go_on_in_slices_a_while_after_the_last_vbl_task_stops_counting():
+    """As a program's own task does when it's run, to be set counting
+    again a moment later: the runs between still come back for the clock,
+    and the core keeps the blocks it's translated, which it flushes when a
+    run goes into slices.  Once LINGER has gone by with none counting, a
+    run goes on until something stops it."""
+    mem, cpu = machine()
+    mem.w32(lowmem.VBLQueue + 2, TASK)
+    flushes, flush = [], cpu.uc.ctl_flush_tb
+    cpu.uc.ctl_flush_tb = lambda: (flushes.append(1), flush())
+    timer = threading.Timer(5, cpu.interrupt)       # for a run that's not in slices
+    timer.start()
+    try:
+        for counting in (1, 0, 1, 0):
+            mem.w16(TASK + 10, counting)
+            cpu.retrace_pending = False
+            assert cpu.run(NEVER).kind == "interrupted" and cpu._counting
+            assert not cpu.interrupt_requested
+        assert len(flushes) == 1                    # going into slices the first time
+        timer.cancel()
+        cpu._ticked -= cpu_module.LINGER
+        cpu.retrace_pending = False
+        timer = threading.Timer(0.2, cpu.interrupt)
+        timer.start()
+        assert cpu.run(NEVER).kind == "interrupted"
+        assert cpu.interrupt_requested and not cpu._counting
+    finally:
+        timer.cancel()
+        cpu.close()
+
+
+def test_a_cpu_dropped_unclosed_takes_its_clock_with_it():
+    """As a test's often is: its clock's thread doesn't stay on, ticking
+    for nothing and taking the interpreter from whatever runs after."""
+    before = set(threading.enumerate())
+    cpu = CPU(RAM(0x1000))
+    clock, = [t for t in threading.enumerate() if t not in before and t.name == "m68k clock"]
+    del cpu
+    gc.collect()
+    clock.join(1)
+    assert not clock.is_alive()
 
 
 def test_with_no_vbl_tasks_only_interrupt_stops_it():
@@ -146,6 +190,7 @@ def test_sr_is_what_move_from_sr_sees(insn, stop, monkeypatch):
     next, which stores them, sees them; and still so for that one."""
     mem, cpu = machine()
     monkeypatch.setattr(cpu_module, "SLICE", 1)
+    monkeypatch.setattr(cpu_module, "LINGER", 0)       # no slices once the task's gone
     code = bytes.fromhex(insn) + MOVE_SR_D7_NOP
     at = CODE + 0x200
 
@@ -184,6 +229,144 @@ def run_through(cpu, until):
     while (ev := cpu.run(until)).kind == "interrupted":
         pass
     assert (ev.kind, ev.pc) == ("until", until)
+
+
+# -- the registers, as a copy of the core's between runs ----------------------
+def uncopied(cpu, state=True):
+    """The CPU as it is with no copy of the core's state to keep its
+    registers in (unicorn's own calls for each), or none found at all."""
+    cpu._sync()
+    cpu._fresh, cpu._regs, cpu._cc = False, None, None
+    if not state:
+        cpu._state = None
+    return cpu
+
+
+@pytest.mark.parametrize("copy", [True, False])
+def test_registers_set_between_runs_are_what_the_core_runs_with(copy):
+    """Each as a long: a negative, or one past 32 bits, is its low long."""
+    mem, cpu = machine()
+    if not copy:
+        uncopied(cpu)
+    at = CODE + 0x200
+    mem.write(at, bytes.fromhex("2080"         # move.l d0,(a0)
+                                "2141 0004"    # move.l d1,4(a0)
+                                "2f09"         # move.l a1,-(sp)
+                                "4e71"))       # nop
+    try:
+        cpu.set_d(0, -1)
+        cpu.set_d(1, 1 << 32 | 5)
+        cpu.set_a(1, -2)
+        cpu.pc, cpu.sp = at, 1 << 32 | 0x9000
+        assert (cpu.d(0), cpu.d(1), cpu.a(1), cpu.a(7), cpu.pc) == (0xFFFFFFFF, 5, 0xFFFFFFFE,
+                                                                    0x9000, at)
+        run_through(cpu, at + 8)
+        assert (mem.r32(COUNTER), mem.r32(COUNTER + 4)) == (0xFFFFFFFF, 5)
+        assert (cpu.sp, mem.r32(0x9000 - 4)) == (0x9000 - 4, 0xFFFFFFFE)
+    finally:
+        cpu.close()
+
+
+def test_a_hook_reads_and_sets_the_registers_as_the_core_has_them():
+    """While the core runs, the registers are its own, not a copy's."""
+    from unicorn import UC_HOOK_CODE
+    mem, cpu = machine()
+    at = CODE + 0x200
+    mem.write(at, bytes.fromhex("7003"         # moveq #3,d0
+                                "4e71"         # nop: looked at here
+                                "2081"         # move.l d1,(a0)
+                                "4e71"))
+    seen = []
+
+    def look(uc, address, size, user_data):
+        seen.append(cpu.d(0))
+        cpu.set_d(1, 7)
+
+    cpu.set_d(0, 1)
+    cpu.pc = at
+    cpu.uc.hook_add(UC_HOOK_CODE, look, begin=at + 2, end=at + 2)
+    try:
+        run_through(cpu, at + 6)
+        assert (seen, mem.r32(COUNTER), cpu.d(0), cpu.d(1)) == ([3], 7, 3, 7)
+    finally:
+        cpu.close()
+
+
+def test_an_sr_written_puts_back_whats_changed_first_and_picks_the_stack():
+    """As the exception entry and RTE write it: A7 is the stack S picks;
+    the setter keeps A7 as it was."""
+    mem, cpu = machine()
+    try:
+        cpu.set_d(2, 9)
+        cpu._set_sr(0x0000)                     # to user mode
+        assert (cpu.d(2), cpu.sr) == (9, 0x0000)
+        cpu.sp = 0x8000                         # the user stack
+        cpu._set_sr(0x2000)
+        assert (cpu.sp, cpu.sr) == (0x9000, 0x2000)
+        cpu._set_sr(0x0004)
+        assert (cpu.sp, cpu.sr) == (0x8000, 0x0004)
+        cpu.sr = 0x2004
+        assert (cpu.sp, cpu.sr, cpu.d(2)) == (0x8000, 0x2004, 9)
+    finally:
+        cpu.close()
+
+
+def test_a_context_saved_has_the_registers_changes_and_restoring_drops_later_ones():
+    mem, cpu = machine()
+    try:
+        cpu.set_d(0, 1)
+        ctx = cpu.context()
+        cpu.set_d(0, 2)
+        cpu.pc = 0x1234
+        cpu.restore(ctx)
+        assert (cpu.d(0), cpu.pc) == (1, CODE)
+        cpu.pc = CODE + 0x200
+        cpu.restore(ctx)
+        assert cpu.pc == CODE
+    finally:
+        cpu.close()
+
+
+@pytest.mark.parametrize("copy", [True, False])
+def test_condition_codes_from_a_word_are_tst_ws(copy):
+    """N and Z from the word; V and C cleared; X and the rest of SR kept:
+    as SR reads, and as the core goes on with them."""
+    mem, cpu = machine()
+    if not copy:
+        uncopied(cpu)
+    at = CODE + 0x200
+    try:
+        for x in (0, 0x10):
+            for word, nz in [(0x8000, 0x8), (0xFFFF, 0x8), (0, 0x4), (0x10000, 0x4),
+                             (1, 0), (0x7FFF, 0)]:
+                mem.write(at, MOVE_SR_D7_NOP)
+                cpu.sr = 0x2700 | x | 0x3       # V and C set, as they'll be cleared
+                cpu.set_cc_from_word(word)
+                assert cpu.sr == 0x2700 | x | nz, (x, hex(word))
+                cpu.pc = at
+                run_through(cpu, at + 2)
+                assert cpu.d(7) & 0xFFFF == 0x2700 | x | nz, (x, hex(word))
+                at += 4
+    finally:
+        cpu.close()
+
+
+def test_with_no_copy_of_the_cores_state_found_the_registers_are_unicorns():
+    mem, cpu = machine()
+    uncopied(cpu, state=False)
+    at = CODE + 0x200
+    mem.write(at, bytes.fromhex("2080" "4e71"))    # move.l d0,(a0)
+    try:
+        cpu.set_d(0, 0x12345678)
+        cpu.pc = at
+        assert (cpu.d(0), cpu.a(0), cpu.sp, cpu.pc, cpu.sr) == (
+            0x12345678, COUNTER, 0x9000, at, 0x2000)
+        run_through(cpu, at + 2)
+        assert mem.r32(COUNTER) == 0x12345678
+        cpu.set_cc_from_word(0)
+        assert cpu.sr & 0xF == 0x4
+    finally:
+        cpu.close()
 
 
 def test_68k_code_reaches_the_memory_a_range_mirrors_through_it():
@@ -623,6 +806,20 @@ def test_rtr_returns_with_the_condition_codes_it_pops(ccr):
         cpu.close()
 
 
+@pytest.mark.parametrize("op", ["4e77", "4e97"])     # rtr, jsr (sp)
+def test_rtr_or_jsr_sp_with_the_stack_outside_ram_is_a_bus_error(op):
+    mem, cpu = machine()
+    at = CODE + 0x1000
+    mem.write(at, bytes.fromhex("2e7c 00fffff0" + op + "4e71"))    # movea.l #$fffff0,sp
+    try:
+        sr = cpu.sr
+        ev = cpu_at(cpu, at).run(at + 10)
+        assert ev == ("exception", at + 6, cpu_module.BUS_ERROR)
+        assert (cpu.sp, cpu.sr) == (0xFFFFF0, sr)
+    finally:
+        cpu.close()
+
+
 def test_two_stores_to_an_instruction_ahead_are_both_seen():
     """A trap word stored a byte at a time, low byte first, in the block
     running: the instruction's run as the second store left it, not as the
@@ -801,6 +998,134 @@ def test_a_programs_own_routine_in_lvl1dt_is_looked_for_at_each_tick_too():
         mem.w32(lowmem.Lvl1DT + 4 * 6, 0x7200)
         assert cpu.own_level_1_routines() == 0x40 and cpu.own_interrupts()
         assert cpu.run(NEVER).kind == "interrupted"
+    finally:
+        cpu.close()
+
+
+SYSTEMS_HANDLER, OWN_HANDLER = 0x7000, 0x7200
+
+
+def with_the_systems_handlers(mem, cpu):
+    cpu.rom_interrupts = SYSTEMS_HANDLER
+    cpu.rom_level_1_routines = (0x7100, 0x7160)
+    mem.w32(4 * cpu_module.LEVEL_1, SYSTEMS_HANDLER)
+    for n in range(8):
+        mem.w32(lowmem.Lvl1DT + 4 * n, 0x7100 + 12 * n)
+
+
+@pytest.mark.parametrize("store, a2", [
+    ("21fc00007200" "0064", 0),         # move.l #OWN_HANDLER,$64.w
+    ("2481", 0x64),                     # move.l d1,(a2)
+    ("48e2" "6000", 0x68),              # movem.l d1-d2,-(a2): the System's, and its own
+    ("21c1" "01aa", 0),                 # move.l d1,Lvl1DT+24.w
+])
+def test_a_handler_of_its_own_put_in_place_between_traps_has_the_run_go_on_in_slices(store, a2):
+    """SimCity puts its own handler in the VIA's interrupt vector with a
+    MOVE, and goes on with no trap for a while: the store's run alone, and
+    the run comes back just after it, to go on in slices, a tick looked at
+    between two instructions."""
+    mem, cpu = machine()
+    at = CODE + 0x1000
+    mem.write(at, bytes.fromhex(store) + COUNT_TWICE)
+    loop = at + len(bytes.fromhex(store))
+    try:
+        with_the_systems_handlers(mem, cpu)
+        cpu.set_d(1, OWN_HANDLER if store != "48e2" "6000" else SYSTEMS_HANDLER)
+        cpu.set_d(2, OWN_HANDLER)
+        cpu.set_a(2, a2)
+        cpu.pc = at
+        assert not cpu.own_interrupts()
+        ev = cpu.run(NEVER)
+        assert (ev.kind, ev.pc) == ("interrupted", loop)
+        assert cpu.own_interrupts()
+        assert mem.r32(COUNTER) == cpu.d(0) == 0
+        # Each slice, the tick taken as the runner takes it: one that came
+        # just before a slice has it end at once, so it may take a few.
+        for _ in range(100):
+            cpu.retrace_pending = False
+            ev = cpu.run(NEVER)
+            assert ev.kind == "interrupted"
+            ahead = 1 if ev.pc == loop + 2 else 0
+            assert mem.r32(COUNTER) == cpu.d(0) + ahead
+            if cpu.d(0) > 0:
+                break
+        assert cpu.d(0) > 0
+    finally:
+        cpu.close()
+
+
+def test_a_store_of_the_systems_own_handler_lets_the_run_go_on():
+    mem, cpu = machine()
+    at = CODE + 0x1000
+    mem.write(at, bytes.fromhex("21fc00007000" "0064"      # move.l #SYSTEMS_HANDLER,$64.w
+                                "31c0" "0100"              # move.w d0,$100.w
+                                "4e71"))
+    try:
+        with_the_systems_handlers(mem, cpu)
+        cpu.set_d(0, 0x1234)
+        cpu.pc = at
+        assert cpu.run(at + 12) == cpu_module.Event("until", at + 12)
+        assert mem.r16(0x100) == 0x1234 and not cpu.own_interrupts()
+    finally:
+        cpu.close()
+
+
+def test_the_clock_lets_a_run_without_slices_go_on_to_its_trap():
+    """A Time Manager task the program's own code has primed comes due
+    between traps: the clock doesn't stop the run, as unicorn, stopped from
+    another thread, would run the instruction it's in again, its stores
+    already made.  It's seen at the trap, and the count in memory keeps
+    step with D2.  The program spins till the third tick sets a word."""
+    mem, cpu = machine()
+    at = CODE + 0x1000
+    mem.write(at, bytes.fromhex("7400"                     # moveq #0,d2
+                                "5290" "5282"              # 1: addq.l #1,(a0); addq.l #1,d2
+                                "4a78" "0100" "67f6"       # tst.w $100.w; beq 1b
+                                "4e71"))
+    end = at + 12
+    ticks = []
+
+    def tick():
+        ticks.append(None)
+        if len(ticks) == 3:
+            mem.w16(0x100, 1)
+    cpu.timers_waiting = lambda: bool(ticks)    # due from the first tick on
+    cpu.on_tick = tick
+    cpu.pc = at
+    try:
+        assert cpu.run(end) == cpu_module.Event("until", end)
+        assert cpu.retrace_pending      # a tick with the task due came as it ran
+        assert mem.r32(COUNTER) == cpu.d(2) > 0
+    finally:
+        cpu.close()
+
+
+def test_a_handler_put_in_place_after_a_store_let_by_is_seen_at_a_tick():
+    """A store to low memory that's let by has the page mapped to be
+    written to, for the rest of the run, and the handler put in place
+    after it isn't held: the clock stops the run at the next tick, as the
+    program waits for its handler with no trap.  The tenth tick would end
+    the wait."""
+    mem, cpu = machine()
+    at = CODE + 0x1000
+    mem.write(at, bytes.fromhex("31c0" "0100"              # move.w d0,$100.w
+                                "21fc00007200" "0064"      # move.l #OWN_HANDLER,$64.w
+                                "4a78" "0102" "67fa"       # 1: tst.w $102.w; beq 1b
+                                "4e71"))
+    end = at + 18
+    ticks = []
+
+    def tick():
+        ticks.append(None)
+        if len(ticks) == 10:
+            mem.w16(0x102, 1)
+    cpu.on_tick = tick
+    try:
+        with_the_systems_handlers(mem, cpu)
+        cpu.pc = at
+        ev = cpu.run(end)
+        assert ev.kind == "interrupted" and at + 12 <= ev.pc < end
+        assert mem.r16(0x102) == 0 and cpu.own_interrupts() and cpu.retrace_pending
     finally:
         cpu.close()
 
@@ -1058,6 +1383,74 @@ def test_cmp2_sets_z_on_a_bound_and_c_outside_them(op, reg, bounds, value, z, c)
         cpu.close()
 
 
+# Where the bounds are, and a long there that points near them.
+BOUNDS, POINTER = 0x7000, 0x7100
+EA_AT = CODE + 0x1000
+
+
+@pytest.mark.parametrize("mode_reg, words, regs, pointer", [
+    (0o21, "", {"a1": BOUNDS}, 0),                                  # (a1)
+    (0o51, "0010", {"a1": BOUNDS - 0x10}, 0),                       # (16,a1)
+    (0o51, "fff0", {"a1": BOUNDS + 0x10}, 0),                       # (-16,a1)
+    (0o61, "2008", {"a1": BOUNDS - 0x20, "d2": 0x18}, 0),           # (8,a1,d2.w)
+    (0o61, "2008", {"a1": BOUNDS + 8, "d2": 0x1234FFF0}, 0),        # d2.w: its word, -16
+    (0o61, "2cfc", {"a1": BOUNDS - 20, "d2": 6}, 0),                # (-4,a1,d2.l*4)
+    (0o61, "b002", {"a1": BOUNDS + 14, "a3": 0x1234FFF0}, 0),       # (2,a1,a3.w)
+    # The 68020's full format: a base displacement, and the base or index suppressed.
+    (0o61, "2320 0080", {"a1": BOUNDS - 0x100, "d2": 0x40}, 0),     # ($80.w,a1,d2.w*2)
+    (0o61, "29b0 00006ff0", {"a1": 0x5000, "d2": 0x10}, 0),         # ($6FF0.l,za1,d2.l)
+    (0o61, "2160 0030", {"a1": BOUNDS - 0x30, "d2": 0x300}, 0),     # ($30.w,a1,zd2)
+    (0o61, "2110", {"a1": BOUNDS - 0x10, "d2": 0x10}, 0),           # (a1,d2.w): a null one
+    # Memory indirect: indexed before the pointer's read, or after it.
+    (0o61, "2122 0020 0006", {"a1": POINTER - 0x30, "d2": 0x10}, BOUNDS - 6),
+    (0o61, "2126 0020 0004", {"a1": POINTER - 0x20, "d2": 0x10}, BOUNDS - 0x14),
+    (0o61, "2131 00000100", {"a1": POINTER - 0x110, "d2": 0x10}, BOUNDS),
+    (0o61, "0163 0008 00000010", {"a1": POINTER - 8}, BOUNDS - 0x10),    # zd0
+    (0o61, "2115", {"a1": POINTER, "d2": 0x10}, BOUNDS - 0x10),     # ([a1],d2.w)
+    (0o70, "7000", {}, 0),                                          # (xxx).w
+    (0o71, "00007000", {}, 0),                                      # (xxx).l
+    # From the PC, which is the extension word's address.
+    (0o73, "2800", {"d2": BOUNDS - EA_AT - 4}, 0),                  # (0,pc,d2.l)
+    (0o73, "2920 0010", {"d2": BOUNDS - EA_AT - 4 - 0x10}, 0),      # ($10.w,pc,d2.l)
+])
+def test_cmp2_finds_its_bounds_at_each_kind_of_address(mode_reg, words, regs, pointer):
+    """The bounds, 5 to 10, are found where the effective address says, so
+    5 is on the lower one; and the run goes on after its extension words.
+    From the Programmer's Reference Manual's effective addressing modes."""
+    mem, cpu = machine()
+    at = EA_AT
+    mem.write(BOUNDS, bytes.fromhex("0005 000a"))
+    mem.w32(POINTER, pointer)
+    code = bytes.fromhex(f"{0x02C0 | mode_reg:04x} 0000 {words}"   # cmp2.w <ea>,d0
+                         "55c4 57c5 4e71")                          # scs d4; seq d5; nop
+    mem.write(at, code)
+    try:
+        cpu.set_d(0, 5)
+        for name, value in regs.items():
+            (cpu.set_a if name[0] == "a" else cpu.set_d)(int(name[1]), value & 0xFFFFFFFF)
+        run_through(cpu_at(cpu, at), at + len(code))
+        assert (cpu.d(5) & 0xFF, cpu.d(4) & 0xFF) == (0xFF, 0)
+    finally:
+        cpu.close()
+
+
+@pytest.mark.parametrize("words", [
+    "2128",                     # bit 3 of a full extension word set
+    "2100",                     # a base displacement size of 0, which is reserved
+    "2114",                     # memory indirect selection 4, reserved
+    "0155",                     # the index suppressed and postindexed
+])
+def test_a_reserved_extension_word_is_an_illegal_instruction(words):
+    mem, cpu = machine()
+    at = EA_AT
+    mem.write(at, bytes.fromhex(f"02f1 0000 {words} 0000 0000 4e71"))  # cmp2.w (...,a1),d0
+    try:
+        cpu.set_a(1, BOUNDS)
+        assert cpu_at(cpu, at).run(at + 14) == ("exception", at, cpu_module.ILLEGAL)
+    finally:
+        cpu.close()
+
+
 def extended(x: float) -> bytes:
     """x as an extended real in memory: its sign and exponent, a word
     unused, and its mantissa."""
@@ -1125,6 +1518,22 @@ def test_fmove_p_takes_a_packed_decimal_real_to_a_register():
         cpu.close()
 
 
+def test_fmove_p_takes_a_packed_decimal_real_from_the_instruction():
+    """FMOVE.P #<data>,FPn has the same first word as an FMOVEM.L of
+    #<data> to the control registers; its second word says which it is."""
+    mem, cpu = machine()
+    at, out = CODE + 0x1000, 0x6100
+    mem.write(at, bytes.fromhex("f23c 4c00"           # fmove.p #1.2345678765E+4,fp0
+                                "00040001 2345678765000000"
+                                "f211 6800"))         # fmove.x fp0,(a1)
+    try:
+        cpu.set_a(1, out)
+        run_through(cpu_at(cpu, at), at + 20)
+        assert mem.read(out, 12).hex() == "400c0000c0e6b70e2c12ad82"
+    finally:
+        cpu.close()
+
+
 def test_fmove_p_to_a_predecrement_leaves_an_twelve_bytes_down():
     """The core takes it for an address error."""
     mem, cpu = machine()
@@ -1170,6 +1579,50 @@ def test_a_packed_decimal_reals_exponent_past_999_raises_operr():
 def test_more_than_17_digits_raises_operr_and_gives_17():
     data, raised = instructions.to_packed(0x3FFF, 0xC000000000000000, 20)
     assert (data.hex(), raised) == ("00000001" "5000000000000000", instructions.OPERR)
+
+
+@pytest.mark.parametrize("se, mantissa, packed, raised", [
+    (0x7FFF, 0, "7fff0000 0000000000000000", 0),                        # infinity
+    (0xFFFF, 1 << 63, "ffff0000 0000000000000000", 0),                  # -infinity
+    (0x7FFF, 0x4000000000000001, "7fff0000 4000000000000001", 0),       # a quiet NaN
+    (0x7FFF, 0x2000000000000000, "7fff0000 6000000000000000", instructions.SNAN),
+    (0x0000, 0, "00000000 0000000000000000", 0),                        # 0
+    (0x8000, 0, "80000000 0000000000000000", 0),                        # -0
+])
+def test_an_infinity_nan_or_zero_as_a_packed_decimal_real(se, mantissa, packed, raised):
+    data, got = instructions.to_packed(se, mantissa, 3)
+    assert (data.hex(), got) == (packed.replace(" ", ""), raised)
+
+
+@pytest.mark.parametrize("x, k", [(9.99, 1), (9.6, 0)])
+def test_a_packed_decimal_real_rounded_up_to_ten(x, k):
+    """To one digit, or none after the point: 1E+1, not 10E+0."""
+    se, _, mantissa = struct.unpack(">HHQ", extended(x))
+    data, raised = instructions.to_packed(se, mantissa, k)
+    assert (data.hex(), raised) == ("00010001" "0000000000000000", instructions.INEX2)
+
+
+def test_a_packed_decimal_real_rounded_up_to_a_power_of_two():
+    """0.99999999999999999 in single precision is 1."""
+    se, mantissa, raised = instructions.from_packed(
+        bytes.fromhex("40010009 9999999999999999"), 1 << instructions.PREC_SHIFT)
+    assert (se, mantissa, raised) == (0x3FFF, 1 << 63, instructions.INEX1)
+
+
+def test_fmove_p_of_too_many_digits_accrues_an_invalid_operation():
+    mem, cpu = machine()
+    at, x, out = CODE + 0x1000, 0x6000, 0x6100
+    mem.write(x, extended(1.5))
+    mem.write(at, bytes.fromhex("f210 4800"           # fmove.x (a0),fp0
+                                "f211 6c12"))         # fmove.p fp0,(a1){#18}
+    try:
+        cpu.set_a(0, x)
+        cpu.set_a(1, out)
+        run_through(cpu_at(cpu, at), at + 8)
+        assert cpu.fpsr & (instructions.OPERR | instructions.AEXC_IOP) == (
+            instructions.OPERR | instructions.AEXC_IOP)
+    finally:
+        cpu.close()
 
 
 @pytest.mark.parametrize("code, fpcr, fpsr", [
@@ -1249,6 +1702,7 @@ def test_setting_the_fpcr_leaves_the_core_as_an_fmove_to_it_does():
     words = cpu_module.FPCR_WORD, cpu_module.FPCR_WORD + 3
 
     def state():
+        cpu._sync()                     # what's changed in the copy, in the core
         cpu.uc.context_update(cpu._ctx)
         return list(cpu._state[cpu._state_at + words[0]:cpu._state_at + words[1]])
     try:

@@ -123,6 +123,9 @@ class PixPat(Record):
     pat1_data = Field(0x14, PATTERN)        # drawn where there's one bit a pixel
 
 
+_PMAP, _PM_TABLE = GDevice.pmap.offset, PixMap.pm_table.offset
+
+
 def deref(mem: RAM, h: int) -> int:
     """Where a handle's block is (0 for no handle, or one purged)."""
     h &= ADDRESS_MASK
@@ -342,9 +345,7 @@ class Devices:
         that (NewGDevice and InitGDevice's, as a video card's driver would
         have them set it up)."""
         mem, heap = self.mem, self.heap
-        data = self._device_table(depth)
-        ct = heap.new_handle(len(data))
-        mem.write(heap.deref(ct), data)
+        ct = heap.new_handle_with(self._device_table(depth))
         pm = heap.new_handle(PIXMAP_SIZE, clear=True)
         write_pixmap(mem, heap.deref(pm), base, row_bytes, rect, depth, ct)
         gdh = heap.new_handle(GDEVICE_SIZE, clear=True)
@@ -355,10 +356,8 @@ class Devices:
         gd.rect = rect
         gd.mode = -1
         if depth <= 8:
-            itab = make_itable(read_table(mem, ct), mem.r32(heap.deref(ct)))
-            ih = heap.new_handle(len(itab))
-            mem.write(heap.deref(ih), itab)
-            gd.i_table = ih
+            gd.i_table = heap.new_handle_with(make_itable(read_table(mem, ct),
+                                                          mem.r32(heap.deref(ct))))
         return gdh
 
     def set_depth(self, depth: int, row_bytes: int, gray: bool = False) -> bool:
@@ -426,10 +425,12 @@ class Devices:
     def table(self) -> list[int]:
         """The main screen's colours, by pixel value, as its colour table
         has them now (each unlike any other: see apart)."""
-        pm = self.pixmap(self.main)
-        h = pm.pm_table if pm is not None else 0
-        p = deref(self.mem, h)
-        seed = self.mem.r32(p) if p else 0
+        mem = self.mem                  # read as pixmap() would, without the views
+        gd = deref(mem, self.main)
+        pm = deref(mem, mem.r32(gd + _PMAP)) if gd else 0
+        h = mem.r32(pm + _PM_TABLE) if pm else 0
+        p = deref(mem, h)
+        seed = mem.r32(p) if p else 0
         if seed != self._table[0]:
             table = read_table(self.mem, h) if self.depth <= 8 else []
             self._raw = table
@@ -487,29 +488,29 @@ _NUDGES = [d for step in range(1, 256)
 
 
 def apart(table: list[int], reserved) -> list[int]:
-    """table, with each entry made unlike any other, if it isn't, by as
-    little as it takes: one whose index is in reserved, and of others
-    alike each but the first.  A window's pixels are kept as colours,
-    and written in the screen buffer as the index of their colour: a
-    pixel drawn in an entry's colour has to go on being written as that
-    entry's index, so that it changes as the entry does.  One reserved
-    for animation does; so does any, when a program sets the entries
-    alike, draws, and sets them back (Zoop fades its screen to black
-    with RestoreEntries, draws its next picture and fades that in).  And
-    black text mustn't change, when an animated colour is black to start
-    with."""
+    """table, with each entry made unlike any other by as little as it
+    takes: one whose index is in reserved, and of others alike each but
+    the first.  A window's pixels are kept as colours, and written in
+    the screen buffer as the index of their colour: a pixel drawn in an
+    entry's colour has to go on being written as that entry's index, so
+    that it changes as the entry does.  One reserved for animation does;
+    so does any, when a program sets the entries alike, draws, and sets
+    them back (Zoop fades its screen to black with RestoreEntries, draws
+    its next picture and fades that in).  And black text mustn't change,
+    when an animated colour is black to start with.  One reserved is
+    changed whether or not another is like it, so that a colour copied
+    from a PixMap of its own colours, the same as it, isn't written as
+    its index: Color QuickDraw matches no colour to it (pixels.encode)."""
+    reserved = {i for i in reserved if 0 <= i < len(table)}
     counts = Counter(table)
-    if len(counts) == len(table):
+    if len(counts) == len(table) and not reserved:
         return table
     out = list(table)
     kept: set[int] = set()
     tried: dict[int, int] = {}      # colour -> how many of _NUDGES its alikes have tried
-    for i in sorted(i for i in reserved if i < len(out)) + [
-            i for i in range(len(out)) if i not in reserved]:
+    for i in sorted(reserved) + [i for i in range(len(out)) if i not in reserved]:
         c = out[i]
-        if counts[c] == 1:
-            continue
-        if i not in reserved and c not in kept:
+        if i not in reserved and (counts[c] == 1 or c not in kept):
             kept.add(c)
             continue
         r, g, b = c >> 16 & 0xFF, c >> 8 & 0xFF, c & 0xFF

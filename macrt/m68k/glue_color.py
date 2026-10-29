@@ -28,7 +28,7 @@ from ..toolbox.qdraw import port_rgb
 from ..toolbox.types import Rect
 from .dispatch import trap
 from .glue_controls import scratch
-from .glue_toolbox import _port
+from .glue_common import _port
 
 HiliteRGB = lowmem.HiliteRGB    # the highlight colour, an RGBColor
 # QDError's results, as Imaging With QuickDraw lists them
@@ -578,11 +578,7 @@ def GetCTable(t, ct_id):
         if not res or not t.mem.r32(res) & ADDRESS_MASK:
             return 0
         data = t.tb.contents(res)
-    heap = t.process.heap
-    h = heap.new_handle(len(data))
-    if h:
-        t.mem.write(heap.deref(h), data)
-    return h
+    return t.process.heap.new_handle_with(data)
 
 
 @trap

@@ -8,13 +8,17 @@ from collections import Counter
 import pytest
 
 from macrt.m68k.glue_pictinfo import PICT_INFO
+from macrt.resfork import Resource
 from macrt.toolbox import pict
 from macrt.toolbox.gdevice import deref
+from macrt.toolbox.memmgr import memFullErr
 from macrt.toolbox.pictutil import WIDEN, Survey, medianMethod, popularMethod
 from macrt.toolbox.qdraw import srcCopy
+from macrt.toolbox.types import Rect
 
-from guest import Guest
-from test_pict import rect, v2
+from guest import Guest, Room
+from test_dialogs import NoDisplay
+from test_pict import direct_bits, rect, tall_pix_pat, v2
 
 returnColorTable, returnPalette, recordComments, recordFontInfo = 1, 2, 4, 8
 suppressBlackAndWhite = 16
@@ -95,6 +99,29 @@ def test_get_pict_info_counts_what_a_picture_draws(g):
     assert g.mem.read(names + spec[7], 7) == b"\x06Geneva"
 
 
+def test_fonts_are_named_by_the_picture_or_the_system(g):
+    """A font the picture names has that name, and the System's family
+    of that name, if there's one, for its sysFontID; one it doesn't name
+    has the System's name for its number."""
+    def font_name(name, font):
+        return 0x002C, struct.pack(">Hh", 2 + len(name), font) + name
+
+    def text_in(font):
+        return (0x0003, struct.pack(">h", font)), (0x0028, struct.pack(">hh", 3, 0) + b"\x01a")
+    data = v2((0, 0, 4, 16), font_name(b"\x06Geneva", 300), font_name(b"\x07Zapfino", 400),
+              *text_in(300), *text_in(400), *text_in(4))
+    info = g.ptr(bytes(PICT_INFO.size))
+    assert g("GetPictInfo", g.handle(data), info, recordFontInfo, 0, 0, 0) == 0
+    got = info_of(g, info)
+    specs, names = deref(g.mem, got["fontHandle"]), deref(g.mem, got["fontNamesHandle"])
+    found = []
+    for i in range(got["uniqueFonts"]):
+        spec = struct.unpack(">hh4LhL", g.mem.read(specs + 26 * i, 26))
+        at = names + spec[7]
+        found.append((spec[0], spec[1], g.mem.read(at + 1, g.mem.r8(at))))
+    assert found == [(300, 3, b"Geneva"), (400, 400, b"Zapfino"), (4, 4, b"Monaco")]
+
+
 def test_what_isnt_asked_for_is_left_nil(g):
     info = g.ptr(b"\xAA" * PICT_INFO.size)
     assert g("GetPictInfo", picture(g), info, 0, 0, 0, 0) == 0
@@ -110,7 +137,13 @@ def test_a_palette_has_the_colours_found_and_a_table_all_asked_for(g):
     assert g("GetPictInfo", picture(g), info, returnColorTable | returnPalette, 8, 0, 0) == 0
     got = info_of(g, info)
     assert len(ctab_colors(g, got["theColorTable"])) == 8
-    assert g.mem.r16(deref(g.mem, got["thePalette"])) == 3
+    palette = got["thePalette"]
+    assert g.mem.r16(deref(g.mem, palette)) == 3
+    rgb, usage, tolerance = g.ptr(bytes(6)), g.ptr(b"\xAA\xAA"), g.ptr(b"\xAA\xAA")
+    g("GetEntryColor", palette, 0, rgb)
+    g("GetEntryUsage", palette, 0, usage, tolerance)
+    assert struct.unpack(">HHH", g.mem.read(rgb, 6)) == RED
+    assert (g.mem.r16(usage), g.mem.r16(tolerance)) == (2, 0)          # pmTolerant, exactly
 
 
 def test_an_extended_header_gives_the_resolution_and_source_rectangle(g):
@@ -128,8 +161,10 @@ def test_an_extended_header_gives_the_resolution_and_source_rectangle(g):
     (0, 0, 0, 1, -11000),                       # pictInfoVersionErr
     (0x20, 0, 0, 0, -11002),                    # pictInfoVerbErr
     (returnColorTable, 0, 0, 0, -11004),        # colorsRequestedErr
+    (returnColorTable, 1, 0, 0, 0),
     (returnPalette, 257, 0, 0, -11004),
     (returnColorTable, 4, 200, 0, -11003),      # cantLoadPickMethodErr: no 'cpmt' 200
+    (returnPalette, 4, 3, 0, -11003),           # no method 3 of the system's
     (recordComments, 0, 200, 0, 0),             # no colours: no method
 ])
 def test_what_get_pict_info_refuses(g, verb, colors, method, version, err):
@@ -137,10 +172,114 @@ def test_what_get_pict_info_refuses(g, verb, colors, method, version, err):
     assert g("GetPictInfo", picture(g), info, verb, colors, method, version) == err
 
 
+def test_the_other_calls_refuse_as_get_pict_info_does(g):
+    """GetPixMapInfo and NewPictInfo check what they're asked as
+    GetPictInfo does, leaving what they'd fill in as it was; a survey
+    that isn't one is pictInfoIDErr."""
+    info, id_p = g.ptr(b"\xAA" * PICT_INFO.size), g.ptr(b"\xAA" * 4)
+    pm = pixmap_handle(g, g.ptr(bytes(4)), 4, (0, 0, 1, 7), 4)
+    assert g("GetPixMapInfo", pm, info, 0, 0, 0, 1) == -11000
+    assert g("NewPictInfo", id_p, 0x20, 0, 0, 0) == -11002
+    assert g("RetrievePictInfo", 1, info, 4) == -11001
+    assert g("RecordPixMapInfo", 1, pm) == -11001
+    assert g.mem.read(info, PICT_INFO.size) == b"\xAA" * PICT_INFO.size
+    assert g.mem.r32(id_p) == 0xAAAAAAAA
+
+
+def test_a_programs_own_colour_picking_method_is_the_popular_one(qapp, caplog):
+    """A 'cpmt' of the program's isn't run, and the log says so: the
+    popular method picks."""
+    g = Guest([Resource(b"cpmt", 128, b"\x4e\x75")], model="ii")
+    picked = []
+    for method in (128, popularMethod):
+        info = g.ptr(bytes(PICT_INFO.size))
+        assert g("GetPictInfo", picture(g), info, returnColorTable, 2, method, 0) == 0
+        picked.append(ctab_colors(g, info_of(g, info)["theColorTable"]))
+    assert picked[0] == picked[1] == [RED, BLUE]
+    assert "cpmt 128" in caplog.text
+
+
+def test_with_no_room_for_a_handle_none_are_left(g, monkeypatch):
+    """With no room for one of the handles asked for, GetPictInfo is a
+    memFullErr, with the record as it was and the handles it made gone."""
+    verb = returnColorTable | returnPalette | recordComments | recordFontInfo
+    pic, room = picture(g), Room(monkeypatch, g)
+    for n in range(6):
+        room.limit(None)
+        info = g.ptr(b"\xAA" * PICT_INFO.size)
+        room.limit(n)
+        err = g("GetPictInfo", pic, info, verb, 4, 0, 0)
+        if n < 5:                   # the table, palette, comments, fonts and names
+            assert err == memFullErr and room.given_back()
+            assert g.mem.read(info, PICT_INFO.size) == b"\xAA" * PICT_INFO.size
+    assert err == 0
+
+
+def test_nil_or_an_empty_handle(g):
+    """GetPictInfo of NIL or of a picture that's been purged is a
+    pictureDataErr; GetPixMapInfo of one finds no pixels."""
+    info = g.ptr(b"\xAA" * PICT_INFO.size)
+    empty = g.handle(b"x")
+    g("EmptyHandle", empty)
+    for h in (0, empty):
+        assert g("GetPictInfo", h, info, 0, 0, 0, 0) == -11005
+    assert g.mem.read(info, PICT_INFO.size) == b"\xAA" * PICT_INFO.size
+    assert g("GetPixMapInfo", empty, info, returnColorTable, 2, 0, 0) == 0
+    got = info_of(g, info)
+    assert got["uniqueColors"] == got["pixMapCount"] == got["bitMapCount"] == 0
+    assert ctab_colors(g, got["theColorTable"]) == [BLACK, BLACK]
+
+
+@pytest.mark.parametrize("model", ["ii", "plus"])
+def test_a_windows_pixels_are_counted_as_they_look(qapp, model):
+    """GetPixMapInfo of a window's pixel map, or of a handle to its
+    portBits, counts its pixels as they're shown, at the screen's depth."""
+    g = Guest(model=model)
+    g.tb._d = NoDisplay()
+    new = "NewCWindow" if model == "ii" else "NewWindow"
+    w = g(new, 0, g.rect_ptr(Rect(40, 40, 100, 200)), g.ptr(b"\x01x"), 1, 0, -1, 0, 0)
+    g("SetPort", w.addr)
+    g("PaintRect", g.rect_ptr(Rect(0, 0, 10, 10)))
+    if model == "ii":
+        h = g.mem.r32(w.addr + 2)                       # its portPixMap
+    else:
+        h = g.ptr(struct.pack(">L", w.addr + 2))        # a master pointer to its portBits
+    info = g.ptr(bytes(PICT_INFO.size))
+    assert g("GetPixMapInfo", h, info, 0, 0, 0, 0) == 0
+    got = info_of(g, info)
+    assert got["uniqueColors"] == 2 and (got["bottom"], got["right"]) == (60, 160)
+    assert got["depth"] == (8 if model == "ii" else 1)
+    assert got["pixMapCount" if model == "ii" else "bitMapCount"] == 1
+
+
+@pytest.mark.parametrize("base, row_bytes, depth", [
+    ("ok", 4, 3),           # no such depth
+    (0, 4, 4),              # no pixels
+    ("ok", 1, 4),           # rows too short for 7 pixels
+    ("end", 4, 4),          # past the end of memory
+])
+def test_pixels_that_cant_be_read_are_a_pixel_map_of_none(g, base, row_bytes, depth):
+    at = {"ok": g.ptr(bytes(4)), "end": g.mem.size - 2}.get(base, base)
+    pm = pixmap_handle(g, at, row_bytes, (0, 0, 1, 7), depth)
+    info = g.ptr(bytes(PICT_INFO.size))
+    assert g("GetPixMapInfo", pm, info, 0, 0, 0, 0) == 0
+    got = info_of(g, info)
+    assert got["uniqueColors"] == 0 and got["pixMapCount"] == 1
+
+
 def test_a_picture_that_cant_be_read_is_a_picture_data_error(g):
     data = v2((0, 0, 4, 4), (0x0001, struct.pack(">H", 4)))     # a region of 4 bytes
     info = g.ptr(bytes(PICT_INFO.size))
     assert g("GetPictInfo", g.handle(data), info, 0, 0, 0, 0) == -11005
+
+
+@pytest.mark.parametrize("op", [
+    direct_bits((0, 0, 4, 8), (0, 0, 4, 8), (0, 0, 4, 8), cmp_count=0),
+    tall_pix_pat(pict.MAX_SIDE + 1),
+])
+def test_pixels_a_picture_cannot_hold_are_a_picture_data_error(g, op):
+    info = g.ptr(bytes(PICT_INFO.size))
+    assert g("GetPictInfo", g.handle(v2((0, 0, 4, 8), op)), info, 0, 0, 0, 0) == -11005
 
 
 def pixmap_handle(g, base, row_bytes, bounds, depth, table=0) -> int:
@@ -160,7 +299,11 @@ def test_get_pixmap_info_reads_the_pixels_through_the_table(g):
     assert g("GetPixMapInfo", pm, info, returnColorTable, 2, 0, 0) == 0
     got = info_of(g, info)
     assert got["uniqueColors"] == 2 and got["pixMapCount"] == 1 and got["depth"] == 4
-    assert ctab_colors(g, got["theColorTable"]) == [(0x1234, 0x5678, 0x9ABC), WHITE]
+    odd = (0x1234, 0x5678, 0x9ABC)
+    assert ctab_colors(g, got["theColorTable"]) == [odd, WHITE]
+    pm = pixmap_handle(g, g.ptr(bytes([0, 1, 1])), 4, (0, 0, 1, 3), 8, table)    # 8 bits
+    assert g("GetPixMapInfo", pm, info, returnColorTable, 2, 0, 0) == 0
+    assert ctab_colors(g, info_of(g, info)["theColorTable"]) == [odd, WHITE]
 
 
 def test_a_32_bit_pixel_map_is_counted_to_5_bits_a_component(g):
@@ -205,6 +348,8 @@ def test_a_survey_of_pictures_and_pixel_maps(g):
     assert g("RecordPixMapInfo", pict_id, pixmap_handle(g, base, 8, (0, 0, 1, 2), 32)) == 0
     info = g.ptr(bytes(PICT_INFO.size))
     assert g("RetrievePictInfo", pict_id, info, 5) == -11004      # more than NewPictInfo's
+    assert g("RetrievePictInfo", pict_id, info, 0) == -11004
+    assert g("RetrievePictInfo", pict_id, info, 1) == 0
     assert g("RetrievePictInfo", pict_id, info, 4) == 0
     got = info_of(g, info)
     assert got["pixMapCount"] == 3 and got["rectCount"] == 2 and got["commentCount"] == 4

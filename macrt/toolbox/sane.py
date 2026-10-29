@@ -675,7 +675,7 @@ def format_decimal(fixed: bool, digits: int, d: Decimal) -> bytes:
         return lead + b"INF"
     if first == b"?":
         return b"?"
-    sig = _leading(d.sig, DIGITS)
+    sig = _leading(d.sig, DIGITS)[:MAX_DIGITS]     # a 20th digit only says there's more
     zero = not sig or first == b"0"
     if fixed:
         digits = max(digits, 0)

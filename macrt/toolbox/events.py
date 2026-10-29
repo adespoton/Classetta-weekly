@@ -207,10 +207,27 @@ class EventQueue:
         # The system event mask, for a 68k program's queue: the event types
         # it leaves out aren't posted, as keyUp isn't unless a program asks
         self.enabled: Callable[[], int] | None = None
+        # When, by the host's clock, the program last asked for an event
+        # (or whether the button or a key is down), last read the clock and
+        # last waited for an event, and whether it's waiting for one now:
+        # so a survey can tell it's waiting for input
+        self.asked_at = float("-inf")
+        self.timed_at = float("-inf")
+        self.waited_at = float("-inf")
+        self.waiting = False
 
     def input_state(self) -> tuple[Point, int]:
         """Where the mouse is and which modifier keys are down, now."""
         return self._input_state()
+
+    def asked(self) -> None:
+        """The program asked whether the button or a key is down, as one
+        that waits for a click or a key by asking over and over does."""
+        self.asked_at = time.monotonic()
+
+    def timed(self) -> None:
+        """The program read the clock, as one waiting for a time does."""
+        self.timed_at = time.monotonic()
 
     def post(self, ev: EventRecord) -> bool:
         """Queue ev; False if the system event mask leaves its type out."""
@@ -310,6 +327,7 @@ class EventQueue:
             while True:
                 if self._killed:
                     raise ProcessKilled()
+                self.asked_at = time.monotonic()
                 ev = self._take(mask, next_update, remove)
                 if ev is not None:
                     return True, ev
@@ -323,13 +341,20 @@ class EventQueue:
                     where, mods = self._input_state()
                     return False, EventRecord(nullEvent, 0, tick_count(), where, mods)
                 # Moving the mouse posts nothing: look again now and then.
-                self._cond.wait(remaining if mouse_rgn is None else min(remaining, MOUSE_LOOK))
+                self.waiting = True
+                try:
+                    self._cond.wait(remaining if mouse_rgn is None
+                                    else min(remaining, MOUSE_LOOK))
+                finally:
+                    self.waiting = False
+                    self.waited_at = time.monotonic()
 
     def peek(self, mask: int, next_update: Callable[[], Any]) -> tuple[bool, EventRecord]:
         """EventAvail: the event get would return, left in the queue."""
         with self._cond:
             if self._killed:
                 raise ProcessKilled()
+            self.asked_at = time.monotonic()
             ev = self._take(mask, next_update, remove=False)
             if ev is not None:
                 return True, ev

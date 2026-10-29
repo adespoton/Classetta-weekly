@@ -327,6 +327,24 @@ def test_a_thngs_version_is_asked_for_and_the_latest_kept(qapp):
     assert latest and g.find() == latest and g.find(latest) == 0
 
 
+def test_a_thng_older_than_one_registered_leaves_no_code(qapp, monkeypatch):
+    g = resource_runner(Resource(b"thng", 128, thng(extension=(0, cm.componentDoAutoVersion, 0))),
+                        Resource(b"thng", 130, thng(extension=(0x30000, 1, 0))))
+    res = g.process.resources
+    assert g.cm(0x12, ("L", res.GetResource("thng", 130)), ("h", 0))
+    loaded = []
+    load = cm._load
+
+    def spy(t, comp):
+        ok = load(t, comp)
+        loaded.append(comp.code_handle)
+        return ok
+    monkeypatch.setattr(cm, "_load", spy)
+    assert g.cm(0x12, ("L", res.GetResource("thng", 128)), ("h", 0)) == 0     # older
+    assert g.log() == [-1, -4, -2] and loaded and loaded[0]
+    assert not g.heap.is_handle(loaded[0])
+
+
 def test_every_thng_in_a_file_is_registered(qapp):
     g = resource_runner(Resource(b"thng", 128, thng()), Resource(b"thng", 129, thng()))
     refnum = g.process.resources.CurResFile()

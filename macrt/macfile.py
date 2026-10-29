@@ -37,7 +37,7 @@ from typing import Iterator, Protocol
 
 import machfs
 import machfs.main
-from machfs.btree import dump_btree, unpack_extent_record
+from machfs.btree import unpack_extent_record
 
 from . import moof
 from .resfork import InvalidForkError, is_fork, open_fork
@@ -470,6 +470,34 @@ class OnDisk(machfs.File):
         self._read["rsrc"] = value
 
 
+def _node(tree, n: int) -> tuple[int, list[bytes]]:
+    """A B*-tree node's forward link (ndFLink) and its records."""
+    at = 512 * n
+    link, count = struct.unpack_from(">L6xH", tree, at)
+    offsets = struct.unpack_from(f">{count + 1}H", tree, at + 512 - 2 * (count + 1))[::-1]
+    return link, [bytes(tree[at + a:at + b]) for a, b in zip(offsets, offsets[1:])]
+
+
+def _leaf_records(tree) -> Iterator[bytes]:
+    """A B*-tree's leaf records in order, as machfs's dump_btree reads them:
+    from bthFNode through each leaf's ndFLink to bthLNode.  But no node is
+    read twice, so a damaged tree whose links go round is a damaged tree,
+    not one read for ever."""
+    header = _node(tree, 0)[1][0]
+    first, last = struct.unpack_from(">LL", header, 10)
+    seen: set[int] = set()
+    n = first
+    while first:                                        # 0: no leaves
+        if n in seen:
+            raise ValueError("its B*-tree's leaves link round in a circle")
+        seen.add(n)
+        n_next, records = _node(tree, n)
+        yield from records
+        if n == last:
+            return
+        n = n_next
+
+
 def _read_hfs(data) -> machfs.Volume:
     """An HFS volume (Inside Macintosh IV, the File Manager, "Data
     Organization on Volumes") as machfs reads one, without its Desktop
@@ -494,6 +522,7 @@ def _read_hfs(data) -> machfs.Volume:
         """Where a fork's bytes are on the disk: its first extents', then
         the extents overflow file's."""
         out, blocks, wanted = [], 0, -(-length // block_size)
+        looked: set[int] = set()
         while True:
             for start, count in unpack_extent_record(extents):
                 where = first * 512 + start * block_size
@@ -501,20 +530,23 @@ def _read_hfs(data) -> machfs.Volume:
                 blocks += count
             if blocks >= wanted:
                 return out
+            if blocks in looked:                # an overflow record of no blocks
+                raise ValueError(f"file {cnid}'s extents end at block {blocks}")
+            looked.add(blocks)
             extents = overflow[kind, cnid, blocks]
 
     def fork(at: int, cnid: int) -> bytes:  # one of the volume's own files, named in the MDB
         length, extents = struct.unpack_from(">I12s", disk, mdb + at)
         return b"".join(disk[a:b] for a, b in spans(length, extents, cnid, 0))[:length]
 
-    for rec in dump_btree(fork(130, 3)):                # the extents overflow file
+    for rec in _leaf_records(fork(130, 3)):             # the extents overflow file
         if rec[0] == 7:
             kind, cnid, start, extents = struct.unpack_from(">xBLH12s", rec)
             if kind in (0, 0xFF):                       # a data fork's, a resource fork's
                 overflow[kind, cnid, start] = extents
     cnids: dict[int, machfs.Folder | machfs.File] = {}
     children = []
-    for rec in dump_btree(fork(146, 4)):                # the catalog
+    for rec in _leaf_records(fork(146, 4)):             # the catalog
         if not rec[0]:
             continue
         parent, length = struct.unpack_from(">LB", rec, 2)
@@ -538,6 +570,13 @@ def _read_hfs(data) -> machfs.Volume:
     for parent, name, node in children:
         if parent != 1:
             cnids[parent][name] = node
+    seen, todo = set(), [cnids[2]]
+    while todo:                                         # a folder that is in itself?
+        folder = todo.pop()
+        if id(folder) in seen:
+            raise ValueError("a folder on it is inside itself")
+        seen.add(id(folder))
+        todo.extend(v for v in folder.values() if isinstance(v, machfs.Folder))
     vol = machfs.Volume()
     vol.update(cnids[2])
     for name in ("Desktop", "Desktop DB", "Desktop DF"):
@@ -749,12 +788,18 @@ def _side_files(path: Path) -> list[tuple[Path, str | None]]:
             (path.with_name("%" + name), "either")]
 
 
-def load_file(path: str | os.PathLike, folder: Folder | None = None) -> MacFile:
+def load_file(path: str | os.PathLike, folder: Folder | None = None, *,
+              links: bool = True) -> MacFile:
     """One Mac file from the host, whatever form it's in.  path may also
-    name one of the side files (._app, %app, app.rsrc)."""
+    name one of the side files (._app, %app, app.rsrc).  With links False,
+    no side file is read through a symbolic link: one may lead anywhere."""
     path = Path(path)
     folder = folder or HostFolder(path.parent)
     name = path.name
+    top = path.parent.resolve()
+
+    def readable(p: Path) -> bool:
+        return links or (not p.is_symlink() and p.resolve().is_relative_to(top))
     try:
         raw = path.read_bytes()
     except FileNotFoundError:
@@ -780,7 +825,7 @@ def load_file(path: str | os.PathLike, folder: Folder | None = None) -> MacFile:
                 name = name[:-5]
             data_path = path.with_name(name)
             data = (data_path.read_bytes() if data_path != path and data_path.is_file()
-                    else b"")
+                    and readable(data_path) else b"")
             path = data_path
         else:
             data = entries.get(AS_DATA, b"")
@@ -792,12 +837,14 @@ def load_file(path: str | os.PathLike, folder: Folder | None = None) -> MacFile:
 
     if name.startswith("%"):                            # Executor's resource fork
         data_path = path.with_name(name[1:])
-        data = data_path.read_bytes() if data_path.is_file() else b""
+        data = data_path.read_bytes() if data_path.is_file() and readable(data_path) else b""
         return MacFile(name[1:], data, raw, key=str(data_path), folder=folder)
 
     f = MacFile(name, raw, key=str(path), folder=folder)
     for side_path, kind in _side_files(path):
         try:
+            if not readable(side_path):
+                continue
             blob = side_path.read_bytes()
             parsed = _parse_apple_single(blob) if kind else None
         except (OSError, ValueError):
@@ -814,7 +861,7 @@ def load_file(path: str | os.PathLike, folder: Folder | None = None) -> MacFile:
         if f.rsrc:
             break
     finf = path.parent / ".finf" / name                 # Basilisk II's Finder info
-    if finf.is_file():
+    if finf.is_file() and readable(finf):
         _apply_finder_info(f, finf.read_bytes())
     elif f.type == b"????":
         _apply_finder_info(f, _host_finder_info(path))

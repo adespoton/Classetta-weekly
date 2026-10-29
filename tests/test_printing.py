@@ -220,6 +220,15 @@ def test_page_setup_chooses_the_paper(qapp, tmp_path, monkeypatch):
     assert pdf_pages(path) == [(842, 595)]
 
 
+def test_a_pdf_is_named_for_its_window_as_far_as_the_host_allows(tmp_path):
+    assert pr.pdf_name("Memo: 1/2") == "Memo- 1-2.pdf" and pr.pdf_name("  ") == "Printout.pdf"
+    name = pr.pdf_name("é" * 255)                       # two bytes each on the host
+    assert name == "é" * (pr.NAME_BYTES // 2) + ".pdf"
+    (tmp_path / name).write_bytes(b"")
+    assert pr.unique(tmp_path / name).name == "é" * (pr.NAME_BYTES // 2) + " 2.pdf"
+    (tmp_path / pr.unique(tmp_path / name)).write_bytes(b"")
+
+
 def test_cancelling_prints_nothing(qapp, monkeypatch):
     answer(monkeypatch, None, None)
     g = Guest()

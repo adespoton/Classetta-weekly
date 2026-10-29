@@ -81,6 +81,7 @@ class Screen:
         table = self.devices.table() if self.devices is not None else None
         self.bits = MemorySurface(self.mem, self.base, self.row_bytes, self.bounds,
                                   self.depth, table)
+        self.bits.match = self.devices.matching() if self.devices is not None else None
         self.seen = bytearray(self.mem.read(self.base, self.size))  # the buffer, last we looked
         self.repaints: dict[Process, Callable[[WindowRecord], None]] = {}
         # The processes front to back; the Display says, once there is one.
@@ -124,6 +125,7 @@ class Screen:
             self.size = self.row_bytes * self.bounds.height
             self.bits = MemorySurface(self.mem, self.base, self.row_bytes, self.bounds,
                                       self.depth, self.devices.table())
+            self.bits.match = self.devices.matching()
             self.shown = self.bits
             self.over_bar = Region()
             self._layout = None
@@ -256,7 +258,7 @@ class Screen:
         table = self.devices.table()
         if table is self.bits.table:
             return
-        self.bits.table = table
+        self.bits.table, self.bits.match = table, self.devices.matching()
         self._pull()
         for w, mine in self._owners:
             self._show(w, mine)
@@ -359,19 +361,18 @@ class Screen:
             if shown is alt:
                 self.desk_drawn = True
                 self._alt_seen = self.mem.read(alt.base, self.size)
-        elif shown is alt:
+        elif shown is alt and not self.mem.same(alt.base, self._alt_seen):
             now = self.mem.read(alt.base, self.size)
-            if now != self._alt_seen:
-                changed = self._changes(now, self._alt_seen).bbox
-                self._alt_seen = now
+            changed = self._changes(now, self._alt_seen).bbox
+            self._alt_seen = now
         if changed is not None and self.on_desk is not None:
             self.on_desk(changed)
 
     # -- the program's pixels into the windows -------------------------------
     def _pull(self) -> None:
-        now = self.mem.read(self.base, self.size)
-        if now == self.seen:
+        if self.mem.same(self.base, self.seen):
             return
+        now = self.mem.read(self.base, self.size)
         changed = self._changes(now, self.seen)
         self.seen[:] = now
         for w, mine in self._owners:

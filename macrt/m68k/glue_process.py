@@ -35,22 +35,15 @@ def free_temp_memory(t) -> None:
     """When an application quits: what it didn't dispose of."""
     with t.system.lock:
         for h in t.temp_handles:
-            heap = _temp_heap_of(t, h)
+            heap = t.system.find_heap(h)
             if heap is not None:
                 heap.dispose_handle(h)
     t.temp_handles.clear()
 
 
-def _temp_heap_of(t, h: int):
-    try:
-        return t.system.heap_of(h)
-    except ValueError:
-        return None
-
-
 def _temp_op(t, h: int, err_p: int, op) -> None:
     h &= ADDRESS_MASK
-    heap = _temp_heap_of(t, h) if h in t.temp_handles else None
+    heap = t.system.find_heap(h) if h in t.temp_handles else None
     if heap is None:
         t.w16(err_p, memWZErr)
         return
@@ -201,7 +194,7 @@ def GetProcessInformation(t, psn_p, info_p):
     if spec:                        # an FSSpec: the application, by name
         mem.w16(spec, 0)
         mem.w32(spec + 2, 0)
-        t.set_str255(spec + 6, proc.app.name[:63] if proc.app is not None else proc.name)
+        t.set_str255(spec + 6, (proc.app.name if proc.app is not None else proc.name)[:63])
     return noErr
 
 

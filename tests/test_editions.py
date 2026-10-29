@@ -176,6 +176,25 @@ def test_a_subscriber_cannot_write_nor_a_publisher_read(qapp):
     assert t("CloseEdition", ref, 0) == fm.rfNumErr
 
 
+def test_a_publisher_writes_no_further_than_the_volume_has_free(qapp):
+    """The mark may be set anywhere, but a write past what the volume has
+    free is dskFulErr; one short of it is padded with zeros as ever."""
+    t = app()
+    spec, node = edition(t)
+    _, pub = new_section(t, spec, ed.stPublisher)
+    rp = t.ptr(bytes(4))
+    assert t("OpenNewEdition", pub, code(b"MACR"), 0, rp) == fm.noErr
+    ref = t.mem.r32(rp)
+    x = t.ptr(b"x")
+    assert t("WriteEdition", ref, code(b"TEXT"), x, 0) == fm.noErr
+    assert t("SetEditionFormatMark", ref, code(b"TEXT"), 0x10000000) == fm.noErr
+    assert t("WriteEdition", ref, code(b"TEXT"), x, 1) == fm.dskFulErr
+    assert t("SetEditionFormatMark", ref, code(b"TEXT"), 2) == fm.noErr
+    assert t("WriteEdition", ref, code(b"TEXT"), x, 1) == fm.noErr
+    assert t("CloseEdition", ref, 1) == fm.noErr
+    assert ed.parse(bytes(node.fork(False))) == [[b"TEXT", b"\0\0x"]]
+
+
 def test_an_edition_not_written_successfully_is_not_kept(qapp):
     t = app()
     spec, node = edition(t)

@@ -361,6 +361,14 @@ def test_format_decimal(fixed, digits, sgn, exp, sig, want):
     assert sane.format_decimal(fixed, digits, d) == want.encode()
 
 
+def test_more_than_19_digits_are_written_as_their_first_19():
+    """Past 19 digits, a decimal record's 20th only says there's more,
+    as from_decimal reads it: it isn't another place."""
+    d, _, _ = sane.scan(b"123456789012345678901", 0)
+    assert sane.format_decimal(False, 21, d) == b" 1.23456789012345678900e+20"
+    assert sane.format_decimal(True, 0, d) == b"123456789012345678900"
+
+
 # =========================================================================
 # Elementary functions
 # =========================================================================

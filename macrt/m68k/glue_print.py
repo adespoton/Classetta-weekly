@@ -36,7 +36,7 @@ from ..toolbox.quickdraw import BitMap, GrafPort
 from ..toolbox.types import Rect
 from .dispatch import trap
 from .glue_pict import SetStdProcs
-from .glue_toolbox import _the_port_var
+from .glue_common import _the_port_var
 
 log = logging.getLogger("macrt.print")
 
@@ -89,28 +89,27 @@ def _error(t) -> int:
 # =========================================================================
 # The print record
 # =========================================================================
-def _heap(t, h: int):
+def _record_heap(t, h: int):
     """The heap a print record's handle is in, or None: the Printing
     Manager only dereferences it, and MacWrite's is a pointer to a
     pointer to a record on its stack."""
-    try:
-        return t.system.heap_of(h)
-    except ValueError:
-        return None
+    return t.system.find_heap(h)
 
 
 def _record(t, h: int) -> bytes:
     p = t.mem.r32(h) & ADDRESS_MASK if h else 0
     if not p:
         return b""
-    heap = _heap(t, h)
+    heap = _record_heap(t, h)
     size = heap.handle_size(h) if heap is not None else pr.PRINT_SIZE
     return t.mem.read(p, min(size, pr.PRINT_SIZE))
 
 
 def _put_record(t, h: int, rec: bytes) -> None:
-    """Into a handle at least as big as a print record."""
-    heap = _heap(t, h)
+    """Into a handle at least as big as a print record; NIL has none."""
+    if not h:
+        return
+    heap = _record_heap(t, h)
     if heap is not None and heap.handle_size(h) < pr.PRINT_SIZE:
         heap.set_handle_size(h, pr.PRINT_SIZE)
     p = t.mem.r32(h) & ADDRESS_MASK
@@ -461,8 +460,6 @@ def _write(t, st: State, job: pr.Job) -> None:
     st.printed.append(path)
     n = len(job.pages)
     log.info("printed %d page%s to %s", n, "" if n == 1 else "s", path)
-    if not path.exists():
-        _set_error(t, pr.iPrSavPFil)
 
 
 @trap
@@ -559,7 +556,6 @@ def _raw_screen(t, st: State, which: int) -> None:
     t.system.screen.look()
     _raw_bits(t, st, bm, r, 0)
     heap.dispose_ptr(bm)
-    _raw_page(t, st, end=True)
     end_raw(t)
 
 

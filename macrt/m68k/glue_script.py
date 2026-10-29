@@ -20,7 +20,7 @@ from ..toolbox.memmgr import noErr
 from ..ui import keymap
 from .dispatch import raw, trap
 from .glue_intl import record
-from .glue_toolbox import _port
+from .glue_common import _port
 
 memFullErr = -108
 

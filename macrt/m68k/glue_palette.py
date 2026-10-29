@@ -1,5 +1,5 @@
 """
-The Palette Manager (Inside Macintosh V-151 to V-166): a window's palette
+The Palette Manager (Inside Macintosh V): a window's palette
 of colours, which the main screen's colour table is given when the
 window is in front, and that the window draws in.
 
@@ -31,7 +31,7 @@ change (animating isn't a change), each window that asked for colour
 updates (SetPalette's cUpdates, NSetPalette's nCUpdates) has the
 screen's rectangle added to its update region: the front window if it
 wants updates for changes its own palette makes, the others if they
-want them for changes another's makes (Inside Macintosh V-157, V-162).
+want them for changes another's makes.
 
 A pixel map whose colour table has bit 14 of its ctFlags set has, for
 each pixel value, an entry of a palette in its value field "instead of its
@@ -51,11 +51,12 @@ from ..toolbox.qdraw import rgb_argb
 from ..toolbox.windows import WindowRecord
 from .dispatch import trap
 from .glue_color import RESERVED, _new_colors, _pixmap, _rgb, _set_rgb
-from .glue_toolbox import _port, front_changed
+from .glue_common import _heap, _port
+from .glue_windows import front_changed
 
 pmCourteous, pmDithered, pmTolerant, pmAnimated, pmExplicit = 0, 1, 2, 4, 8
 # The usages that keep an entry off a device of a depth: a grey one, a
-# colour one (Inside Macintosh VI-20-16).
+# colour one (Inside Macintosh VI, Palette Manager).
 INHIBIT = {2: (0x0100, 0x0200), 4: (0x0400, 0x0800), 8: (0x1000, 0x2000)}
 HEADER = INFO = 16
 MAX_ENTRIES = 4095
@@ -95,13 +96,6 @@ def _infos(t, h: int) -> list[tuple[tuple[int, int, int], int, int]]:
     data = t.mem.read(_record(t, h) + HEADER, INFO * n) if n else b""
     return [(struct.unpack_from(">HHH", data, INFO * i),
              *struct.unpack_from(">HH", data, INFO * i + CI_USAGE)) for i in range(n)]
-
-
-def _heap(t, h: int):
-    try:
-        return t.system.heap_of(h)
-    except ValueError:
-        return t.process.heap
 
 
 def _resize(t, h: int, n: int) -> int:
@@ -153,10 +147,7 @@ def _get_new_palette(t, palette_id: int) -> int:
     for i in range(n):
         at = HEADER + INFO * i + 10
         data[at:at + 6] = bytes(6)
-    h = t.process.heap.new_handle(len(data))
-    if h:
-        t.mem.write(t.process.heap.deref(h), bytes(data))
-    return h
+    return t.process.heap.new_handle_with(bytes(data))
 
 
 # -- which palette is a window's ----------------------------------------------
@@ -625,7 +616,7 @@ def Palette2CTab(t, h, ct_h):
 def CopyPalette(t, src, dst, src_entry, dst_entry, dst_length):
     """Entries from dst_entry on get the colours, usages and tolerances of
     the source's from src_entry on, the destination made longer if it
-    needs to be (Inside Macintosh VI-20-21)."""
+    needs to be (Inside Macintosh VI, Palette Manager)."""
     if not src or not dst or not _record(t, src) or not _record(t, dst) or dst_length <= 0:
         return
     if src_entry < 0 or dst_entry < 0:

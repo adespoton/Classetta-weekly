@@ -249,15 +249,26 @@ def read_pixmap(r: Reader) -> tuple[int, int, int]:
     return pack_type, pixel_size, cmp_count
 
 
+def check_size(width: int, height: int, pixel_size: int) -> None:
+    """PictError unless a picture's bitmap or pixel map is one it may
+    hold: at most MAX_SIDE each way, at a depth QuickDraw has."""
+    if (not 0 < width <= MAX_SIDE or not 0 < height <= MAX_SIDE
+            or pixel_size not in (1, 2, 4, 8, 16, 32)):
+        raise PictError(f"a {width}x{height} {pixel_size}-bit bitmap")
+
+
 def read_pixels(r: Reader, row_bytes: int, height: int, packed: bool, pack_type: int = 0,
                 width: int = 0, pixel_size: int = 1, cmp_count: int = 1) -> list[bytes]:
     """Pixel data, row by row.  Rows narrower than 8 bytes are never
     packed; packed rows each start with their length, a byte if rowBytes
     is 250 or less, else a word.  packType 1 is unpacked, 2 is 32-bit
     pixels as 3 bytes, unpacked, 3 is PackBits by the word (16-bit), 4 is
-    PackBits of each component's row in turn (32-bit)."""
+    PackBits of each component's row in turn (32-bit: 3 components, or 4
+    with alpha first; PictError for none, or more than 4)."""
     if pack_type == 0:
         pack_type = {16: 3, 32: 4}.get(pixel_size, 0)
+    if pack_type == 4 and packed and row_bytes >= 8 and not 0 < cmp_count <= 4:
+        raise PictError(f"{cmp_count} components packed")
     if not packed or row_bytes < 8 or pack_type == 1:
         return [r.read(row_bytes) for _ in range(height)]
     if pack_type == 2:
@@ -325,7 +336,8 @@ def pixel_image(rows: list[bytes], width: int, height: int, pixel_size: int,
         rgb = bytearray(3 * width)
         if pack_type == 2:
             rgb[:] = row[:3 * width].ljust(3 * width, b"\0")
-        elif len(row) >= cmp_count * width and pack_type != 1 and len(row) != 4 * width:
+        elif (cmp_count in (3, 4) and len(row) >= cmp_count * width and pack_type != 1
+              and len(row) != 4 * width):
             at = width if cmp_count == 4 else 0             # alpha first, if it's there
             for c in range(3):
                 rgb[c::3] = row[at + c * width:at + (c + 1) * width]
@@ -334,6 +346,8 @@ def pixel_image(rows: list[bytes], width: int, height: int, pixel_size: int,
             for c in range(3):
                 rgb[c::3] = row[c + 1::4]
         out += rgb
+    if len(out) != 3 * width * height:
+        raise PictError(f"{len(out)} bytes of pixels for {width}x{height}")
     return QImage(bytes(out), width, height, 3 * width, QImage.Format.Format_RGB888).copy()
 
 
@@ -591,7 +605,8 @@ class Player:
             pack_type, pixel_size, cmp_count = read_pixmap(Reader.of(bytes(rest)))
             rest[2:8] = bytes(6)                # packType, packSize: its pixels are unpacked
             table = read_ctab_record(r)
-            height = max(bounds.height, 0)
+            height = bounds.height
+            check_size(bounds.width, height, pixel_size)
             rows = read_pixels(r, row_bytes, height, True, pack_type, bounds.width,
                                pixel_size, cmp_count)
             pixmap = struct.pack(">LH4h", 0, PIXMAP_FLAG | row_bytes, *bounds) + rest
@@ -659,9 +674,7 @@ class Player:
         mode = r.u16()
         mask = self.map_rgn(r.rgn()) if op & 1 else None
         width, height = bounds.width, bounds.height
-        if (not 0 < width <= MAX_SIDE or not 0 < height <= MAX_SIDE
-                or pixel_size not in (1, 2, 4, 8, 16, 32)):
-            raise PictError(f"a {width}x{height} {pixel_size}-bit bitmap")
+        check_size(width, height, pixel_size)
         rows = read_pixels(r, row_bytes, height, op >= 0x98, pack_type, width, pixel_size,
                            cmp_count)
         img = pixel_image(rows, width, height, pixel_size, ctab, pack_type, cmp_count)
@@ -669,9 +682,16 @@ class Player:
         color = (direct or ctab is not None) and self.qd.depth(self.port) > 1
         if not color:
             img, mode = to_mono(img, bool(mode & DITHER_COPY)), transfer_mode(mode)
-        if src.empty:
+        part = src.sect(bounds)             # there are pixels only in the bounds
+        if part.empty:
             return
-        img = img.copy(QRect(src.left - bounds.left, src.top - bounds.top, src.width, src.height))
+        if part != src:                     # and so to only part of dst
+            def at(v: int, h: int) -> tuple[int, int]:
+                return (dst.top + (v - src.top) * dst.height // src.height,
+                        dst.left + (h - src.left) * dst.width // src.width)
+            dst = Rect(*at(part.top, part.left), *at(part.bottom, part.right))
+        img = img.copy(QRect(part.left - bounds.left, part.top - bounds.top, part.width,
+                             part.height))
         self.qd.draw_bits(self.port.addr + 2, self.map_rect(dst), img, mode, mask, self.port,
                           color=color)
 

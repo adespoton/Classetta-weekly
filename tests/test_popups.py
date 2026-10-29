@@ -31,7 +31,7 @@ class Host:
     def __init__(self, chosen=0):
         self.chosen = chosen
         self.seen = []
-        self.bridge = SimpleNamespace(call=lambda fn, *args, serve=None: fn(*args))
+        self.bridge = SimpleNamespace(call=lambda fn, *args, serve=None, killed=None: fn(*args))
 
     def track_popup(self, process, m, at, item):
         self.seen.append((m.id, at, item, [it.mark for it in m.items]))

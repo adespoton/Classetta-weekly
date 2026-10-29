@@ -16,7 +16,7 @@ from macrt.toolbox.gdevice import PIXMAP_SIZE, PixMap, deref
 from macrt.toolbox.types import Point
 
 from conftest import Recorder
-from guest import Guest
+from guest import Guest, Room
 
 WHITE, BLACK, RED = (0xFFFF, 0xFFFF, 0xFFFF), (0, 0, 0), (0xFFFF, 0, 0)
 CLEAR = (0, 0, 0, 0)
@@ -112,6 +112,32 @@ def test_a_colour_cursor(qapp):
     assert g.process.cursor_shown == cursors.mono(BOX)
     g("DisposeCCursor", h)
     assert g.process.cursor_shown == cursors.mono(BOX)      # still shown
+
+
+def test_get_c_cursor_with_no_room_gives_back_what_it_made(qapp, monkeypatch):
+    pixels = b"\xAA\xAA\x00\x00" * 16
+    g = Guest([Resource(b"crsr", 128, crsr(pixels, [WHITE, BLACK, RED, BLACK], BOX)),
+               Resource(b"crsr", 130, crsr(pixels, [WHITE, BLACK, RED, BLACK], BOX)[:90])],
+              model="ii")
+    assert g("GetCCursor", 130) == 0                    # shorter than a CCrsr
+    assert g("GetCCursor", 128)                         # and now the resource is in memory
+    room = Room(monkeypatch, g)
+    for blocks in range(20):
+        room.limit(blocks)
+        h = g("GetCCursor", 128)
+        if h:
+            break
+        assert room.given_back()
+    assert blocks == 7 and g.contents(struct.unpack(">L", g.mem.read(deref(g.mem, h) + 6, 4))[0]) \
+        == pixels
+
+
+def test_set_and_dispose_c_cursor_pass_over_nil_and_what_isnt_a_handle(g):
+    g("SetCursor", g.ptr(BOX))
+    for h in (0, g.mem.size - 2):
+        g("SetCCursor", h)
+        g("DisposeCCursor", h)
+    assert g.process.cursor_shown == cursors.mono(BOX)
 
 
 def test_the_screen_shows_the_front_programs_cursor(harness):

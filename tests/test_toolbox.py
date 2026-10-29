@@ -2,6 +2,8 @@
 
 import math
 import struct
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +11,7 @@ from guest import Guest, Processor
 
 from macrt.m68k import dispatch, runtime
 from macrt.m68k.glue_os import Gestalt
+from macrt.memory import RAM, BusError
 from macrt.toolbox import constants as k
 from macrt.toolbox import lowmem, system
 from macrt.toolbox.events import EventQueue, EventRecord, ProcessKilled
@@ -104,6 +107,84 @@ def test_balloons_are_never_shown_but_their_settings_are_kept(qapp):
     assert get("HMGetMenuResID", 128) == 300
 
 
+def test_help_menu_resource_ids_through_the_trap(qapp):
+    """HMGetMenuResID(menuID, VAR resID) takes three words and
+    HMSetMenuResID(menuID, resID) two, as their selectors say: each leaves
+    its OSErr in the word pushed for it, and the stack as it was."""
+    m = Processor()
+    var = m.ptr(bytes(2))
+    get = struct.pack(">HHHHIHHH", 0x4267, 0x3F3C, 128, 0x4879, var, 0x303C, 0x0314, 0xA830)
+    put = struct.pack(">HHHHHHHH", 0x4267, 0x3F3C, 128, 0x3F3C, 300, 0x303C, 0x020D, 0xA830)
+    m.run(get + put + get)                  # CLR.W -(SP); MOVE.W #128,-(SP); ...; _Pack14
+    assert [m.cpu.pop16() for _ in range(3)] == [0, 0, 0x10000 - 192]      # resNotFound first
+    assert m.cpu.sp == m.stack_top and m.mem.r16(var) == 300 and m.missing == []
+
+
+def test_an_items_icon_is_its_words_low_byte(qapp):
+    """SetItemIcon's iconIndex is a Byte, pushed as a word with the value
+    in its low byte."""
+    m = Processor()
+    m.tb._d = SimpleNamespace(bridge=SimpleNamespace(call=lambda fn, *a: fn(*a)),
+                              refresh_bars=lambda: None)
+    h = m("NewMenu", 200, m.ptr(b"\x05Disks"))
+    m("AppendMenu", h, m.ptr(b"\x04Open"))
+    out = m.ptr(bytes(2))
+    for word, icon in ((5, 5), (0x0107, 7)):
+        m.run(struct.pack(">HIHHHHHHIHHHIH", 0x2F3C, h, 0x3F3C, 1, 0x3F3C, word, 0xA940,
+                          0x2F3C, h, 0x3F3C, 1, 0x4879, out, 0xA93F))   # Set-, GetItemIcon
+        assert m.mem.r16(out) == icon and m.cpu.sp == m.stack_top
+
+
+def _selector_bytes(dispatcher: str, selector: int) -> int | None:
+    """The bytes of arguments a routine's selector says it takes, where
+    its dispatcher's selectors count them, as the interfaces' do."""
+    if dispatcher in ("DialogDispatch", "DisplayDispatch", "FSDispatch", "IconDispatch",
+                      "MenuDispatch", "Pack8", "Pack11", "Pack14", "Pack15"):
+        return (selector >> 8 & 0xFF) * 2               # words, in bits 8-15
+    if dispatcher == "PrGlue" or dispatcher == "PaletteDispatch" and selector >> 8:
+        return selector >> 8 & 0xFF                     # bytes, in bits 8-15
+    if dispatcher == "QDExtensions":
+        return selector >> 16                           # bytes, in bits 16-31
+    if dispatcher == "SoundDispatch" and selector >> 24:
+        return (selector >> 24) * 2                     # words, in bits 24-31
+    return None
+
+
+def test_every_signature_takes_what_its_selector_says():
+    """A signature that takes more or less than its selector says leaves
+    the stack unbalanced (HMGetMenuResID's took a word too many).
+    ScriptUtil's selectors count their results too (see test_script).
+    CountVoices's counts a word for its VAR's pointer, which is two."""
+    checked = 0
+    for sig in dispatch.SIGNATURES.values():
+        want = None if sig.selector is None else _selector_bytes(sig.dispatcher, sig.selector)
+        if want is not None and sig.name != "CountVoices":
+            assert sig.stack_bytes == want, sig.name
+            checked += 1
+    assert checked > 250
+
+
+def test_pascal_arguments_come_off_the_stack_in_declaration_order():
+    """The last pushed is at the top of the stack; a byte is in its word's
+    high byte; a Point is its v, then its h."""
+    mem = RAM(0x1000)
+    sp = 0x800
+    mem.w32(sp, 0xABCDEF)               # p
+    mem.w32(sp + 4, -2)                 # l
+    mem.w16(sp + 8, 0xFFFF)             # H
+    mem.w16(sp + 10, -2)                # h
+    mem.w16(sp + 12, 0x80FF)            # B
+    mem.w16(sp + 14, 0xFF00)            # b
+    mem.w16(sp + 16, -10)               # P's v
+    mem.w16(sp + 18, 20)                # and h
+    assert dispatch.pop_args(mem, sp, "PbBhHlp") == (
+        [Point(-10, 20), -1, 0x80, -2, 0xFFFF, -2, 0xABCDEF], sp + 20)
+    assert dispatch.pop_args(mem, sp, "") == ([], sp)
+    assert dispatch.pop_args(mem, sp + 16, "P") == ([Point(-10, 20)], sp + 20)
+    with pytest.raises(BusError):
+        dispatch.pop_args(mem, 0xFFC, "lh")
+
+
 def test_open_paren_anywhere_disables_the_item():
     # Same as the real AppendMenu, which is why the demo avoids "(".
     (item,) = parse_menu_items("Modal Dialog (dBoxProc)")
@@ -166,6 +247,53 @@ def test_a_mouse_region_the_mouse_is_out_of_gives_mouse_moved_events():
         assert got and (ev.what, ev.message) == (k.osEvt, k.mouseMovedMessage << 24)
     got, ev = q.get(k.everyEvent, 3, next_update, mouse_rgn=Region.rect(Rect(-1, -1, 1, 1)))
     assert not got and ev.what == k.nullEvent
+
+
+def test_the_queue_says_when_the_program_last_asked_and_waited():
+    """By the host's clock, so that a survey can tell a program waiting
+    for input from a busy one: asking is each look in the queue, and
+    waiting the wait in WaitNextEvent's sleep for something to come."""
+    q, next_update = _queue()
+    never = float("-inf")
+    assert (q.asked_at, q.waited_at, q.timed_at, q.waiting) == (never, never, never, False)
+    before = time.monotonic()
+    q.peek(k.everyEvent, next_update)
+    assert q.asked_at >= before and q.waited_at == never
+    before = time.monotonic()
+    q.get(k.everyEvent, 0, next_update)
+    assert q.asked_at >= before and q.waited_at == never
+    got = []
+    t = threading.Thread(target=lambda: got.append(q.get(k.everyEvent, 600, next_update)))
+    t.start()
+    deadline = time.monotonic() + 5
+    while not q.waiting and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert q.waiting and q.waited_at == never
+    posted = time.monotonic()
+    q.post(EventRecord(k.keyDown, 0x61, 0, Point(0, 0), 0))
+    t.join(5)
+    assert got[0][0] and got[0][1].what == k.keyDown
+    assert not q.waiting and q.waited_at >= posted and q.asked_at >= posted
+    before = time.monotonic()
+    q.asked()
+    q.timed()
+    assert q.asked_at >= before and q.timed_at >= before
+
+
+def test_reading_the_clock_and_the_keys_is_stamped(qapp):
+    """TickCount and Delay are a program reading the clock; GetKeys, one
+    asking whether a key is down."""
+    g = Guest()
+    events = g.process.events
+    before = time.monotonic()
+    g("TickCount")
+    assert events.timed_at >= before and events.asked_at == float("-inf")
+    events.timed_at, slept = float("-inf"), []
+    g.sleep = slept.append
+    g("Delay", 1)
+    assert events.timed_at >= before and events.asked_at == float("-inf") and slept == [1]
+    g("GetKeys", g.ptr(bytes(16)))
+    assert events.asked_at >= before
 
 
 def test_activate_then_deactivate_before_reading_cancels_out():
@@ -360,6 +488,15 @@ def test_a_toolbox_routine_with_no_result_leaves_d0_clear(qapp):
     # A function's result is still where Pascal puts it, and D0 is its own.
     m.run(struct.pack(">HIHH", 0x203C, 0x1234, 0x42A7, 0xA924))    # CLR.L -(SP); _FrontWindow
     assert m.cpu.d(0) == 0x1234 and m.cpu.sp == m.stack_top - 4
+
+
+def test_release_resource_leaves_d0_as_it_was(qapp):
+    """DeadEnd's checksum routine, a C function, falls off its end after
+    ReleaseResource and returns the sum it left in D0."""
+    m = Processor()
+    # MOVE.L #$0000022B,D0; CLR.L -(SP); _ReleaseResource
+    m.run(struct.pack(">HIHH", 0x203C, 0x022B, 0x42A7, 0xA9A3))
+    assert m.cpu.d(0) == 0x022B and m.cpu.sp == m.stack_top
 
 
 def test_hwpriv_has_no_caches_to_mind(qapp):

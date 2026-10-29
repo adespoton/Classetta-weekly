@@ -171,9 +171,8 @@ def read_desc(t, p: int) -> tuple[bytes, bytes] | None:
     dtype, h = _code(t.mem.r32(p)), t.mem.r32(p + 4) & ADDRESS_MASK
     if not h:
         return dtype, b""
-    try:
-        heap = t.system.heap_of(h)
-    except ValueError:
+    heap = t.system.find_heap(h)
+    if heap is None:
         return None
     if heap.is_empty(h):
         return dtype, b""
@@ -184,12 +183,9 @@ def write_desc(t, p: int, dtype: bytes, data: bytes) -> int:
     """A new AEDesc at p, with its own handle."""
     h = 0
     if dtype != typeNull or data:
-        heap = t.process.heap
-        h = heap.new_handle(len(data))
+        h = t.process.heap.new_handle_with(data)
         if not h:
             dtype = typeNull
-        else:
-            t.mem.write(heap.deref(h), data)
     t.w32(p, int.from_bytes(dtype, "big"))
     t.w32(p + 4, h)
     return noErr if h or dtype == typeNull and not data else memFullErr
@@ -197,11 +193,9 @@ def write_desc(t, p: int, dtype: bytes, data: bytes) -> int:
 
 def dispose_desc(t, p: int) -> None:
     h = t.mem.r32(p + 4) & ADDRESS_MASK
-    if h:
-        try:
-            t.system.heap_of(h).dispose_handle(h)
-        except ValueError:
-            pass
+    heap = t.system.find_heap(h) if h else None
+    if heap is not None:
+        heap.dispose_handle(h)
     t.w32(p, int.from_bytes(typeNull, "big"))
     t.w32(p + 4, 0)
 
@@ -246,7 +240,8 @@ def coerce(t, dtype: bytes, data: bytes, to: bytes) -> tuple[bytes, bytes] | Non
     n = None
     if dtype in NUMBERS and len(data) == struct.calcsize(NUMBERS[dtype]):
         n = struct.unpack(NUMBERS[dtype], data)[0]
-    elif dtype == typeChar and DECIMAL.fullmatch(data):
+    elif dtype == typeChar and DECIMAL.fullmatch(data) \
+            and len(data.strip(b" +-").lstrip(b"0")) <= 20:      # more fits no number
         n = int(data)
     if n is not None and to in NUMBERS and (to != typeBoolean or n in (0, 1)):
         try:
@@ -1052,11 +1047,8 @@ def _table_entries(t, table: int) -> list[bytes] | None:
     h = table & ADDRESS_MASK
     if not h:
         return None
-    try:
-        heap = t.system.heap_of(h)
-    except ValueError:
-        return None
-    if not heap.is_handle(h):
+    heap = t.system.find_heap(h)
+    if heap is None or not heap.is_handle(h):
         return None
     data = t.mem.read(heap.deref(h), heap.handle_size(h))
     whole = len(data) - len(data) % HANDLER_ENTRY

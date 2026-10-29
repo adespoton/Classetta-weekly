@@ -48,7 +48,11 @@ def SndSoundManagerVersion(t):
 @trap
 def SndNewChannel(t, chan_ptr, synth, init, user_routine):
     """A channel record, unless the program passed one of its own, which
-    has to say how long its queue is."""
+    has to say how long its queue is.  Past macrt's MAX_CHANNELS open at
+    once there are no more: DeadEnd counts how many it can have by asking
+    for one more each time until it's refused."""
+    if len(t.machine.sound_manager.channels) >= sm.MAX_CHANNELS:
+        return sm.notEnoughHardware
     chan = t.mem.r32(chan_ptr) & ADDRESS_MASK
     owned = not chan
     if owned:
@@ -268,11 +272,8 @@ def SndDisposeChannel(t, chan, quiet_now):
 
 def _settings_heap(t, settings: int):
     """The heap of a handle a program passed, or None."""
-    try:
-        heap = t.system.heap_of(settings)
-    except ValueError:
-        return None
-    return heap if heap.is_handle(settings & ADDRESS_MASK) else None
+    heap = t.system.find_heap(settings)
+    return heap if heap is not None and heap.is_handle(settings & ADDRESS_MASK) else None
 
 
 @trap

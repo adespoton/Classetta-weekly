@@ -630,7 +630,7 @@ def apply_style(style: Style, mode: int, new: Style, continuous_face: int = 0) -
         else:
             face = 0
     if mode & addSize:
-        size = max(1, size + new.size)
+        size = min(max(1, size + new.size), 0x7FFF)
     elif mode & doSize:
         size = new.size
     if mode & doColor:
@@ -734,10 +734,7 @@ class EditRecord:
         return self.mem.r32(h) & ADDRESS_MASK if h else 0
 
     def _heap_for(self, h: int) -> Heap:
-        try:
-            return self.system.heap_of(h & ADDRESS_MASK)
-        except ValueError:
-            return self.heap
+        return self.system.find_heap(h) or self.heap
 
     def _resize(self, h: int, size: int) -> bool:
         heap = self._heap_for(h)
@@ -893,7 +890,9 @@ class EditRecord:
             sr = self._style_rec()
         sr.n_runs, sr.n_styles = len(runs), len(styles)
         data = b"".join(struct.pack(">hh", s, i) for (s, _), i in zip(runs, index))
-        self.mem.write(sr.addr + STYLE_REC, data + struct.pack(">hh", len(lay.text) + 1, -1))
+        # the runs end with one past the text, which a text of 32767 puts
+        # past an INTEGER's range
+        self.mem.write(sr.addr + STYLE_REC, data + struct.pack(">Hh", len(lay.text) + 1, -1))
         tab = b"".join(struct.pack(">hhhhBxh", index.count(i), *lay.style_height(st), st.font,
                                    st.face, st.size) + st.color for i, st in enumerate(styles))
         # each line's lhHeight and lhAscent, and a dummy entry after the
@@ -1573,11 +1572,8 @@ def dispose_record(system: System, h: int) -> None:
         x &= ADDRESS_MASK
         if not x:
             return
-        try:
-            owner = system.heap_of(x)
-        except ValueError:
-            return
-        if owner.is_handle(x):
+        owner = system.find_heap(x)
+        if owner is not None and owner.is_handle(x):
             owner.dispose_handle(x)
     sh = te.style_handle & ADDRESS_MASK if te.tx_size == -1 else 0
     p = mem.r32(sh) & ADDRESS_MASK if sh else 0
