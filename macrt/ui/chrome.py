@@ -13,9 +13,10 @@ its auxiliary record's or the default record's (Inside Macintosh V, the
 Window Manager), as the screen shows them, when they aren't the standard
 black and white.  The parts are named, not described: macrt draws the
 outline, the line under the title bar, the boxes' outlines and any shadow
-in wFrameColor, the title in wTextColor, the stripes in wHiliteColor and
-the title bar behind them in wTitleBarColor, and a dialog box's white
-band in wContentColor.  Rounded windows stay black and white.
+in wFrameColor, the title and the title bar's icon in wTextColor, the
+stripes in wHiliteColor and the title bar behind them in wTitleBarColor,
+and a dialog box's white band in wContentColor.  Rounded windows stay
+black and white.
 """
 
 from __future__ import annotations
@@ -49,6 +50,7 @@ STANDARD_COLORS = (_WHITE, _BLACK, _BLACK, _BLACK, _WHITE)
 class Frame:
     kind: WindowKind
     title: str = ""
+    title_icon: list[str] | None = None   # '#'/'.' rows drawn beside the title
     hilited: bool = True
     go_away: bool = False
     zoom: bool = False
@@ -322,6 +324,7 @@ def _paint_document(p: QPainter, f: Frame, w: int, h: int, pal: _Palette) -> Non
 
 
 def _title_text_rect(f: Frame, w: int, tr: QRect, cb, zb) -> QRect | None:
+    """Where the icon and title go together, centred as one block."""
     if not f.title:
         return None
     font = theme.title_font()
@@ -335,14 +338,20 @@ def _title_text_rect(f: Frame, w: int, tr: QRect, cb, zb) -> QRect | None:
     box = theme.BOX_INSET + theme.BOX_SIZE + theme.BOX_CLEARANCE + pad
     left = box if f.go_away else pad
     right = w - (box if f.zoom and f.kind is WindowKind.DOCUMENT else pad)
-    x = max((w - m.horizontalAdvance(f.title)) // 2, left)
-    text = m.elidedText(f.title, Qt.TextElideMode.ElideRight, max(right - x, 0))
+    lead = (theme.bitmap_size(f.title_icon)[0] + theme.TITLE_ICON_GAP
+            if f.title_icon else 0)
+    x = max((w - m.horizontalAdvance(f.title) - lead) // 2, left)
+    text = m.elidedText(f.title, Qt.TextElideMode.ElideRight, max(right - x - lead, 0))
     if not text:
         return None
-    return QRect(x, tr.y(), m.horizontalAdvance(text), tr.height())
+    return QRect(x, tr.y(), lead + m.horizontalAdvance(text), tr.height())
 
 
 def _paint_title(p: QPainter, f: Frame, r: QRect, color) -> None:
+    if f.title_icon:
+        iw, ih = theme.bitmap_size(f.title_icon)
+        theme.draw_bitmap(p, r.x(), r.y() + (r.height() - ih) // 2, f.title_icon, color)
+        r = r.adjusted(iw + theme.TITLE_ICON_GAP, 0, 0, 0)
     font = theme.title_font()
     p.setFont(font)
     p.setPen(QPen(color))

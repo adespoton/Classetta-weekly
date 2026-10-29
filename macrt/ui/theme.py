@@ -43,6 +43,7 @@ BOX_SIZE = 11              # close and zoom boxes
 BOX_INSET = 7              # box distance from the window's outer edge
 BOX_CLEARANCE = 1          # white gap the stripes leave around a box
 TITLE_CLEARANCE = 6        # white gap the stripes leave around the title
+TITLE_ICON_GAP = 3         # gap between a title bar's icon and its text
 PINSTRIPE_SPACING = 2
 STRIPE_INSET = 1           # white gap between the stripes and the frame
 SHADOW_OFFSET = 1          # document window drop shadow

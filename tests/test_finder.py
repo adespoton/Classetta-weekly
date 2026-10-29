@@ -8,7 +8,8 @@ from conftest import LB, NO_MODS
 from macrt.demo import open_targets, parse_args
 from macrt.macfile import open_disks
 from macrt.resfork import build_fork, Resource, resPurgeable
-from macrt.ui.finder import FinderOptions
+from macrt.ui.finder import ARCHIVE_ICON, FinderOptions, _container_icon
+from macrt.ui.stdfile import DISK_ICON, DOCUMENT_ICON, FOLDER_ICON
 from test_files import FORK, macbinary
 
 
@@ -34,6 +35,18 @@ def _disk(tmp_path):
     p = tmp_path / "browse.dsk"
     p.write_bytes(_volume().write(800 * 1024))
     return p
+
+
+def _icon_folder_volume() -> machfs.Volume:
+    """A disk whose folder keeps its own icon: all black at 32 by 32."""
+    v = machfs.Volume()
+    v.name = "Custom"
+    folder = machfs.Folder()
+    icon = machfs.File()
+    icon.rsrc = bytearray(build_fork([Resource(b"ICN#", 128, bytes([0xFF]) * 256)]))
+    folder["Icon\r"] = icon
+    v["Mystery"] = folder
+    return v
 
 
 # -- what the command line asks for ---------------------------------------
@@ -133,6 +146,56 @@ def test_a_window_that_can_be_modified_would_wear_no_lock(harness):
     win = h.d.open_finder(h.d.config.disks[0], options=FinderOptions(writable=True))
     h.settle()
     assert win.tree.headerItem().icon(0).isNull()
+
+
+# -- what the title bar wears -----------------------------------------------
+def test_the_title_bar_wears_the_disk_icon_at_the_root(harness):
+    h = harness(disks=[_volume()])
+    win = h.d.open_finder(h.d.config.disks[0])
+    h.settle()
+    assert win.frame().title_icon == DISK_ICON
+
+
+def test_the_title_bar_wears_the_folder_icon_inside(harness):
+    h = harness(disks=[_volume()])
+    win = h.d.open_finder(h.d.config.disks[0], ("Games",))
+    h.settle()
+    assert win.frame().title_icon == FOLDER_ICON
+
+
+def test_a_folder_with_its_own_icon_wears_it_in_the_title_bar(harness):
+    h = harness(disks=[_icon_folder_volume()])
+    win = h.d.open_finder(h.d.config.disks[0], ("Mystery",))
+    h.settle()
+    assert win.frame().title_icon == ["#" * 16] * 16
+
+
+def test_a_file_container_wears_what_the_file_is():
+    v = machfs.Volume()
+    v.name = "Files"
+    packed = machfs.File()
+    packed.data = b"SIT!" + bytes(6) + b"rLau"
+    v["Pack.sit"] = packed
+    text = machfs.File()
+    text.data = b"Hello."
+    v["Letter"] = text
+    assert _container_icon(v, ("Pack.sit",)) == ARCHIVE_ICON
+    assert _container_icon(v, ("Letter",)) == DOCUMENT_ICON
+
+
+def test_a_file_wears_its_own_icon_only_when_marked_as_having_one():
+    v = machfs.Volume()
+    v.name = "Files"
+    icon_rsrc = bytearray(build_fork([Resource(b"ICON", 128, bytes([0xFF]) * 128)]))
+    marked = machfs.File()
+    marked.data, marked.flags = b"Text.", 0x0400      # kHasCustomIcon
+    marked.rsrc = icon_rsrc
+    v["Marked"] = marked
+    plain = machfs.File()
+    plain.data, plain.rsrc = b"Text.", bytearray(icon_rsrc)
+    v["Plain"] = plain
+    assert _container_icon(v, ("Marked",)) == ["#" * 16] * 16
+    assert _container_icon(v, ("Plain",)) == DOCUMENT_ICON
 
 
 def test_the_same_folder_is_one_window(harness):

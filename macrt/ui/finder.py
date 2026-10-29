@@ -30,14 +30,15 @@ from PyQt6.QtWidgets import (
     QApplication, QHeaderView, QMessageBox, QTreeWidget, QTreeWidgetItem, QWidget,
 )
 
-from ..macfile import MacFile, is_control_panel, launch_target, list_folder
+from ..macfile import MacFile, archive_kind, is_control_panel, launch_target, list_folder
 from ..m68k.segload import has_code, why_no_code
-from ..resfork import is_fork
+from ..resfork import InvalidForkError, is_fork, read_fork
 from ..toolbox import constants as k
+from ..toolbox.icons import LARGE, MINI, SMALL, Icon, bitmap_icon, suite_icon
 from ..toolbox.windows import WindowKind
 from ..viewer import describe, viewer_main
 from . import chrome, theme
-from .stdfile import icon
+from .stdfile import DISK_ICON, DOCUMENT_ICON, FOLDER_ICON, icon
 from .tracking import BoxTracker, DragTracker
 from .window import _Hosted
 
@@ -71,6 +72,31 @@ LOCK = [
     "#########",
     "#########",
 ]
+
+# A container's own icon: what the Finder calls the file (Icon plus a
+# carriage return) that keeps a folder's or a volume's, and the flag a
+# file's custom icon is set by (kHasCustomIcon).
+ICON_FILE = "Icon\r"
+HAS_CUSTOM_ICON = 0x0400
+
+# A window over a packed file: a case with a handle and a strap down it.
+ARCHIVE_ICON = [
+    ".....######.....",
+    "################",
+    "#......##......#",
+    "#......##......#",
+    "################",
+    "#......##......#",
+    "#......##......#",
+    "#......##......#",
+    "################",
+]
+
+# The title bar's stand-in when a container has no icon of its own, by
+# what the container is: the volume (its disk image), a folder, or a
+# file — an archive to look through, what no window opens yet.
+CONTAINER_ICONS = {"volume": DISK_ICON, "folder": FOLDER_ICON,
+                   "archive": ARCHIVE_ICON, "document": DOCUMENT_ICON}
 
 
 @dataclass(frozen=True)
@@ -112,8 +138,84 @@ def _lock() -> QIcon:
     return QIcon(pm)
 
 
+def _bitmap(icon: Icon) -> list[str]:
+    """An icon as '#' and '.' rows, only where its mask lets it show."""
+    mask = icon.mask or [b"\xFF" * icon.row_bytes] * icon.height
+    return ["".join("#" if irow[x >> 3] & 0x80 >> (x & 7) and mrow[x >> 3] & 0x80 >> (x & 7)
+                    else "." for x in range(icon.width))
+            for irow, mrow in zip(icon.rows, mask)]
+
+
+def _halve(bitmap: list[str]) -> list[str]:
+    """A 32-by-32 icon's every other row and column: the bar's 16."""
+    return [row[::2] for row in bitmap[::2]]
+
+
+def _icon_from(rsrc: bytes) -> list[str] | None:
+    """The icon a resource fork holds: the small one of a custom icon
+    suite when it has one, else the 32-by-32 ICON or ICN# halved to the
+    title bar's size; None for a fork that holds no icon."""
+    if not is_fork(rsrc):
+        return None
+    try:
+        resources = read_fork(rsrc)
+    except InvalidForkError:
+        return None
+    # The custom icon's id (128) first, then any id, for a fork that
+    # keeps its icon in the old way.
+    for pool in ({r.type: r.data for r in resources if r.id == 128},
+                 {r.type: r.data for r in resources}):
+        if not pool:
+            continue
+
+        def get(kind: str) -> bytes | None:
+            return pool.get(kind.encode("ascii"))
+
+        icon = suite_icon(get, SMALL) or suite_icon(get, LARGE) or suite_icon(get, MINI)
+        if icon is None and b"ICON" in pool:       # an ICON, which no suite names
+            icon = bitmap_icon(pool[b"ICON"], LARGE, masked=False)
+        if icon is not None:
+            bitmap = _bitmap(icon)
+            return _halve(bitmap) if len(bitmap[0]) > 16 else bitmap
+    return None
+
+
+def _custom_icon(node: machfs.Volume | machfs.Folder | machfs.File) -> list[str] | None:
+    """A container's own icon: a file's when its Finder flags say it has
+    one, or a folder's or a volume's, kept in the Icon-plus-return file
+    the Finder writes inside them.  machfs keeps no folder flags, so for
+    those, that file's being there is what says the icon is set."""
+    if isinstance(node, machfs.File):
+        if not node.flags & HAS_CUSTOM_ICON:
+            return None
+        return _icon_from(bytes(node.rsrc))
+    icon_file = next((f for name, f in node.items()
+                      if name.lower() == ICON_FILE.lower()), None)
+    if isinstance(icon_file, machfs.File):
+        return _icon_from(bytes(icon_file.rsrc))
+    return None
+
+
+def _container_icon(volume: machfs.Volume, path: tuple[str, ...] = ()) -> list[str]:
+    """What the title bar shows for the container the window lists: the
+    container's own icon when it has one, else a generic for what the
+    container is — the volume (its disk image), a folder, or a file."""
+    node = volume
+    for part in path:
+        node = node[part]
+    custom = _custom_icon(node)
+    if custom is not None:
+        return custom
+    kind = ("volume" if isinstance(node, machfs.Volume)
+            else "folder" if isinstance(node, machfs.Folder)
+            else "archive" if archive_kind(node) else "document")
+    return CONTAINER_ICONS[kind]
+
+
 class FinderWindow(_Hosted):
-    """One folder's window: its contents listed, ready to open."""
+    """One folder's window: its contents listed, ready to open.  Its
+    title bar wears an icon of the container it lists — the disk image
+    at the root, a folder inside — the container's own when it has one."""
 
     def __init__(self, display: Display, volume: machfs.Volume,
                  path: tuple[str, ...] = (), options: FinderOptions | None = None,
@@ -122,6 +224,7 @@ class FinderWindow(_Hosted):
         self.volume = volume
         self.path = path
         self.options = options or FinderOptions()
+        self._title_icon = _container_icon(volume, path)
         self.setWindowTitle(self.path[-1] if self.path else self.volume.name)
         self._hilited = True
         self._pressed = k.wNoHit
@@ -171,7 +274,8 @@ class FinderWindow(_Hosted):
     # -- frame ------------------------------------------------------------
     def frame(self) -> chrome.Frame:
         title = self.path[-1] if self.path else self.volume.name
-        return chrome.Frame(kind=WindowKind.DOCUMENT, title=title, hilited=self._hilited,
+        return chrome.Frame(kind=WindowKind.DOCUMENT, title=title,
+                            title_icon=self._title_icon, hilited=self._hilited,
                             go_away=True, pressed=self._pressed)
 
     def content_size(self) -> tuple[int, int]:
