@@ -1,8 +1,6 @@
-# Classetta (previously MacRT)
+# macrt
 
-A runtime for classic Mac OS (System 1–7) applications with a PyQt6 front end. **Weekly builds available every Wednesday!**
-
-__ANNOUNCEMENT: To provide a unified communication channel for Classetta, a new Discord server was made!  Access here: https://discord.gg/f6NF7yhWjF__
+A runtime for classic Mac OS (System 1–7) applications with a PyQt6 front end.
 
 macrt runs an application's own 68k code on an emulated CPU, catches its
 A-line traps, and answers them with a Toolbox written in Python, with Qt
@@ -14,7 +12,7 @@ desktop next to your other programs.
 **Status:** real 68k applications run: TeachText, Microsoft Excel,
 MacWrite, MacPaint and Word 1.0 from 1984, and games such as Creepy Castle
 and Glider+ among them (see
-[what's been tried](docs/running-apps.md#tried-so-far)).
+[what's been tried](docs/titles.md)).
 - **The processor** is unicorn's 68020, in 24-bit mode, which tells programs
   it's a Mac Plus's 68000 (or, with `--model ii`, a Mac II's 68020 and
   68881) and stacks that processor's exception frames, with its trace mode
@@ -76,8 +74,8 @@ python -m macrt --host screen --size 512x342 --classic-menus
 ```
 
 The demo launches two apps. **Sampler** opens every window kind from its
-*Windows* menu. **Ticker** is a clock, so there's a second app to switch to.
-Ctrl stands in for ⌘ (Command), Alt for Option.
+*Windows* menu. **Ticker** is a clock, so there's a second app to switch to;
+`--single` leaves it out. Ctrl stands in for ⌘ (Command), Alt for Option.
 
 | Emulated screen, global menu bar | Host windows, menu bar under each title bar |
 |---|---|
@@ -99,7 +97,17 @@ python -m macrt "App Folder/App"              # run what came out (App or App.rs
 
 [docs/running-apps.md](docs/running-apps.md) has the whole story: the
 forms a Mac file can come in, archives and disk images, every option,
-what works, and the system error IDs.
+and the system error IDs. [docs/toolbox.md](docs/toolbox.md) goes through
+what macrt implements, a manager at a time, and
+[docs/titles.md](docs/titles.md) the applications tried so far and how far
+each gets.
+
+To try many applications at once, `python -m macrt.survey` runs a list of
+them headless, clicks and types what the list says, and reports what each
+did, with screenshots and the calls macrt doesn't implement ranked by how
+many titles make them. It can also compare two surveys to show what a
+change to macrt changed
+([Surveying many applications](docs/running-apps.md#surveying-many-applications)).
 
 An application with no 68k code, such as a PowerPC-only one, or any
 application with `--view`, gets `viewer.py`'s **ResourceViewer** in place of
@@ -231,10 +239,11 @@ macrt/
              sound_manager.py (the Sound Manager's channels),
              segload.py (CODE 0, the jump table, LoadSeg), dispatch.py and
              trapdefs.py (trap signatures), glue_*.py (the trap routines:
-             toolbox, os, controls, dialogs, lists, textedit, scrap,
-             files, sony, aliases, stdfile, pict, icons, color, cport,
-             palette, gworld, video, picker, sound, process, aevents, ppc,
-             sane, intl, script)
+             quickdraw, fonts, windows, menus, events, resources,
+             utilities, help, os, controls, dialogs, lists, textedit,
+             scrap, files, sony, aliases, stdfile, pict, icons, color,
+             cport, palette, gworld, video, picker, sound, process,
+             aevents, ppc, sane, intl, script)
   resfork.py the resource fork format, read (every offset checked) and written
   macfile.py Mac files from the host: MacBinary, BinHex, AppleSingle/Double,
              emulator side files, HFS and MFS disk images
@@ -417,7 +426,8 @@ a host font would draw a box.
 ## Tests
 
 ```sh
-pytest                      # runs offscreen, in about half a minute
+pytest                      # runs offscreen, in about two minutes
+pytest -n auto              # with pytest-xdist, from .[dev]: on every core
 ```
 
 `tests/test_memory.py` and `tests/test_records.py` check RAM, the heap, the
@@ -471,7 +481,9 @@ folders and disk images, from Python and from 68k code, the floppy disk
 driver, a program's own `RdData` and the ROM's, and drives the Open and Save dialogs. `tests/test_textedit.py` checks TextEdit's records
 and drawing, and `tests/test_scrap.py` the scrap and the host clipboard.
 `tests/test_viewer.py` checks the resource listing, the command line's
-errors, and ResourceViewer in a running display.
+errors, and ResourceViewer in a running display. `tests/test_survey.py`
+checks the survey tool's lists, steps, reports and comparisons, and runs a
+small survey of the test applications.
 `tests/test_resources.py` checks purging, the resource chain in guest memory,
 loading, purge and reload, opening and closing files, writing forks back, the
 templates, and an app whose menus and windows come from its resources, driven
@@ -520,4 +532,4 @@ key events, in both menu-bar modes. It covers:
 2. Suspend and resume when a host window gains or loses focus, so the
    clipboard follows without an extra click.
 3. More real applications, fixing whatever each one reaches first (see
-   [the ones tried so far](docs/running-apps.md#tried-so-far)).
+   [the ones tried so far](docs/titles.md)).
