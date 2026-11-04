@@ -166,7 +166,7 @@ def _icon_rows(rsrc: bytes, large: bool) -> tuple[str, ...] | None:
         return None
     try:
         resources = read_fork(rsrc)
-    except InvalidForkError:
+    except (InvalidForkError, ValueError, DecompressError, Exception):
         return None
     # The custom icon's id (128) first, then any id, for a fork that
     # keeps its icon in the old way.

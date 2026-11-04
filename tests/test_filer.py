@@ -689,3 +689,26 @@ def test_content_viewer_empty_and_unreadable_fork(harness, monkeypatch):
 
 
 
+
+def test_item_icons(harness):
+    v = machfs.Volume()
+    # 1. Item with custom icon (marked 0x0400)
+    marked = machfs.File()
+    marked.data, marked.flags = b"Text.", 0x0400
+    marked.rsrc = bytearray(build_fork([Resource(b"ICN#", 128, bytes([0xFF]) * 256)]))
+    v["Marked"] = marked
+    # 2. Item with unreadable resources
+    bad = machfs.File()
+    bad.data, bad.flags = b"Bad.", 0x0400
+    bad.rsrc = b"corrupt"
+    v["Bad"] = bad
+    # 3. Item with generic icon (folder)
+    v["Folder"] = machfs.Folder()
+    h = harness(disks=[v])
+    win = h.d.open_filer(v)
+    h.settle()
+    
+    # Assertions
+    assert not _item(win, "Marked").icon(0).isNull()
+    assert not _item(win, "Bad").icon(0).isNull() # Should fall back to generic
+    assert not _item(win, "Folder").icon(0).isNull()
