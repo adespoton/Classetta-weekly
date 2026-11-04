@@ -211,10 +211,9 @@ def _filled(row: str) -> str:
     return row if a < 0 else "." * a + "#" * (b - a + 1) + "." * (len(row) - b - 1)
 
 
-@cache
-def icon(kind: str) -> QIcon:
-    """Black on white; inverted, like its name, when it's selected."""
-    bitmap = ICONS[kind]
+def icon_from_bitmap(bitmap: list[str]) -> QIcon:
+    """Black on white from '#' and '.' rows; inverted, like its name,
+    when it's selected."""
     w, h = theme.bitmap_size(bitmap)
     x, y = (16 - w) // 2, (16 - h) // 2
     out = QIcon()
@@ -228,6 +227,12 @@ def icon(kind: str) -> QIcon:
         p.end()
         out.addPixmap(pm, mode)
     return out
+
+
+@cache
+def icon(kind: str) -> QIcon:
+    """Black on white; inverted, like its name, when it's selected."""
+    return icon_from_bitmap(ICONS[kind])
 
 
 STYLE = """

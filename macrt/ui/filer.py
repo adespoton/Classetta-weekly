@@ -21,13 +21,15 @@ from __future__ import annotations
 import time
 from concurrent.futures import Future
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import TYPE_CHECKING
 
 import machfs
 from PyQt6.QtCore import QEvent, QSize, Qt
 from PyQt6.QtGui import QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import (
-    QApplication, QHeaderView, QMessageBox, QTreeWidget, QTreeWidgetItem, QWidget,
+    QApplication, QCheckBox, QHeaderView, QMessageBox, QPlainTextEdit, QTreeWidget,
+    QTreeWidgetItem, QWidget,
 )
 
 from ..macfile import MacFile, archive_kind, is_control_panel, launch_target, list_folder
@@ -35,15 +37,18 @@ from ..m68k.segload import has_code, why_no_code
 from ..resfork import InvalidForkError, is_fork, read_fork
 from ..toolbox import constants as k
 from ..toolbox.icons import LARGE, MINI, SMALL, Icon, bitmap_icon, suite_icon
+from ..toolbox.menus import Menu, parse_menu_items
 from ..toolbox.windows import WindowKind
 from ..viewer import describe, viewer_main
 from . import chrome, theme
-from .stdfile import DISK_ICON, DOCUMENT_ICON, FOLDER_ICON, icon
+from .stdfile import (DISK_ICON, DOCUMENT_ICON, FOLDER_ICON, icon,
+                      icon_from_bitmap)
 from .tracking import BoxTracker, DragTracker
 from .window import _Hosted
 
 if TYPE_CHECKING:
     from .display import Display
+    from .menubar import MenuBarWidget
 
 CONTENT = (316, 236)       # the list's size, inside the frame
 LIST_STYLE = """
@@ -151,10 +156,12 @@ def _halve(bitmap: list[str]) -> list[str]:
     return [row[::2] for row in bitmap[::2]]
 
 
-def _icon_from(rsrc: bytes) -> list[str] | None:
-    """The icon a resource fork holds: the small one of a custom icon
-    suite when it has one, else the 32-by-32 ICON or ICN# halved to the
-    title bar's size; None for a fork that holds no icon."""
+@lru_cache(maxsize=256)
+def _icon_rows(rsrc: bytes, large: bool) -> tuple[str, ...] | None:
+    """The '#'/'.' rows a resource fork's icon gives, kept as a tuple so
+    the cache shares them safely: the small one for rows and title bars
+    (halved when the fork only has a 32-by-32), the full one for Get
+    Info; None for a fork that holds no icon."""
     if not is_fork(rsrc):
         return None
     try:
@@ -171,16 +178,31 @@ def _icon_from(rsrc: bytes) -> list[str] | None:
         def get(kind: str) -> bytes | None:
             return pool.get(kind.encode("ascii"))
 
-        icon = suite_icon(get, SMALL) or suite_icon(get, LARGE) or suite_icon(get, MINI)
+        order = (LARGE, SMALL, MINI) if large else (SMALL, LARGE, MINI)
+        icon = None
+        for size in order:
+            icon = suite_icon(get, size)
+            if icon is not None:
+                break
         if icon is None and b"ICON" in pool:       # an ICON, which no suite names
             icon = bitmap_icon(pool[b"ICON"], LARGE, masked=False)
         if icon is not None:
             bitmap = _bitmap(icon)
-            return _halve(bitmap) if len(bitmap[0]) > 16 else bitmap
+            if not large and len(bitmap[0]) > 16:
+                bitmap = _halve(bitmap)
+            return tuple(bitmap)
     return None
 
 
-def _custom_icon(node: machfs.Volume | machfs.Folder | machfs.File) -> list[str] | None:
+def _icon_from(rsrc: bytes, large: bool = False) -> list[str] | None:
+    """The icon a resource fork holds (see _icon_rows), as rows to draw,
+    or None for a fork that holds no icon."""
+    rows = _icon_rows(rsrc, large)
+    return None if rows is None else list(rows)
+
+
+def _custom_icon(node: machfs.Volume | machfs.Folder | machfs.File,
+                 *, large: bool = False) -> list[str] | None:
     """A container's own icon: a file's when its Finder flags say it has
     one, or a folder's or a volume's, kept in the Icon-plus-return file
     the Finder writes inside them.  machfs keeps no folder flags, so for
@@ -188,12 +210,57 @@ def _custom_icon(node: machfs.Volume | machfs.Folder | machfs.File) -> list[str]
     if isinstance(node, machfs.File):
         if not node.flags & HAS_CUSTOM_ICON:
             return None
-        return _icon_from(bytes(node.rsrc))
+        return _icon_from(bytes(node.rsrc), large)
     icon_file = next((f for name, f in node.items()
                       if name.lower() == ICON_FILE.lower()), None)
     if isinstance(icon_file, machfs.File):
-        return _icon_from(bytes(icon_file.rsrc))
+        return _icon_from(bytes(icon_file.rsrc), large)
     return None
+
+
+def item_icon(f: MacFile, *, large: bool = False) -> list[str] | None:
+    """The icon the item's own resources give it — an application's or a
+    marked file's from its resource fork, a folder's from its Icon file —
+    else None for an item with no icon of its own."""
+    if f.type == FOLDER:
+        volume = getattr(f.folder, "volume", None)
+        if volume is None:
+            return None
+        node = volume
+        for part in getattr(f.folder, "path", ()):
+            node = node[part]
+        try:
+            return _custom_icon(node[f.name], large=large)
+        except KeyError:
+            return None
+    if f.is_application or f.flags & HAS_CUSTOM_ICON:
+        return _icon_from(bytes(f.rsrc), large)
+    return None
+
+
+def _generic_icon(f: MacFile) -> list[str]:
+    """A stand-in for an item with no icon of its own, by what it is."""
+    if f.type == FOLDER:
+        return FOLDER_ICON
+    if f.is_application:
+        return theme.GENERIC_APP_ICON
+    try:
+        if archive_kind(f):
+            return ARCHIVE_ICON
+    except Exception:               # an unreadable data fork says nothing
+        pass
+    return DOCUMENT_ICON
+
+
+@lru_cache(maxsize=256)
+def _qicon_cached(rows: tuple[str, ...]) -> QIcon:
+    return icon_from_bitmap(list(rows))
+
+
+def _qicon(bitmap: list[str] | None) -> QIcon | None:
+    """The list's QIcon for an item's own icon, cached with its rows,
+    or None when the item has no icon of its own."""
+    return None if bitmap is None else _qicon_cached(tuple(bitmap))
 
 
 def _container_icon(volume: machfs.Volume, path: tuple[str, ...] = ()) -> list[str]:
@@ -316,7 +383,7 @@ class FilerWindow(_Hosted):
             data, rsrc = f.sizes()
             size = "--" if folder else f"{data + rsrc:,}"
             item = QTreeWidgetItem([f.name, size, _kind(f)])
-            item.setIcon(0, icon(_icon_for(f)))
+            item.setIcon(0, _qicon(item_icon(f)) or icon(_icon_for(f)))
             self.tree.addTopLevelItem(item)
 
     # -- frame ------------------------------------------------------------
