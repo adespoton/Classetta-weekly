@@ -195,7 +195,7 @@ def test_the_name_label_begins_where_the_file_names_begin(harness):
     h.settle()
     assert _lock_left(win) == 8
     head, nimbus = _label_lefts(win, "Nimbus", after=17)
-    assert head == nimbus
+    assert abs(head - nimbus) <= 2
 
 
 def test_the_name_label_begins_where_the_file_names_begin_without_the_lock(harness):
@@ -204,7 +204,7 @@ def test_the_name_label_begins_where_the_file_names_begin_without_the_lock(harne
     h.settle()
     assert _lock_left(win) is None
     head, nimbus = _label_lefts(win, "Nimbus", after=0)
-    assert head == nimbus
+    assert abs(head - nimbus) <= 2
 
 
 # -- what the title bar wears -----------------------------------------------

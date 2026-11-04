@@ -28,7 +28,7 @@ import machfs
 from PyQt6.QtCore import QEvent, QSize, Qt
 from PyQt6.QtGui import QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QHeaderView, QMessageBox, QPlainTextEdit, QTreeWidget,
+    QApplication, QCheckBox, QHeaderView, QListWidget, QMessageBox, QPlainTextEdit, QTreeWidget,
     QTreeWidgetItem, QWidget,
 )
 
@@ -541,6 +541,20 @@ class FilerWindow(_Hosted):
             return
         self._open(item)
 
+    def display_contents(self) -> None:
+        """Open a Resource/Content Viewer window for the selected file."""
+        item = self.selected_item()
+        if item is None:
+            return
+        win = ContentViewerWindow(self.display, item)
+        self.display.viewer_windows.append(win)
+        fr = self.frameGeometry()
+        win.move(fr.center().x() - win.width() // 2,
+                 fr.center().y() - win.height() // 2)
+        win.show()
+        win.raise_()
+        win.activateWindow()
+
     def get_info(self) -> None:
         """Open a Get Info window for the currently selected item."""
         item = self.selected_item()
@@ -557,10 +571,11 @@ class FilerWindow(_Hosted):
         win.activateWindow()
 
     def display_contents(self) -> None:
-        """Open a Content Viewer window for the selected file's data fork."""
+        """Open a Resource/Content Viewer window for the selected file."""
         item = self.selected_item()
         if item is None:
             return
+        # TODO: Replace ContentViewerWindow with one that supports resource forks
         win = ContentViewerWindow(self.display, item)
         self.display.viewer_windows.append(win)
         fr = self.frameGeometry()
@@ -813,14 +828,43 @@ class GetInfoWindow(AboutWindow):
 
 
 class ContentViewerWindow(AboutWindow):
-    """A viewer window for a file's data fork (hex view and text-only view)."""
+    """A viewer window for a file's contents (data and/or resource fork list and viewer)."""
 
     def __init__(self, display: Display, item: MacFile):
         super().__init__(display, item.name, [],
                          title_icon=item_icon(item) or _generic_icon(item),
-                         content_size=(560, 400))
+                         content_size=(640, 420))
         self.item = item
         self.text_only = False
+
+        # Gather items to list: DATA if data fork present, plus resources in alphabetical order
+        self.resources = []
+        try:
+            if item.data:
+                self.resources.append(("DATA", 0, len(item.data), item.data))
+        except Exception:
+            pass
+
+        try:
+            if item.rsrc:
+                rlist = read_fork(item.rsrc)
+                # Sort resources alphabetically by type name, then id/name
+                def res_key(r):
+                    t_str = r.type.decode('latin1', errors='replace')
+                    n_str = r.name.decode('latin1', errors='replace') if r.name else f"#{r.id}"
+                    return (t_str, n_str, r.id)
+                for r in sorted(rlist, key=res_key):
+                    t_str = r.type.decode('latin1', errors='replace')
+                    n_str = r.name.decode('latin1', errors='replace') if r.name else f"#{r.id}"
+                    display_name = f"{t_str} {n_str}"
+                    self.resources.append((display_name, r.id, len(r.data), r.data))
+        except Exception:
+            pass
+
+        self.list_widget = QListWidget(self)
+        self.list_widget.setFont(theme.body_font())
+        for name, rid, size, data in self.resources:
+            self.list_widget.addItem(f"{name}  ({size:,} bytes)")
 
         self.checkbox = QCheckBox("Text only", self)
         self.checkbox.setChecked(False)
@@ -830,16 +874,30 @@ class ContentViewerWindow(AboutWindow):
         self.text_edit.setReadOnly(True)
         self.text_edit.setFont(theme.body_font())
         self.text_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+
+        self.list_widget.currentRowChanged.connect(self._selection_changed)
+        if self.resources:
+            self.list_widget.setCurrentRow(0)
+
         self._update_content()
         self._relayout()
+
+    def _selection_changed(self, row: int) -> None:
+        self._update_content()
 
     def _toggle_view(self, state) -> None:
         self.text_only = bool(state)
         self._update_content()
 
+    def _current_data(self) -> bytes:
+        row = self.list_widget.currentRow()
+        if 0 <= row < len(self.resources):
+            return self.resources[row][3]
+        return getattr(self.item, "data", b"")
+
     def _update_content(self) -> None:
         try:
-            data = self.item.data
+            data = self._current_data()
             if not data:
                 self.text_edit.setPlainText("(empty)")
                 return
@@ -863,14 +921,21 @@ class ContentViewerWindow(AboutWindow):
 
     def _relayout(self) -> None:
         super()._relayout()
-        if not hasattr(self, "checkbox") or not hasattr(self, "text_edit"):
+        if not hasattr(self, "list_widget") or not hasattr(self, "checkbox") or not hasattr(self, "text_edit"):
             return
         f = self.frame()
         w = self.width() - chrome.shadow(f)
         h = self.height() - chrome.shadow(f)
         rect = chrome.content_rect(f, w, h)
-        self.checkbox.setGeometry(rect.left() + 8, rect.top() + 8, 100, 24)
-        self.text_edit.setGeometry(rect.left() + 8, rect.top() + 38, rect.width() - 16, rect.height() - 46)
+        
+        # Left pane: list of resources/data (width 200)
+        self.list_widget.setGeometry(rect.left() + 8, rect.top() + 8, 200, rect.height() - 16)
+        
+        # Right pane: checkbox and text edit
+        right_x = rect.left() + 216
+        right_w = rect.width() - 224
+        self.checkbox.setGeometry(right_x, rect.top() + 8, 100, 24)
+        self.text_edit.setGeometry(right_x, rect.top() + 38, right_w, rect.height() - 46)
 
     def closeEvent(self, event):  # noqa: N802
         event.accept()
@@ -1136,7 +1201,7 @@ class FilerMenus:
             Menu(APPLE_MENU_ID, k.APPLE_MENU_TITLE,
                  parse_menu_items("About Classetta…;(-")),
             Menu(FILE_MENU_ID, "File", parse_menu_items(
-                "(Open/O;(-;(Get Info…/I;(Display Contents/ ;(-;(Close/W;(Eject/E")),
+                 "(Open/O;(-;(Get Info…/I;(Display Contents/ ;(-;(Close/W;(Eject/E")),
             Menu(EDIT_MENU_ID, "Edit", parse_menu_items(
                 "(Undo/Z;(-;(Cut/X;(Copy/C;(Paste/V;(Clear;(Select All/A")),
             Menu(VIEW_MENU_ID, "View", parse_menu_items(
