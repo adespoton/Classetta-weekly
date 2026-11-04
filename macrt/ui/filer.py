@@ -523,8 +523,10 @@ class FilerWindow(_Hosted):
         if item is None:
             return set()
         actions = {"open", "info"}
+        actions = {"open", "info"}
+        actions = {"open", "info"}
         try:
-            has_data = item.type != FOLDER and len(item.rsrc) == 0
+            has_data = item.type != FOLDER and (len(item.data) > 0 or len(item.rsrc) > 0)
         except Exception:
             has_data = item.type != FOLDER
         if has_data:
@@ -833,7 +835,7 @@ class ContentViewerWindow(AboutWindow):
     def __init__(self, display: Display, item: MacFile):
         super().__init__(display, item.name, [],
                          title_icon=item_icon(item) or _generic_icon(item),
-                         content_size=(640, 420))
+                         content_size=(720, 480))
         self.item = item
         self.text_only = False
 

@@ -597,7 +597,7 @@ def test_file_display_contents_menu_item_enabled_state(harness):
     assert _file_menu_display_contents_enabled(h) is False
     win.tree.setCurrentItem(_item(win, "Widget"))
     h.settle()
-    assert _file_menu_display_contents_enabled(h) is False
+    assert _file_menu_display_contents_enabled(h) is True
     win.tree.setCurrentItem(_item(win, "Letter"))
     h.settle()
     assert _file_menu_display_contents_enabled(h) is True
