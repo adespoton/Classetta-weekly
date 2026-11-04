@@ -2,12 +2,15 @@
 
 import machfs
 import pytest
+from PyQt6.QtCore import Qt
 from PyQt6.QtTest import QTest
 
-from conftest import LB, NO_MODS
+from conftest import LB, NO_MODS, Recorder
 from macrt.demo import open_targets, parse_args
 from macrt.macfile import open_disks
 from macrt.resfork import build_fork, Resource, resPurgeable
+from macrt.toolbox import constants as k
+from macrt.ui import theme
 from macrt.ui.filer import ARCHIVE_ICON, FilerOptions, _container_icon
 from macrt.ui.stdfile import DISK_ICON, DOCUMENT_ICON, FOLDER_ICON
 from test_files import FORK, macbinary
@@ -323,3 +326,366 @@ def test_a_second_window_survives_the_first_closing(harness):
     h.wait_until(lambda: child not in h.d.filer_windows, what="the folder window to close")
     assert win in h.d.filer_windows
     assert not h.d.shutting_down
+
+
+def _file_menu_open_enabled(h) -> bool:
+    """File > Open as the bar itself would draw it: through bar_menus."""
+    for menu, _cell in h.d.global_bar.cells():
+        if menu.title == "File":
+            return menu.items[0].enabled
+    raise AssertionError("the menu bar is showing no File menu")
+
+
+def test_file_open_menu_item_enabled_state(harness):
+    h = harness(disks=[_volume()])
+    win = h.d.open_filer(h.d.config.disks[0])
+    h.settle()
+    assert _file_menu_open_enabled(h) is False       # nothing is selected
+    win.tree.setCurrentItem(_item(win, "Games"))
+    h.settle()
+    assert _file_menu_open_enabled(h) is True        # a folder is selected
+
+
+def test_file_open_opens_selected_item(harness):
+    h = harness(disks=[_volume()])
+    win = h.d.open_filer(h.d.config.disks[0])
+    h.settle()
+    win.tree.setCurrentItem(_item(win, "Games"))
+    h.settle()
+    win.open_selected()
+    h.settle()
+    assert len(h.d.filer_windows) == 2
+    assert h.d.front_filer.path == ("Games",)
+
+
+def test_the_file_menu_pulls_down_and_opens(harness):
+    h = harness(disks=[_volume()])
+    win = h.d.open_filer(h.d.config.disks[0])
+    h.settle()
+    win.tree.setCurrentItem(_item(win, "Games"))
+    h.settle()
+    h.choose(h.d.global_bar, "File", 1)
+    h.wait_until(lambda: len(h.d.filer_windows) == 2, what="the folder window")
+    assert h.d.front_filer.path == ("Games",)
+
+
+def test_the_apple_menu_opens_about_classetta(harness):
+    h = harness(disks=[_volume()])
+    h.d.open_filer(h.d.config.disks[0])
+    h.settle()
+    h.choose(h.d.global_bar, k.APPLE_MENU_TITLE, 1)
+    h.wait_until(lambda: len(h.d.about_windows) == 1, what="the About window")
+    assert h.d.front_filer is not None             # the Filer is still front
+    h.d.about_windows[0].close()
+    h.settle()
+    assert h.d.about_windows == []
+
+
+def test_about_classetta_appears(harness):
+    h = harness(disks=[_volume()])
+    h.d.open_filer(h.d.config.disks[0])
+    h.settle()
+    assert len(h.d.about_windows) == 0
+    h.d.show_about_classetta()
+    h.settle()
+    assert len(h.d.about_windows) == 1
+    about = h.d.about_windows[0]
+    assert about.windowTitle() == "About Classetta"
+    assert any("Classetta" in line for line in about._lines)
+    assert any(line.startswith("Total Memory") for line in about._lines)
+    assert any(line.startswith("Largest Unused Block") for line in about._lines)
+    assert about._logo_icon in (theme.MAC_II_ICON, theme.MAC_PLUS_ICON)
+    assert about._processes[0][0] == "System"      # the System heap is listed
+    about.close()
+    h.settle()
+
+
+def test_about_window_can_be_dragged(harness):
+    h = harness(disks=[_volume()])
+    h.d.open_filer(h.d.config.disks[0])
+    h.settle()
+    h.d.show_about_classetta()
+    h.settle()
+    about = h.d.about_windows[0]
+    start_pos = about.pos()
+    o = about.mac_origin()
+    h.press(o.h + 40, o.v + 10)
+    h.move(o.h + 80, o.v + 30)
+    h.release(o.h + 80, o.v + 30)
+    h.settle()
+    assert about.pos() != start_pos
+    about.close()
+    h.settle()
+
+
+def test_about_window_close_box_closes_it(harness):
+    h = harness(disks=[_volume()])
+    h.d.open_filer(h.d.config.disks[0])
+    h.settle()
+    h.d.show_about_classetta()
+    h.settle()
+    about = h.d.about_windows[0]
+    o = about.mac_origin()
+    box = about.box_rect(4)                   # wInGoAway
+    assert box is not None
+    h.click(o.h + box.x() + 5, o.v + box.y() + 5)
+    h.wait_until(lambda: about not in h.d.about_windows,
+                 what="the About window to close")
+
+
+@pytest.mark.parametrize("host", ["screen", "desktop"])
+def test_control_opens_the_selection(harness, host):
+    h = harness(disks=[_volume()], host=host)
+    win = h.d.open_filer(h.d.config.disks[0])
+    h.settle()
+    win.tree.setFocus()
+    win.tree.setCurrentItem(_item(win, "Games"))
+    h.settle()
+    QTest.keyClick(win.tree, Qt.Key.Key_O, Qt.KeyboardModifier.ControlModifier)
+    h.settle()
+    assert len(h.d.filer_windows) == 2
+    assert h.d.front_filer.path == ("Games",)
+
+
+def test_the_bar_goes_to_an_application_and_back(harness):
+    h = harness(disks=[_volume()])
+    win = h.d.open_filer(h.d.config.disks[0])
+    h.settle()
+    assert h.d.global_bar.process is h.d.filer_menus
+    alpha = h.launch(Recorder("Alpha", at=(30, 60)))
+    h.wait_until(lambda: h.d.front_process is alpha, what="Alpha to come forward")
+    assert h.d.front_filer is None
+    assert h.d.global_bar.process is alpha
+    c = win.tree.visualItemRect(_item(win, "Games")).center()
+    h.click(*h.mac(win.tree.viewport(), c))         # click back into the Filer
+    h.settle()
+    assert h.d.front_filer is win
+    assert h.d.global_bar.process is h.d.filer_menus
+
+
+def test_keys_typed_in_the_filer_are_not_left_for_an_application(harness, monkeypatch):
+    h = harness(disks=[_volume()])
+    win = h.d.open_filer(h.d.config.disks[0])
+    h.settle()
+    alpha = Recorder("Alpha", at=(30, 60))
+    proc = h.launch(alpha)
+    h.wait_until(lambda: h.d.front_process is proc, what="Alpha to come forward")
+    c = win.tree.visualItemRect(_item(win, "Games")).center()
+    h.click(*h.mac(win.tree.viewport(), c))         # the Filer is front again
+    h.settle()
+    posted = []
+    post = proc.events.post
+
+    def spy(ev):
+        posted.append(ev.what)
+        return post(ev)
+
+    monkeypatch.setattr(proc.events, "post", spy)
+    QTest.keyClick(win, Qt.Key.Key_A)               # a keystroke in the Filer
+    h.settle()
+    assert posted == []                             # Alpha behind it gets none
+
+
+def test_control_w_closes_the_front_filer_window(harness):
+    h = harness(disks=[_volume()])
+    win = h.d.open_filer(h.d.config.disks[0])
+    h.settle()
+    win.tree.setFocus()
+    QTest.keyClick(win.tree, Qt.Key.Key_W, Qt.KeyboardModifier.ControlModifier)
+    h.settle()
+    assert win not in h.d.filer_windows
+    assert h.d.front_filer is None
+
+
+def _file_menu_info_enabled(h) -> bool:
+    """File > Get Info as the bar itself would draw it: through bar_menus."""
+    for menu, _cell in h.d.global_bar.cells():
+        if menu.title == "File":
+            return menu.items[2].enabled
+    raise AssertionError("the menu bar is showing no File menu")
+
+
+def test_file_info_menu_item_enabled_state(harness):
+    h = harness(disks=[_volume()])
+    win = h.d.open_filer(h.d.config.disks[0])
+    h.settle()
+    assert _file_menu_info_enabled(h) is False       # nothing is selected
+    win.tree.setCurrentItem(_item(win, "Games"))
+    h.settle()
+    assert _file_menu_info_enabled(h) is True        # an item is selected
+
+
+def test_control_i_opens_get_info_window(harness):
+    h = harness(disks=[_volume()])
+    win = h.d.open_filer(h.d.config.disks[0])
+    h.settle()
+    win.tree.setFocus()
+    win.tree.setCurrentItem(_item(win, "Games"))
+    h.settle()
+    QTest.keyClick(win.tree, Qt.Key.Key_I, Qt.KeyboardModifier.ControlModifier)
+    h.settle()
+    assert len(h.d.info_windows) == 1
+    assert "Games Info" in h.d.info_windows[0].windowTitle()
+    h.d.info_windows[0].close()
+    h.settle()
+    assert h.d.info_windows == []
+
+
+def test_file_menu_get_info_opens_window(harness):
+    h = harness(disks=[_volume()])
+    win = h.d.open_filer(h.d.config.disks[0])
+    h.settle()
+    win.tree.setCurrentItem(_item(win, "Widget"))
+    h.settle()
+    h.choose(h.d.global_bar, "File", 3)
+    h.wait_until(lambda: len(h.d.info_windows) == 1, what="the Get Info window")
+    assert "Widget Info" in h.d.info_windows[0].windowTitle()
+    h.d.info_windows[0].close()
+    h.settle()
+    assert h.d.info_windows == []
+
+
+def test_control_w_closes_get_info_window_when_front(harness):
+    h = harness(disks=[_volume()])
+    win = h.d.open_filer(h.d.config.disks[0])
+    h.settle()
+    win.tree.setCurrentItem(_item(win, "Widget"))
+    h.settle()
+    win.get_info()
+    h.settle()
+    assert len(h.d.info_windows) == 1
+    info_win = h.d.info_windows[0]
+    info_win.setFocus()
+    info_win.activateWindow()
+    h.settle()
+    QTest.keyClick(info_win, Qt.Key.Key_W, Qt.KeyboardModifier.ControlModifier)
+    h.settle()
+    assert len(h.d.info_windows) == 0
+    assert win in h.d.filer_windows
+
+
+
+def test_get_info_displays_fork_and_metadata_details(harness):
+    h = harness(disks=[_volume()])
+    win = h.d.open_filer(h.d.config.disks[0])
+    h.settle()
+    win.tree.setCurrentItem(_item(win, "Widget"))
+    h.settle()
+    win.get_info()
+    h.settle()
+    assert len(h.d.info_windows) == 1
+    info_win = h.d.info_windows[0]
+    assert "Widget Info" in info_win.windowTitle()
+    assert any("Resource fork:" in line for line in info_win._lines)
+    assert any("Type: APPL" in line for line in info_win._lines)
+    assert any("Creator: TEST" in line for line in info_win._lines)
+    info_win.close()
+    h.settle()
+
+
+def _file_menu_display_contents_enabled(h) -> bool:
+    for menu, _cell in h.d.global_bar.cells():
+        if menu.title == "File":
+            return menu.items[3].enabled
+    raise AssertionError("the menu bar is showing no File menu")
+
+
+def test_file_display_contents_menu_item_enabled_state(harness):
+    h = harness(disks=[_volume()])
+    win = h.d.open_filer(h.d.config.disks[0])
+    h.settle()
+    assert _file_menu_display_contents_enabled(h) is False
+    win.tree.setCurrentItem(_item(win, "Widget"))
+    h.settle()
+    assert _file_menu_display_contents_enabled(h) is False
+    win.tree.setCurrentItem(_item(win, "Letter"))
+    h.settle()
+    assert _file_menu_display_contents_enabled(h) is True
+
+
+def test_file_menu_display_contents_opens_window(harness):
+    h = harness(disks=[_volume()])
+    win = h.d.open_filer(h.d.config.disks[0])
+    h.settle()
+    win.tree.setCurrentItem(_item(win, "Letter"))
+    h.settle()
+    h.choose(h.d.global_bar, "File", 4)
+    h.wait_until(lambda: len(h.d.viewer_windows) == 1, what="the Content Viewer window")
+    assert "Letter" in h.d.viewer_windows[0].windowTitle()
+    h.d.viewer_windows[0].close()
+    h.settle()
+    assert h.d.viewer_windows == []
+
+
+def test_control_space_opens_content_viewer(harness):
+    h = harness(disks=[_volume()])
+    win = h.d.open_filer(h.d.config.disks[0])
+    h.settle()
+    win.tree.setFocus()
+    win.tree.setCurrentItem(_item(win, "Letter"))
+    h.settle()
+    for menu, _cell in h.d.global_bar.cells():          # the item draws ⌘ over a space
+        if menu.title == "File":
+            assert menu.items[3].key == " "
+    QTest.keyClick(win.tree, Qt.Key.Key_Space, Qt.KeyboardModifier.ControlModifier)
+    h.wait_until(lambda: len(h.d.viewer_windows) == 1, what="the Content Viewer window")
+    assert "Letter" in h.d.viewer_windows[0].windowTitle()
+    h.d.viewer_windows[0].close()
+    h.settle()
+    assert h.d.viewer_windows == []
+
+
+def test_content_viewer_ordinary_and_text_only_fork(harness):
+    h = harness(disks=[_volume()])
+    win = h.d.open_filer(h.d.config.disks[0])
+    h.settle()
+    win.tree.setCurrentItem(_item(win, "Letter"))
+    h.settle()
+    win.display_contents()
+    h.settle()
+    assert len(h.d.viewer_windows) == 1
+    viewer = h.d.viewer_windows[0]
+    assert "Hello" in viewer.text_edit.toPlainText()
+    viewer.checkbox.setChecked(True)
+    h.settle()
+    assert "Hello" in viewer.text_edit.toPlainText()
+    viewer.close()
+    h.settle()
+
+
+def test_content_viewer_empty_and_unreadable_fork(harness, monkeypatch):
+    v = _volume(games=False)
+    empty_file = machfs.File()
+    empty_file.data = b""
+    v["Empty"] = empty_file
+
+    bad_file = machfs.File()
+    bad_file.data = b"some data"
+    v["Bad"] = bad_file
+
+    h = harness(disks=[v])
+    win = h.d.open_filer(h.d.config.disks[0])
+    h.settle()
+
+    win.tree.setCurrentItem(_item(win, "Empty"))
+    h.settle()
+    win.display_contents()
+    h.settle()
+    assert "(empty)" in h.d.viewer_windows[-1].text_edit.toPlainText()
+    h.d.viewer_windows[-1].close()
+    h.settle()
+
+    bad_item = win.entries["Bad"]
+    monkeypatch.setattr(bad_item.__class__, "data", property(lambda self: (_ for _ in ()).throw(RuntimeError("Corrupt"))))
+
+    win.tree.setCurrentItem(_item(win, "Bad"))
+    h.settle()
+    win.display_contents()
+    h.settle()
+    assert "(unreadable data fork)" in h.d.viewer_windows[-1].text_edit.toPlainText()
+    h.d.viewer_windows[-1].close()
+    h.settle()
+
+
+
+

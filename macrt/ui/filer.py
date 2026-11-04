@@ -367,6 +367,7 @@ class FilerWindow(_Hosted):
         self.tree.setColumnWidth(1, 56)
         self.tree.setColumnWidth(2, 84)
         self.tree.itemActivated.connect(self._activated)
+        self.tree.installEventFilter(self)
         self.tree.viewport().installEventFilter(self)
         app = QApplication.instance()
         if app is not None:
@@ -488,15 +489,98 @@ class FilerWindow(_Hosted):
             return w is not None and (w is self or self.isAncestorOf(w))
         if inside(new) and not inside(old):
             self._set_hilited(True)
+            self.display.filer_front(self)         # screen: focus in a Filer window
         elif inside(old) and not inside(new):
             self._set_hilited(False)
+            self.display.filer_blurred(self, new)
 
     def eventFilter(self, obj, ev):  # noqa: N802
         if ev.type() == QEvent.Type.MouseButtonPress:
             self.raise_()
             if self.isWindow():
                 self.activateWindow()
+            self.display.filer_front(self)         # a click in the list
+        elif (obj is self.tree and ev.type() == QEvent.Type.KeyPress
+              and ev.modifiers() & (Qt.KeyboardModifier.ControlModifier
+                                    | Qt.KeyboardModifier.MetaModifier)):
+            # The list takes most keys itself — Space selects — so a
+            # Command-key equivalent it would swallow is offered to the
+            # Display first, which answers True when it took it.
+            return self.display.key_event(ev)
         return False
+
+    # -- what the menus act on ---------------------------------------------
+    def selected_item(self) -> MacFile | None:
+        items = self.tree.selectedItems()
+        if not items:
+            return None
+        return self.entries.get(items[0].text(0))
+
+    def selected_actions(self) -> set[str]:
+        """The things the menus can do with the selection: an empty set
+        while nothing is selected."""
+        item = self.selected_item()
+        if item is None:
+            return set()
+        actions = {"open", "info"}
+        try:
+            has_data = item.type != FOLDER and len(item.rsrc) == 0
+        except Exception:
+            has_data = item.type != FOLDER
+        if has_data:
+            actions.add("display_contents")
+        return actions
+
+    def open_selected(self) -> None:
+        """Open the currently selected item, as double-clicking it would."""
+        item = self.selected_item()
+        if item is None:
+            return
+        if item.type == FOLDER:
+            self.display.open_filer(self.volume, self.path + (item.name,), self.options)
+            return
+        self._open(item)
+
+    def get_info(self) -> None:
+        """Open a Get Info window for the currently selected item."""
+        item = self.selected_item()
+        if item is None:
+            return
+        win = GetInfoWindow(self.display, item)
+        self.display.info_windows.append(win)
+        # Center the info window over the Filer window.
+        fr = self.frameGeometry()
+        win.move(fr.center().x() - win.width() // 2,
+                 fr.center().y() - win.height() // 2)
+        win.show()
+        win.raise_()
+        win.activateWindow()
+
+    def display_contents(self) -> None:
+        """Open a Content Viewer window for the selected file's data fork."""
+        item = self.selected_item()
+        if item is None:
+            return
+        win = ContentViewerWindow(self.display, item)
+        self.display.viewer_windows.append(win)
+        fr = self.frameGeometry()
+        win.move(fr.center().x() - win.width() // 2,
+                 fr.center().y() - win.height() // 2)
+        win.show()
+        win.raise_()
+        win.activateWindow()
+
+    # -- the keyboard -------------------------------------------------------
+    # A Filer window has no Process behind it, so its keys come here rather
+    # than through the Display's event filter: the Display takes them, the
+    # Filer's own menu shortcuts first.
+    def keyPressEvent(self, ev):  # noqa: N802
+        self.display.key_event(ev)
+        ev.accept()
+
+    def keyReleaseEvent(self, ev):  # noqa: N802
+        self.display.key_event(ev)
+        ev.accept()
 
     # -- opening what's clicked -------------------------------------------
     def _activated(self, item: QTreeWidgetItem) -> None:
@@ -554,3 +638,526 @@ class FilerWindow(_Hosted):
 
     def _say(self, message: str) -> None:
         self.display.show_alert(QMessageBox.Icon.Warning, "Could Not Open", message)
+
+
+class AboutWindow(_Hosted):
+    """An About window, modeled on the System 7 About dialogs: a small
+    window with a title bar and close box, its lines of text drawn in the
+    content area, draggable by its title."""
+
+    def __init__(self, display: Display, title: str, lines: list[str],
+                 title_icon: list[str] | None = None,
+                 content_size: tuple[int, int] = (280, 100),
+                 parent: QWidget | None = None):
+        super().__init__(display, parent)
+        self._title = title
+        self._lines = lines
+        self._title_icon = title_icon
+        self._content_size = content_size
+        self.setWindowTitle(title)
+        self._hilited = True
+        self._pressed = k.wNoHit
+        self._relayout()
+
+    def frame(self) -> chrome.Frame:
+        return chrome.Frame(kind=WindowKind.DOCUMENT, title=self._title,
+                            title_icon=self._title_icon, hilited=self._hilited,
+                            go_away=True, pressed=self._pressed)
+
+    def content_size(self) -> tuple[int, int]:
+        return self._content_size
+
+    def _relayout(self) -> None:
+        f = self.frame()
+        w, h = chrome.structure_size(f, *self.content_size())
+        s = chrome.shadow(f)
+        self.resize(w + s, h + s)
+        self.setMask(chrome.mask(f, w, h))
+        self.update()
+
+    def paintEvent(self, event):  # noqa: N802
+        f = self.frame()
+        w = self.width() - chrome.shadow(f)
+        h = self.height() - chrome.shadow(f)
+        p = QPainter(self)
+        chrome.paint(p, f, w, h)
+        rect = chrome.content_rect(f, w, h)
+        p.fillRect(rect, theme.WHITE)
+        p.setFont(theme.body_font())
+        y = rect.top() + 20
+        for line in self._lines:
+            p.drawText(rect.left() + 20, y, line)
+            y += 18
+
+    def _hit(self, x: int, y: int) -> int:
+        f = self.frame()
+        w = self.width() - chrome.shadow(f)
+        h = self.height() - chrome.shadow(f)
+        return chrome.hit(f, w, h, x, y)
+
+    def box_rect(self, part: int):
+        if part != k.wInGoAway:
+            return None
+        f = self.frame()
+        w = self.width() - chrome.shadow(f)
+        return chrome.close_box_rect(f, w)
+
+    def set_pressed(self, part: int) -> None:
+        if part != self._pressed:
+            self._pressed = part
+            self.update()
+
+    def mousePressEvent(self, ev):  # noqa: N802
+        self.raise_()
+        self.activateWindow()
+        self.display.update_mouse(ev.globalPosition().toPoint(), ev.modifiers(), down=True)
+        part = self._hit(ev.position().toPoint().x(), ev.position().toPoint().y())
+        if part == k.wInGoAway:
+            self.display._start_tracker(
+                BoxTracker(self.display, Future(), self, k.wInGoAway)
+            ).add_done_callback(self._close_box_done)
+        elif part == k.wInDrag:
+            self.display._start_tracker(DragTracker(
+                self.display, Future(), self, self.mac_origin(),
+                self.display._drag_limit(None), self.display.input.mac_pos))
+
+    def mouseMoveEvent(self, ev):  # noqa: N802
+        self.display.update_mouse(ev.globalPosition().toPoint(), ev.modifiers(), down=None)
+        t = self.display.tracker
+        if isinstance(t, (BoxTracker, DragTracker)) and self._tracks(t):
+            t.move(ev.globalPosition().toPoint())
+
+    def mouseReleaseEvent(self, ev):  # noqa: N802
+        self.display.update_mouse(ev.globalPosition().toPoint(), ev.modifiers(), down=False)
+        t = self.display.tracker
+        if isinstance(t, (BoxTracker, DragTracker)) and self._tracks(t):
+            t.release(ev.globalPosition().toPoint())
+        self.display.input.releases = self.display.input.presses
+
+    def _tracks(self, t) -> bool:
+        return getattr(t, "view", None) is self or getattr(t, "widget", None) is self
+
+    def _close_box_done(self, closed) -> None:
+        if closed:
+            self.close()
+
+    def closeEvent(self, event):  # noqa: N802
+        event.accept()
+        if self in self.display.about_windows:
+            self.display.about_windows.remove(self)
+
+    def keyPressEvent(self, ev):  # noqa: N802
+        if ev.key() == Qt.Key.Key_W and (ev.modifiers() & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier)):
+            self.close()
+            ev.accept()
+            return
+        super().keyPressEvent(ev)
+
+
+class GetInfoWindow(AboutWindow):
+    """A Get Info window for a Filer item, modeled on System 6 Get Info boxes."""
+
+    def __init__(self, display: Display, item: MacFile, parent: QWidget | None = None):
+        lines = [f"Name: {item.name}"]
+        if item.type != FOLDER:
+            data, rsrc = item.sizes()
+            lines.append(f"Data fork: {data:,} bytes")
+            lines.append(f"Resource fork: {rsrc:,} bytes")
+            lines.append(f"Total size: {data + rsrc:,} bytes")
+            lines.append(f"Type: {item.type.decode('latin1', errors='replace')}")
+            lines.append(f"Creator: {item.creator.decode('latin1', errors='replace')}")
+            if item.flags:
+                lines.append(f"Flags: 0x{item.flags:04X}")
+        else:
+            lines.append("Kind: Folder")
+        super().__init__(display, f"{item.name} Info", lines,
+                         title_icon=item_icon(item) or _generic_icon(item),
+                         content_size=(320, 160), parent=parent)
+        self.item = item
+        # The item's own icon at its full size, for the box; None keeps
+        # the generic one for what it is.
+        self._own_icon = item_icon(item, large=True)
+
+    def paintEvent(self, event):  # noqa: N802
+        f = self.frame()
+        w = self.width() - chrome.shadow(f)
+        h = self.height() - chrome.shadow(f)
+        p = QPainter(self)
+        chrome.paint(p, f, w, h)
+        rect = chrome.content_rect(f, w, h)
+        p.fillRect(rect, theme.WHITE)
+
+        # Draw icon: the item's own when it has one, else the generic one
+        own = self._own_icon
+        if own is not None:
+            icon_w, icon_h = theme.bitmap_size(own)
+            theme.draw_bitmap(p, rect.left() + 16 + (32 - icon_w) // 2,
+                              rect.top() + 16 + (32 - icon_h) // 2,
+                              own, theme.BLACK)
+        else:
+            ico = icon(_icon_for(self.item))
+            p.drawPixmap(rect.left() + 16, rect.top() + 16, 32, 32,
+                         ico.pixmap(32, 32))
+
+        # Draw details
+        p.setFont(theme.body_font())
+        y = rect.top() + 20
+        for line in self._lines:
+            p.drawText(rect.left() + 64, y, line)
+            y += 18
+
+    def closeEvent(self, event):  # noqa: N802
+        event.accept()
+        if self in self.display.info_windows:
+            self.display.info_windows.remove(self)
+
+
+class ContentViewerWindow(AboutWindow):
+    """A viewer window for a file's data fork (hex view and text-only view)."""
+
+    def __init__(self, display: Display, item: MacFile):
+        super().__init__(display, item.name, [],
+                         title_icon=item_icon(item) or _generic_icon(item),
+                         content_size=(560, 400))
+        self.item = item
+        self.text_only = False
+
+        self.checkbox = QCheckBox("Text only", self)
+        self.checkbox.setChecked(False)
+        self.checkbox.stateChanged.connect(self._toggle_view)
+
+        self.text_edit = QPlainTextEdit(self)
+        self.text_edit.setReadOnly(True)
+        self.text_edit.setFont(theme.body_font())
+        self.text_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self._update_content()
+        self._relayout()
+
+    def _toggle_view(self, state) -> None:
+        self.text_only = bool(state)
+        self._update_content()
+
+    def _update_content(self) -> None:
+        try:
+            data = self.item.data
+            if not data:
+                self.text_edit.setPlainText("(empty)")
+                return
+            if self.text_only:
+                try:
+                    text = data.decode('utf-8', errors='replace')
+                except Exception:
+                    text = data.decode('latin1', errors='replace')
+                self.text_edit.setPlainText(text)
+            else:
+                lines = []
+                for i in range(0, len(data), 16):
+                    chunk = data[i:i+16]
+                    hex_part = " ".join(f"{b:02X}" for b in chunk)
+                    hex_part = hex_part.ljust(47)
+                    ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+                    lines.append(f"{i:08X}: {hex_part}  {ascii_part}")
+                self.text_edit.setPlainText("\n".join(lines))
+        except Exception:
+            self.text_edit.setPlainText("(unreadable data fork)")
+
+    def _relayout(self) -> None:
+        super()._relayout()
+        if not hasattr(self, "checkbox") or not hasattr(self, "text_edit"):
+            return
+        f = self.frame()
+        w = self.width() - chrome.shadow(f)
+        h = self.height() - chrome.shadow(f)
+        rect = chrome.content_rect(f, w, h)
+        self.checkbox.setGeometry(rect.left() + 8, rect.top() + 8, 100, 24)
+        self.text_edit.setGeometry(rect.left() + 8, rect.top() + 38, rect.width() - 16, rect.height() - 46)
+
+    def closeEvent(self, event):  # noqa: N802
+        event.accept()
+        if self in self.display.viewer_windows:
+            self.display.viewer_windows.remove(self)
+
+
+class AboutClassettaWindow(AboutWindow):
+    """About Classetta, modeled on System 7's About This Macintosh: the
+    Classetta logo (the machine's own large icon until it arrives), the
+    emulated model name, version, and build info at top; Total Memory and
+    Largest Unused Block below; then a scrollable list of the System's
+    heap and of the running applications with their memory usage bars."""
+
+    def __init__(self, display: Display, parent: QWidget | None = None):
+        # Get system info
+        system = display.system
+        model_name = system.model.name
+        version = "0.1.0"  # From pyproject.toml
+        build_date = "2026-10-30"  # Build date
+        total_memory = 8 * 1024  # 8MB in K
+        largest_free = system.largest_free() // 1024  # In K
+
+        # The System's heap at the top of the list — how much of memory
+        # is reserved for it and how far its heap has grown — then each
+        # running application the same way (System/Filer processes outside
+        # the application heap are not among them).
+        sys_heap = system.sys_heap
+        processes = [("System", (sys_heap.limit - sys_heap.start) // 1024,
+                      (sys_heap.end - sys_heap.start) // 1024,
+                      theme.GENERIC_APP_ICON)]
+        for proc in display.processes:
+            if proc.name not in ("System", "Filer"):
+                partition_size = (proc.partition.end - proc.partition.start) // 1024
+                heap_used = (proc.partition.heap.end - proc.partition.heap.start) // 1024
+                # The running application's own icon, else the generic one
+                row_icon = (theme.GENERIC_APP_ICON if proc.app is None
+                            else _icon_from(bytes(proc.app.rsrc))
+                                 or theme.GENERIC_APP_ICON)
+                processes.append((proc.name, partition_size, heap_used, row_icon))
+
+        # Build the window - no title icon
+        title = "About Classetta"
+        lines = [
+            model_name,
+            "",
+            f"Classetta {version}",
+            f"Build {build_date}",
+            "",
+            f"Total Memory: {total_memory}K",
+            f"Largest Unused Block: {largest_free}K",
+        ]
+        super().__init__(display, title, lines, content_size=(400, 300),
+                         parent=parent)
+        self._processes = processes
+        self._total_memory = total_memory
+        self._largest_free = largest_free
+        self._logo_icon = (theme.MAC_II_ICON if model_name == "Macintosh II"
+                           else theme.MAC_PLUS_ICON)
+
+        # Create scroll area for application list
+        self._app_list_y = 0  # Will be set in paintEvent
+        self._scroll_offset = 0
+        self._scroll_bar_width = 16
+        self._row_height = 20
+
+    def paintEvent(self, event):  # noqa: N802
+        f = self.frame()
+        w = self.width() - chrome.shadow(f)
+        h = self.height() - chrome.shadow(f)
+        p = QPainter(self)
+        chrome.paint(p, f, w, h)
+        content = chrome.content_rect(f, w, h)
+        p.fillRect(content, theme.WHITE)
+
+        cx, cy = content.x(), content.y()
+        cw = content.width()
+
+        body = theme.body_font()
+        title = theme.title_font()
+        p.setFont(body)
+        bm = p.fontMetrics()
+
+        # Three columns: the icon down the left, the left-hand text (the
+        # model name and Total Memory), and the right-hand text (version,
+        # build, and Largest Unused Block) which the rows' bars sit under.
+        icon_bitmap = self._logo_icon
+        icon_w, icon_h = theme.bitmap_size(icon_bitmap)
+        col1_x = cx + 6
+        col2_x = col1_x + icon_w + 8
+        col3_x = cx + cw - 8 - max(bm.horizontalAdvance(line)
+                                   for line in (self._lines[2], self._lines[3],
+                                                self._lines[6]))
+        mem_x = col2_x + bm.horizontalAdvance("Total Memory: ")
+
+        p.setFont(title)
+        tm = p.fontMetrics()
+        row_h = max(tm.height(), bm.height())
+        y_top = cy + 8
+
+        # The logo spans both lines: line 1 beside it is the blank area
+        # the model name goes underneath, with the version on the right.
+        theme.draw_bitmap(p, col1_x, y_top, icon_bitmap, theme.BLACK)
+        p.setFont(body)
+        p.drawText(col3_x, y_top + tm.ascent(), self._lines[2])
+
+        # Line 2: the model name beside the logo, the build under the version.
+        p.setFont(title)
+        p.drawText(col2_x, y_top + row_h + tm.ascent(), self._lines[0])
+        p.setFont(body)
+        p.drawText(col3_x, y_top + row_h + tm.ascent(), self._lines[3])
+
+        # Line 4 (line 3 is left blank): the memory summary.
+        mem_top = y_top + 3 * row_h
+        p.drawText(col2_x, mem_top + bm.ascent(), self._lines[5])
+        p.drawText(col3_x, mem_top + bm.ascent(), self._lines[6])
+
+        # The horizontal line, full width across the content area.
+        line_y = mem_top + row_h + 4
+        p.drawLine(cx, line_y, cx + cw, line_y)
+
+        # Application list area
+        self._app_list_y = line_y + 8
+        app_list_height = content.bottom() - self._app_list_y
+        row_height = self._row_height
+
+        # Calculate total height of all rows
+        total_rows_height = len(self._processes) * row_height
+        has_scrollbar = total_rows_height > app_list_height
+
+        # Draw scroll bar if needed
+        if has_scrollbar:
+            # Draw scroll bar track
+            scroll_x = content.right() - self._scroll_bar_width
+            p.fillRect(scroll_x, self._app_list_y, self._scroll_bar_width,
+                      app_list_height, theme.WHITE)
+            p.drawRect(scroll_x, self._app_list_y, self._scroll_bar_width - 1,
+                      app_list_height - 1)
+
+            # Calculate scroll bar thumb size and position
+            visible_ratio = app_list_height / total_rows_height
+            thumb_height = int(app_list_height * visible_ratio)
+            max_scroll = total_rows_height - app_list_height
+            if max_scroll > 0:
+                thumb_pos = int((app_list_height - thumb_height) * (self._scroll_offset / max_scroll))
+            else:
+                thumb_pos = 0
+
+            # Draw scroll bar thumb
+            thumb_y = self._app_list_y + thumb_pos
+            p.fillRect(scroll_x + 2, thumb_y + 2, self._scroll_bar_width - 4,
+                      thumb_height - 4, theme.BLACK)
+
+        bar_end = content.right() - (self._scroll_bar_width if has_scrollbar else 0)
+
+        # Draw application rows
+        for i, (name, partition_size, heap_used, row_icon) in enumerate(
+                self._processes):
+            row_y = self._app_list_y + i * row_height - self._scroll_offset
+
+            # Skip rows that are not visible
+            if row_y + row_height < self._app_list_y or row_y > content.bottom():
+                continue
+
+            # Clip drawing to the app list area
+            p.save()
+            p.setClipRect(content.x(), self._app_list_y, content.width() - (
+                self._scroll_bar_width if has_scrollbar else 0), app_list_height)
+
+            # Draw the application's own icon (the generic one when it has none)
+            p.setFont(body)
+            row_icon_w, row_icon_h = theme.bitmap_size(row_icon)
+            theme.draw_bitmap(p, col1_x, row_y + (row_height - row_icon_h) // 2,
+                              row_icon, theme.BLACK)
+
+            # Draw application name, up to the memory column
+            max_name = mem_x - col2_x - 6
+            p.drawText(col2_x, row_y + 14,
+                       bm.elidedText(name, Qt.TextElideMode.ElideRight, max_name))
+
+            # Draw application memory, aligned under Total Memory's value
+            p.drawText(mem_x, row_y + 14, f"{partition_size}K")
+
+            # Draw memory bar, under Largest Unused Block
+            bar_x = col3_x
+            bar_width = bar_end - bar_x - 4
+            bar_height = 12
+            bar_y = row_y + 4
+
+            # Draw outline
+            p.drawRect(bar_x, bar_y, bar_width, bar_height)
+
+            # Draw used portion (black) and unused portion (white)
+            if partition_size > 0 and bar_width > 2:
+                used_width = min(bar_width - 2,
+                                 max(0, int((heap_used / partition_size) * bar_width)))
+                p.fillRect(bar_x + 1, bar_y + 1, used_width, bar_height - 2, theme.BLACK)
+                p.fillRect(bar_x + 1 + used_width, bar_y + 1,
+                          bar_width - 2 - used_width, bar_height - 2, theme.WHITE)
+
+            p.restore()
+
+    def mousePressEvent(self, ev):  # noqa: N802
+        # Handle scroll bar clicks
+        if self._scroll_offset >= 0:
+            # Check if click is in scroll bar area
+            f = self.frame()
+            w = self.width() - chrome.shadow(f)
+            h = self.height() - chrome.shadow(f)
+            content = chrome.content_rect(f, w, h)
+            pos = ev.position().toPoint()
+
+            if (content.right() - self._scroll_bar_width <= pos.x() <= content.right()
+                    and pos.y() >= self._app_list_y):
+                # Click in scroll bar area
+                total_rows_height = len(self._processes) * self._row_height
+                app_list_height = content.bottom() - self._app_list_y
+                max_scroll = total_rows_height - app_list_height
+
+                if max_scroll > 0:
+                    # Calculate click position relative to scroll bar
+                    click_y = pos.y() - self._app_list_y
+                    thumb_height = int(app_list_height * (app_list_height / total_rows_height))
+
+                    # Simple scroll: scroll up or down based on click position
+                    if click_y < thumb_height // 2:
+                        # Click near top - scroll up
+                        self._scroll_offset = max(0, self._scroll_offset - self._row_height * 3)
+                    elif click_y > app_list_height - thumb_height // 2:
+                        # Click near bottom - scroll down
+                        self._scroll_offset = min(max_scroll, self._scroll_offset + self._row_height * 3)
+                    else:
+                        # Click in middle - scroll proportionally
+                        ratio = click_y / app_list_height
+                        self._scroll_offset = int(max_scroll * ratio)
+
+                    self.update()
+                    return
+
+        # Call parent for other mouse events
+        super().mousePressEvent(ev)
+
+
+# The Filer's menus, by the IDs the Menu Manager gives them.
+APPLE_MENU_ID = 128
+FILE_MENU_ID = 129
+EDIT_MENU_ID = 130
+VIEW_MENU_ID = 131
+SPECIAL_MENU_ID = 132
+
+
+class FilerMenus:
+    """The Filer's menus for the menu bar, kept host-side.  The Filer is
+    not a Process: it is one application with many windows, so while any
+    of them is frontmost the bar shows these instead of a process's, and
+    a choice from them is answered by the Display itself, as the System 7
+    Application menu's is."""
+
+    def __init__(self, display: Display):
+        self.display = display
+        self.last_bar: MenuBarWidget | None = None
+        self.menus: dict[int, Menu] = {m.id: m for m in (
+            Menu(APPLE_MENU_ID, k.APPLE_MENU_TITLE,
+                 parse_menu_items("About Classetta…;(-")),
+            Menu(FILE_MENU_ID, "File", parse_menu_items(
+                "(Open/O;(-;(Get Info…/I;(Display Contents/ ;(-;(Close/W;(Eject/E")),
+            Menu(EDIT_MENU_ID, "Edit", parse_menu_items(
+                "(Undo/Z;(-;(Cut/X;(Copy/C;(Paste/V;(Clear;(Select All/A")),
+            Menu(VIEW_MENU_ID, "View", parse_menu_items(
+                "(by Icon;(by Small Icon;(by Name;(by Date;(by Size;(by Kind")),
+            Menu(SPECIAL_MENU_ID, "Special", parse_menu_items(
+                "(Clean Up Window;(Empty Trash;(Erase Disk…;(Set Startup…;"
+                "(-;(Restart;(Shutdown")),
+        )}
+
+    def bar_menus(self) -> list[Menu]:
+        """The Filer's menu headings, with File > Open, File > Get Info, and
+        File > Display Contents enabled only where appropriate."""
+        front = self.display.front_filer
+        openable = front is not None and "open" in front.selected_actions()
+        infoable = front is not None and "info" in front.selected_actions()
+        displayable = front is not None and "display_contents" in front.selected_actions()
+        closeable = front is not None
+        file_menu = self.menus[FILE_MENU_ID]
+        if file_menu.items:
+            file_menu.items[0].enabled = openable
+            file_menu.items[2].enabled = infoable
+            file_menu.items[3].enabled = displayable
+            file_menu.items[5].enabled = closeable
+        return list(self.menus.values())

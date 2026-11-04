@@ -810,6 +810,12 @@ class MenuTracker:
             self._finish(0)
             self.display.application_menu_choice(item)
             return
+        if menu is not None and self.bar.process is self.display.filer_menus:
+            # The Filer's menus: no process waits on a MenuSelect, so the
+            # Display takes the choice itself.
+            self._finish(0)
+            self.display.filer_menu_choice(menu.id, item)
+            return
         self._finish((menu.id & 0xFFFF) << 16 | item if menu else 0)
 
     def _finish(self, result: int) -> None:
