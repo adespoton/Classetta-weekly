@@ -231,17 +231,32 @@ class _ListHeader(QHeaderView):
             return
         icon = model.headerData(logicalIndex, Qt.Orientation.Horizontal,
                                 Qt.ItemDataRole.DecorationRole)
+        painter.save()
+        # The stylesheet's section leaves the painter clipped to nothing,
+        # so whatever is drawn on top of it — the lock, the label — needs
+        # the clip set back to the section first or it never lands.
+        painter.setClipRect(rect, Qt.ClipOperation.ReplaceClip)
         painter.setFont(self.font())
+        # Drawn one pixel left of where the ink should fall: the 'N' of
+        # Name has a pixel of left bearing, so at 26 it lands at 27 —
+        # the column the file names below begin in.
         text_left = rect.x() + 26
-        old_left = rect.x() + (4 if icon is None or icon.isNull() else 21)
-        painter.fillRect(old_left, rect.y(),
+        painter.fillRect(rect.x(), rect.y(),
                          text_left + painter.fontMetrics().horizontalAdvance(text)
-                         + 2 - old_left, rect.height() - 1, Qt.GlobalColor.white)
+                         + 2 - rect.x(), rect.height() - 1, Qt.GlobalColor.white)
+        if icon is not None and not icon.isNull():
+            # The lock moved off the padding: drawn there its first pixel
+            # fell at 4, too far from Name at 26 — at 8 it sits beside it.
+            size = icon.actualSize(QSize(rect.width(), rect.height()))
+            icon.paint(painter, rect.x() + 8,
+                       rect.y() + (rect.height() - size.height()) // 2,
+                       size.width(), size.height())
         painter.setPen(Qt.GlobalColor.black)
         painter.drawText(text_left, rect.y() + 2, rect.width() - 30,
                          rect.height() - 5,
                          int(Qt.AlignmentFlag.AlignLeft
                              | Qt.AlignmentFlag.AlignVCenter), text)
+        painter.restore()
 
 
 class FilerWindow(_Hosted):
