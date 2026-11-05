@@ -2,6 +2,7 @@
 
 import machfs
 import pytest
+import struct
 from PyQt6.QtCore import Qt
 from PyQt6.QtTest import QTest
 
@@ -565,20 +566,23 @@ def test_control_w_closes_get_info_window_when_front(harness):
 
 
 
-def test_get_info_displays_fork_and_metadata_details(harness):
-    h = harness(disks=[_volume()])
+def test_get_info_displays_minimum_and_desired_heap(harness):
+    v = _volume()
+    app = machfs.File()
+    app.type, app.creator = b"APPL", b"TEST"
+    app.rsrc = build_fork([Resource(b"SIZE", 0, struct.pack(">HII", 0, 2000000, 1000000))])
+    v["SizedApp"] = app
+    h = harness(disks=[v])
     win = h.d.open_filer(h.d.config.disks[0])
     h.settle()
-    win.tree.setCurrentItem(_item(win, "Widget"))
+    win.tree.setCurrentItem(_item(win, "SizedApp"))
     h.settle()
     win.get_info()
     h.settle()
     assert len(h.d.info_windows) == 1
     info_win = h.d.info_windows[0]
-    assert "Widget Info" in info_win.windowTitle()
-    assert any("Resource fork:" in line for line in info_win._lines)
-    assert any("Type: APPL" in line for line in info_win._lines)
-    assert any("Creator: TEST" in line for line in info_win._lines)
+    assert any("Minimum heap:" in line for line in info_win._lines)
+    assert any("Desired heap:" in line for line in info_win._lines)
     info_win.close()
     h.settle()
 
