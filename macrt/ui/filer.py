@@ -33,6 +33,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ..macfile import MacFile, archive_kind, is_control_panel, launch_target, list_folder
+from ..process import size_resource
 from ..m68k.segload import has_code, why_no_code
 from ..resfork import InvalidForkError, is_fork, read_fork
 from ..toolbox import constants as k
@@ -781,6 +782,11 @@ class GetInfoWindow(AboutWindow):
             lines.append(f"Data fork: {data:,} bytes")
             lines.append(f"Resource fork: {rsrc:,} bytes")
             lines.append(f"Total size: {data + rsrc:,} bytes")
+            if item.type == b"APPL":
+                if sizes := size_resource(item):
+                    preferred, minimum = sizes
+                    lines.append(f"Minimum heap: {minimum // 1024:,}K")
+                    lines.append(f"Desired heap: {preferred // 1024:,}K")
             lines.append(f"Type: {item.type.decode('latin1', errors='replace')}")
             lines.append(f"Creator: {item.creator.decode('latin1', errors='replace')}")
             if item.flags:
