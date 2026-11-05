@@ -795,7 +795,7 @@ class GetInfoWindow(AboutWindow):
             lines.append("Kind: Folder")
         super().__init__(display, f"{item.name} Info", lines,
                          title_icon=item_icon(item) or _generic_icon(item),
-                         content_size=(320, 160), parent=parent)
+                         content_size=(320, 200), parent=parent)
         self.item = item
         # The item's own icon at its full size, for the box; None keeps
         # the generic one for what it is.
