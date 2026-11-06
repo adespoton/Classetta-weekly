@@ -32,7 +32,7 @@ from PyQt6.QtWidgets import (
     QTreeWidgetItem, QWidget,
 )
 
-from ..macfile import MacFile, archive_kind, is_control_panel, launch_target, list_folder
+from ..macfile import HostFolder, MacFile, archive_kind, is_control_panel, launch_target, list_folder
 from ..process import size_resource
 from ..m68k.segload import has_code, why_no_code
 from ..resfork import InvalidForkError, is_fork, read_fork
@@ -332,15 +332,19 @@ class FilerWindow(_Hosted):
     title bar wears an icon of the container it lists — the disk image
     at the root, a folder inside — the container's own when it has one."""
 
-    def __init__(self, display: Display, volume: machfs.Volume,
+    def __init__(self, display: Display, volume: machfs.Volume | HostFolder,
                  path: tuple[str, ...] = (), options: FilerOptions | None = None,
                  parent: QWidget | None = None):
         super().__init__(display, parent)
         self.volume = volume
         self.path = path
         self.options = options or FilerOptions()
-        self._title_icon = _container_icon(volume, path)
-        self.setWindowTitle(self.path[-1] if self.path else self.volume.name)
+        if isinstance(volume, HostFolder):
+            self._title_icon = FOLDER_ICON
+            self.setWindowTitle(path[-1] if path else str(volume.path.name) or "Host Folder")
+        else:
+            self._title_icon = _container_icon(volume, path)
+            self.setWindowTitle(self.path[-1] if self.path else self.volume.name)
         self._hilited = True
         self._pressed = k.wNoHit
         self._last_name: str | None = None
@@ -377,20 +381,29 @@ class FilerWindow(_Hosted):
 
     # -- content ----------------------------------------------------------
     def _fill(self) -> None:
-        files = sorted(list_folder(self.volume, self.path), key=lambda f: f.name.lower())
+        try:
+            files = sorted(list_folder(self.volume, self.path), key=lambda f: f.name.lower())
+        except Exception:
+            files = []
         self.entries = {f.name: f for f in files}
         self.tree.clear()
         for f in files:
             folder = f.type == FOLDER
-            data, rsrc = f.sizes()
-            size = "--" if folder else f"{data + rsrc:,}"
+            try:
+                data, rsrc = f.sizes()
+                size = "--" if folder else f"{data + rsrc:,}"
+            except Exception:
+                size = "--"
             item = QTreeWidgetItem([f.name, size, _kind(f)])
             item.setIcon(0, _qicon(item_icon(f)) or icon(_icon_for(f)))
             self.tree.addTopLevelItem(item)
 
     # -- frame ------------------------------------------------------------
     def frame(self) -> chrome.Frame:
-        title = self.path[-1] if self.path else self.volume.name
+        if isinstance(self.volume, HostFolder):
+            title = self.path[-1] if self.path else str(self.volume.path.name) or "Host Folder"
+        else:
+            title = self.path[-1] if self.path else self.volume.name
         return chrome.Frame(kind=WindowKind.DOCUMENT, title=title,
                             title_icon=self._title_icon, hilited=self._hilited,
                             go_away=True, pressed=self._pressed)
@@ -540,7 +553,11 @@ class FilerWindow(_Hosted):
         if item is None:
             return
         if item.type == FOLDER:
-            self.display.open_filer(self.volume, self.path + (item.name,), self.options)
+            if isinstance(self.volume, HostFolder):
+                sub_path = self.volume.path / item.name
+                self.display.open_filer(HostFolder(sub_path, self.volume.root), (), self.options)
+            else:
+                self.display.open_filer(self.volume, self.path + (item.name,), self.options)
             return
         self._open(item)
 
@@ -611,7 +628,11 @@ class FilerWindow(_Hosted):
         if f is None:
             return
         if f.type == FOLDER:
-            self.display.open_filer(self.volume, self.path + (f.name,), self.options)
+            if isinstance(self.volume, HostFolder):
+                sub_path = self.volume.path / f.name
+                self.display.open_filer(HostFolder(sub_path, self.volume.root), (), self.options)
+            else:
+                self.display.open_filer(self.volume, self.path + (f.name,), self.options)
             return
         self._open(f)
 

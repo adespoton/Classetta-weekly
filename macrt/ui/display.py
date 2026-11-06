@@ -648,7 +648,7 @@ class Display(QObject):
 
     def open_filer(self, volume, path: tuple[str, ...] = (),
                     options: FilerOptions | None = None) -> FilerWindow:
-        """A Filer window over one folder of a disk image, or the one
+        """A Filer window over one folder of a disk image or host folder, or the one
         already open there: brought to the front instead."""
         for win in self.filer_windows:
             if win.volume is volume and win.path == path:
