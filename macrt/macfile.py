@@ -171,11 +171,20 @@ class HostFolder:
         return None
 
     def files(self) -> list[MacFile]:
-        names = sorted(os.listdir(self.path))
+        try:
+            names = sorted(os.listdir(self.path))
+        except OSError:
+            return []
         out = []
         for n in names:
             p = self.path / n
-            if n.startswith((".", "%")) or not p.is_file():
+            if n.startswith((".", "%")):
+                continue
+            if p.is_dir():
+                sub_folder = HostFolder(p, self.root)
+                out.append(MacFile(n, type=b"fldr", key=str(p), folder=sub_folder))
+                continue
+            if not p.is_file():
                 continue
             if n.lower().endswith(".rsrc") and n[:-5] in names:
                 continue                                # app's resource fork, beside app
@@ -636,10 +645,18 @@ def volume_files(volume: machfs.Volume) -> Iterator[MacFile]:
             yield _from_machfs(volume, VolumeFolder(volume, path[:-1]), path[-1], node)
 
 
-def list_folder(volume: machfs.Volume, path: tuple[str, ...] = ()) -> list[MacFile]:
+def list_folder(volume: machfs.Volume | HostFolder, path: tuple[str, ...] = ()) -> list[MacFile]:
     """One folder's contents, as the Finder's window lists them: its
     files, and its subfolders as MacFiles of type 'fldr' with no forks,
     each keeping its place in the folder it's in."""
+    if isinstance(volume, HostFolder):
+        folder = volume
+        for part in path:
+            sub = folder._entry(part)
+            if sub is None or not sub.is_dir():
+                return []
+            folder = HostFolder(sub, folder.root)
+        return folder.files()
     folder = VolumeFolder(volume, path)
     node = folder._node(folder.path)
     out = []

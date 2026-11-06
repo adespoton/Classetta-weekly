@@ -8,7 +8,7 @@ from PyQt6.QtTest import QTest
 
 from conftest import LB, NO_MODS, Recorder
 from macrt.demo import open_targets, parse_args
-from macrt.macfile import open_disks
+from macrt.macfile import open_disks, HostFolder
 from macrt.resfork import build_fork, Resource, resPurgeable
 from macrt.toolbox import constants as k
 from macrt.ui import theme
@@ -619,6 +619,54 @@ def test_file_menu_display_contents_opens_window(harness):
     h.d.viewer_windows[0].close()
     h.settle()
     assert h.d.viewer_windows == []
+
+
+def test_open_host_folder(harness, tmp_path):
+    folder = tmp_path / "host"
+    folder.mkdir()
+    (folder / "test.txt").write_bytes(b"hello")
+    subfolder = folder / "sub"
+    subfolder.mkdir()
+    (subfolder / "inner.txt").write_bytes(b"world")
+
+    h = harness(disks=[])
+    win = h.d.open_filer(HostFolder(folder))
+    h.settle()
+    assert win.windowTitle() == "host"
+    assert _rows(win) == [("sub", "folder"), ("test.txt", "document")]
+    win.tree.setCurrentItem(_item(win, "sub"))
+    h.settle()
+    win.open_selected()
+    h.settle()
+    assert len(h.d.filer_windows) == 2
+    sub_win = h.d.filer_windows[1]
+    assert sub_win.windowTitle() == "sub"
+    assert _rows(sub_win) == [("inner.txt", "document")]
+    sub_win.tree.setCurrentItem(_item(sub_win, "inner.txt"))
+    h.settle()
+    assert sub_win.selected_actions() == {"open", "info", "display_contents"}
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    h.d.open_filer(HostFolder(empty))
+    h.settle()
+    assert _rows(h.d.filer_windows[-1]) == []
+
+    bad = tmp_path / "bad"
+    bad.mkdir()
+    (bad / "ok.txt").write_bytes(b"ok")
+    (bad / "bad.bin").write_bytes(b"not a mac file")
+    bad_win = h.d.open_filer(HostFolder(bad))
+    h.settle()
+    assert _rows(bad_win) == [("bad.bin", "document"), ("ok.txt", "document")]
+
+    inaccessible = tmp_path / "inaccessible"
+    inaccessible.mkdir()
+    inaccessible.chmod(0o000)
+    h.d.open_filer(HostFolder(inaccessible))
+    h.settle()
+    assert _rows(h.d.filer_windows[-1]) == []
+    inaccessible.chmod(0o755)
 
 
 def test_control_space_opens_content_viewer(harness):
