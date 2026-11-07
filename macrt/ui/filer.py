@@ -32,8 +32,8 @@ from PyQt6.QtWidgets import (
     QTreeWidgetItem, QWidget,
 )
 
-from ..macfile import (ContainerFolder, HostFolder, MacFile, archive_kind, is_control_panel,
-                       launch_target, list_folder)
+from ..macfile import (ContainerFolder, HostFolder, MacFile, archive_kind, container_contents,
+                       is_control_panel, launch_target, list_folder)
 from ..process import size_resource
 from ..m68k.segload import has_code, why_no_code
 from ..resfork import InvalidForkError, is_fork, read_fork
@@ -643,6 +643,17 @@ class FilerWindow(_Hosted):
         self._open(f)
 
     def _open(self, f: MacFile) -> None:
+        # A file whose data fork is itself an encoding — MacBinary, BinHex
+        # or AppleSingle — shows what it holds in a Filer window rather
+        # than run.  A container that's there but damaged says so instead.
+        try:
+            nested = container_contents(f.data, f.name, f.folder) if f.data else None
+        except ValueError as e:
+            self._say(str(e))
+            return
+        if nested is not None:
+            self.display.open_filer(ContainerFolder(nested, f.name), (), self.options)
+            return
         try:
             target = launch_target(f)
         except ValueError as e:

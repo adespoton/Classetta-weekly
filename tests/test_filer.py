@@ -8,7 +8,7 @@ from PyQt6.QtTest import QTest
 
 from conftest import LB, NO_MODS, Recorder
 from macrt.demo import open_targets, parse_args
-from macrt.macfile import ContainerFolder, HostFolder, open_disks
+from macrt.macfile import ContainerFolder, HostFolder, MacFile, open_disks
 from macrt.resfork import build_fork, Resource, resPurgeable
 from macrt.toolbox import constants as k
 from macrt.ui import theme
@@ -835,3 +835,59 @@ def test_the_window_lists_a_containers_contents(harness, tmp_path):
     assert [name for name, _ in rows] == ["Inner"]
     assert rows[0][1] == "application"
     assert win in h.d.filer_windows
+
+
+def test_a_container_in_a_window_drills_into_its_contents(harness, tmp_path):
+    core = macbinary("Core", b"payload", FORK)
+    outer = tmp_path / "Outer.bin"
+    outer.write_bytes(macbinary("Packet", core, FORK))
+    args = parse_args([str(outer), "--filer"])
+    _, _, filers, error = open_targets(args)
+    assert error is None
+    h = harness(disks=[])
+    win = h.d.open_filer(filers[0])
+    h.settle()
+    assert _rows(win) == [("Packet", "application")]
+    win.tree.setCurrentItem(_item(win, "Packet"))
+    h.settle()
+    assert win.selected_actions() == {"open", "info", "display_contents"}
+    assert _file_menu_open_enabled(h) is True     # File > Open can drill into it
+    win.open_selected()
+    h.settle()
+    assert len(h.d.filer_windows) == 2
+    inner = h.d.filer_windows[1]
+    assert inner.windowTitle() == "Packet"
+    assert _rows(inner) == [("Core", "application")]
+    assert not h.d._alerts
+
+
+def test_a_damaged_nested_container_says_so_without_crashing(harness, tmp_path):
+    cut = bytes(bytearray(macbinary("Core", b"payload", FORK))[:150])   # header, no forks
+    outer = tmp_path / "Outer.bin"
+    outer.write_bytes(macbinary("Packet", cut, FORK))
+    args = parse_args([str(outer), "--filer"])
+    _, _, filers, error = open_targets(args)
+    assert error is None
+    h = harness(disks=[])
+    win = h.d.open_filer(filers[0])
+    h.settle()
+    win.tree.setCurrentItem(_item(win, "Packet"))
+    h.settle()
+    win.open_selected()
+    h.settle()
+    assert len(h.d.filer_windows) == 1          # no drill window
+    assert h.d._alerts and "cut short" in h.d._alerts[0].text()
+
+
+def test_an_unsupported_nested_item_does_not_drill(harness):
+    zipped = MacFile("Packet", b"PK\x03\x04" + b"payload" * 4, FORK, b"TEXT", b"ttxt")
+    h = harness(disks=[])
+    win = h.d.open_filer(ContainerFolder(zipped, "Outer.bin"))
+    h.settle()
+    assert _rows(win) == [("Packet", "document")]
+    win.tree.setCurrentItem(_item(win, "Packet"))
+    h.settle()
+    win.open_selected()
+    h.settle()
+    assert len(h.d.filer_windows) == 1          # it did not drill into the zip
+    assert h.d._alerts                          # and it said why it could not open
