@@ -905,21 +905,50 @@ def archive_kind(f: MacFile) -> str | None:
     return None
 
 
+def _container_kind(raw: bytes) -> str | None:
+    """Which encoding raw is, if it's one load_file decodes — MacBinary,
+    BinHex or AppleSingle — else None for plain bytes.  A container that's
+    there but damaged raises, as its parser does."""
+    if _parse_macbinary(raw) is not None:
+        return "MacBinary"
+    if _parse_binhex(raw) is not None:
+        return "BinHex"
+    if _parse_apple_single(raw) is not None:
+        return "AppleSingle"
+    return None
+
+
 def container_kind(path: str | os.PathLike) -> str | None:
     """The encoding at path, when load_file decodes it as one — MacBinary,
     BinHex or AppleSingle — else None for a plain file.  Damaged or
     unreadable reads as None too: load_file already said what was wrong."""
     try:
-        raw = Path(path).read_bytes()
-        if _parse_macbinary(raw) is not None:
-            return "MacBinary"
-        if _parse_binhex(raw) is not None:
-            return "BinHex"
-        if _parse_apple_single(raw) is not None:
-            return "AppleSingle"
+        return _container_kind(Path(path).read_bytes())
     except (OSError, ValueError):
         return None
-    return None
+
+
+def container_contents(data: bytes, name: str, folder: Folder | None = None) -> MacFile | None:
+    """The file an encoded container's bytes hold — MacBinary, BinHex or
+    AppleSingle — else None when data isn't one of those.  A container
+    that's there but damaged raises, as load_file's parsers do."""
+    mb = _parse_macbinary(data) or _parse_binhex(data)
+    if mb is not None:
+        mb.folder = folder
+        return mb
+    single = _parse_apple_single(data)
+    if single is None:
+        return None
+    magic, entries = single
+    if magic == APPLE_DOUBLE:             # a sidecar header: no data fork of its own
+        real = entries.get(AS_NAME)
+        return MacFile(real.decode("mac_roman") if real else name,
+                       b"", entries.get(AS_RSRC, b""), folder=folder)
+    real = entries.get(AS_NAME)
+    f = MacFile(real.decode("mac_roman") if real else name,
+                entries.get(AS_DATA, b""), entries.get(AS_RSRC, b""), folder=folder)
+    _apply_finder_info(f, entries.get(AS_FINDER_INFO, b""))
+    return f
 
 
 class ContainerFolder:
