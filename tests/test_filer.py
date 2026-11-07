@@ -891,3 +891,57 @@ def test_an_unsupported_nested_item_does_not_drill(harness):
     h.settle()
     assert len(h.d.filer_windows) == 1          # it did not drill into the zip
     assert h.d._alerts                          # and it said why it could not open
+
+
+def test_a_contained_application_launches(harness, tmp_path, monkeypatch):
+    p = tmp_path / "App.bin"
+    p.write_bytes(macbinary("Inner", b"payload", FORK))
+    args = parse_args([str(p), "--filer"])
+    _, _, filers, error = open_targets(args)
+    assert error is None
+    h = harness(disks=[])
+    win = h.d.open_filer(filers[0])
+    h.settle()
+    launched = []
+    monkeypatch.setattr(h.d, "launch",
+                        lambda name, main, **kw: launched.append((name, kw)))
+    win.tree.setCurrentItem(_item(win, "Inner"))
+    h.settle()
+    win.open_selected()
+    h.settle()
+    assert len(launched) == 1
+    assert launched[0][0] == "Inner"
+    assert launched[0][1]["app"].name == "Inner"
+
+
+def test_a_multi_nested_application_launches(harness, tmp_path, monkeypatch):
+    inner = macbinary("Core", b"payload", FORK)
+    outer_bytes = macbinary("Packet", inner, FORK)
+    outer = tmp_path / "Outer.bin"
+    outer.write_bytes(outer_bytes)
+    args = parse_args([str(outer), "--filer"])
+    _, _, filers, error = open_targets(args)
+    assert error is None
+    h = harness(disks=[])
+    win1 = h.d.open_filer(filers[0])
+    h.settle()
+    # Drill into Packet container
+    win1.tree.setCurrentItem(_item(win1, "Packet"))
+    h.settle()
+    win1.open_selected()
+    h.settle()
+    assert len(h.d.filer_windows) == 2
+    win2 = h.d.filer_windows[1]
+    assert win2.windowTitle() == "Packet"
+    assert _rows(win2) == [("Core", "application")]
+
+    launched = []
+    monkeypatch.setattr(h.d, "launch",
+                        lambda name, main, **kw: launched.append((name, kw)))
+    win2.tree.setCurrentItem(_item(win2, "Core"))
+    h.settle()
+    win2.open_selected()
+    h.settle()
+    assert len(launched) == 1
+    assert launched[0][0] == "Core"
+    assert launched[0][1]["app"].name == "Core"
