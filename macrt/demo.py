@@ -16,6 +16,7 @@ Or run a real 68k application instead (see docs/running-apps.md):
     python -m macrt One.bin Two.hqx          # several, side by side
     python -m macrt App.hqx --list           # just list its resources
     python -m macrt App.bin --view           # show its resources; don't run its code
+    python -m macrt App.bin --filer          # show it in a Filer window instead
     python -m macrt App.bin --trace-traps    # log every trap it calls
     python -m macrt App.bin --system System  # with a real System file
 """
@@ -34,7 +35,7 @@ from PyQt6.QtCore import QTimer
 from PyQt6.QtWidgets import QApplication
 
 from .m68k.segload import has_code, why_no_code
-from .macfile import is_control_panel, open_application, open_disks
+from .macfile import HostFolder, is_control_panel, open_application, open_disks
 from .resfork import is_fork
 from .toolbox import constants as k
 from .toolbox.api import Toolbox
@@ -314,6 +315,8 @@ def parse_args(argv=None):
     ap.add_argument("--view", action="store_true",
                     help="show the application's menus, windows and dialogs from its "
                          "resources instead of running its code")
+    ap.add_argument("--filer", action="store_true",
+                    help="show a file in a Filer window instead of running it")
     ap.add_argument("--trace-traps", action="store_true",
                     help="log every Toolbox and OS trap the application calls")
     ap.add_argument("--system", metavar="FILE",
@@ -347,19 +350,28 @@ def _screen_size(text: str) -> tuple[int, int] | None:
 def open_targets(args):
     """The applications named on the command line, each with whether to
     show it from its resources rather than run its code, the disk images
-    for the drives, and those among them to show in Filer windows
-    (those no --app picks from); or an error message."""
+    for the drives, and those among them to show in Filer windows (those
+    no --app picks from, and with --filer a loose file's folder); or an
+    error message."""
     browse = bool(args.file) and not args.app and not args.list
     try:
         apps, disks = open_disks(args.file, args.app, browse=browse)
     except (OSError, ValueError) as e:
         return None, None, None, str(e)
     targets = []
+    filers = list(disks) if browse else []
     for f in apps:
         print(describe(f, full=args.list))
         for doc in f.documents:
             print(f"Opening {doc.name} with it.")
         if args.list:
+            continue
+        if getattr(args, "filer", False) and isinstance(f.folder, HostFolder):
+            # A loose file asked for in Filer view: show its folder in a
+            # Filer window rather than running it.
+            if not any(isinstance(v, HostFolder) and v.path == f.folder.path
+                       for v in filers):
+                filers.append(f.folder)
             continue
         if not f.rsrc and is_fork(f.data):
             return None, None, None, (f"{f.name}'s resource fork is in its data fork: it "
@@ -379,7 +391,7 @@ def open_targets(args):
                   "and windows from its resources.")
             view = True
         targets.append((f, view))
-    return targets, disks, (disks if browse else []), None
+    return targets, disks, filers, None
 
 
 def main(argv=None) -> int:

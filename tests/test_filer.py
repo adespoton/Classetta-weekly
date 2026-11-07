@@ -764,3 +764,24 @@ def test_item_icons(harness):
     assert not _item(win, "Marked").icon(0).isNull()
     assert not _item(win, "Bad").icon(0).isNull() # Should fall back to generic
     assert not _item(win, "Folder").icon(0).isNull()
+
+
+def test_open_target_with_filer_flag(tmp_path):
+    p = tmp_path / "App.bin"
+    p.write_bytes(macbinary("App", b"data", FORK))
+    # Default launch action: runs the app, target in targets
+    args = parse_args([str(p)])
+    targets, disks, filers, error = open_targets(args)
+    assert error is None
+    assert len(targets) == 1
+    assert targets[0][0].name == "App"
+    assert filers == []
+
+    # With --filer flag: opens parent folder in a Filer window
+    args_filer = parse_args([str(p), "--filer"])
+    targets_f, disks_f, filers_f, error_f = open_targets(args_filer)
+    assert error_f is None
+    assert targets_f == []
+    assert len(filers_f) == 1
+    assert isinstance(filers_f[0], HostFolder)
+    assert filers_f[0].path == tmp_path
