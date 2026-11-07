@@ -8,13 +8,14 @@ from PyQt6.QtTest import QTest
 
 from conftest import LB, NO_MODS, Recorder
 from macrt.demo import open_targets, parse_args
-from macrt.macfile import open_disks, HostFolder
+from macrt.macfile import ContainerFolder, HostFolder, open_disks
 from macrt.resfork import build_fork, Resource, resPurgeable
 from macrt.toolbox import constants as k
 from macrt.ui import theme
 from macrt.ui.filer import ARCHIVE_ICON, FilerOptions, _container_icon
 from macrt.ui.stdfile import DISK_ICON, DOCUMENT_ICON, FOLDER_ICON
-from test_files import FORK, macbinary
+from builders import binhex
+from test_files import FORK, apple_single, macbinary
 
 
 def _volume(games: bool = True) -> machfs.Volume:
@@ -777,11 +778,60 @@ def test_open_target_with_filer_flag(tmp_path):
     assert targets[0][0].name == "App"
     assert filers == []
 
-    # With --filer flag: opens parent folder in a Filer window
-    args_filer = parse_args([str(p), "--filer"])
+    # With --filer flag on a plain file: opens its folder in a Filer window
+    q = tmp_path / "Letter.txt"
+    q.write_bytes(b"Hello.")
+    args_filer = parse_args([str(q), "--filer"])
     targets_f, disks_f, filers_f, error_f = open_targets(args_filer)
     assert error_f is None
     assert targets_f == []
     assert len(filers_f) == 1
     assert isinstance(filers_f[0], HostFolder)
     assert filers_f[0].path == tmp_path
+
+
+def test_filer_opens_container_contents(tmp_path):
+    # MacBinary, BinHex and AppleSingle each decode to the file inside.
+    mb = tmp_path / "App.bin"
+    mb.write_bytes(macbinary("Inner", b"data", FORK))
+    hqx = tmp_path / "Doc.hqx"
+    hqx.write_bytes(b"From: a list\r\r" + binhex("HexDoc", b"hi", b"", b"TEXT", b"ttxt"))
+    single = tmp_path / "Note.as"
+    single.write_bytes(apple_single({1: b"data!", 2: FORK, 3: b"Real Name"}))
+    args = parse_args([str(mb), str(hqx), str(single), "--filer"])
+    targets, disks, filers, error = open_targets(args)
+    assert error is None
+    assert targets == []
+    assert [type(v).__name__ for v in filers] == ["ContainerFolder"] * 3
+    assert [v.name for v in filers] == ["App.bin", "Doc.hqx", "Note.as"]
+    assert [[f.name for f in v.files()] for v in filers] == \
+        [["Inner"], ["HexDoc"], ["Real Name"]]
+
+
+def test_filer_reports_a_damaged_container(tmp_path):
+    hqx = bytearray(binhex("Hex App", b"data", FORK))
+    at = hqx.index(b":") + 40
+    hqx[at] = ord("!") if hqx[at] != ord("!") else ord("#")
+    p = tmp_path / "app.hqx"
+    p.write_bytes(hqx)
+    args = parse_args([str(p), "--filer"])
+    targets, disks, filers, error = open_targets(args)
+    assert targets is None and filers is None
+    assert error and "BinHex" in error
+
+
+def test_the_window_lists_a_containers_contents(harness, tmp_path):
+    p = tmp_path / "App.bin"
+    p.write_bytes(macbinary("Inner", b"data", FORK))
+    args = parse_args([str(p), "--filer"])
+    _, _, filers, error = open_targets(args)
+    assert error is None
+    h = harness(disks=[])
+    win = h.d.open_filer(filers[0])
+    h.settle()
+    assert win.isVisible()
+    assert win.windowTitle() == "App.bin"
+    rows = _rows(win)
+    assert [name for name, _ in rows] == ["Inner"]
+    assert rows[0][1] == "application"
+    assert win in h.d.filer_windows

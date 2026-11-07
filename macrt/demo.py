@@ -30,12 +30,14 @@ import re
 import signal
 import sys
 import time
+from pathlib import Path
 
 from PyQt6.QtCore import QTimer
 from PyQt6.QtWidgets import QApplication
 
 from .m68k.segload import has_code, why_no_code
-from .macfile import HostFolder, is_control_panel, open_application, open_disks
+from .macfile import (ContainerFolder, HostFolder, container_kind, is_control_panel,
+                      open_application, open_disks)
 from .resfork import is_fork
 from .toolbox import constants as k
 from .toolbox.api import Toolbox
@@ -367,10 +369,12 @@ def open_targets(args):
         if args.list:
             continue
         if getattr(args, "filer", False) and isinstance(f.folder, HostFolder):
-            # A loose file asked for in Filer view: show its folder in a
-            # Filer window rather than running it.
-            if not any(isinstance(v, HostFolder) and v.path == f.folder.path
-                       for v in filers):
+            # A loose file asked for in Filer view: an encoding shows the
+            # file it decodes to; anything else shows its folder.
+            if container_kind(f.key) is not None:
+                filers.append(ContainerFolder(f, Path(f.key).name))
+            elif not any(isinstance(v, HostFolder) and v.path == f.folder.path
+                         for v in filers):
                 filers.append(f.folder)
             continue
         if not f.rsrc and is_fork(f.data):

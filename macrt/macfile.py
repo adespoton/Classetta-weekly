@@ -657,6 +657,8 @@ def list_folder(volume: machfs.Volume | HostFolder, path: tuple[str, ...] = ()) 
                 return []
             folder = HostFolder(sub, folder.root)
         return folder.files()
+    if isinstance(volume, ContainerFolder):
+        return volume.files()               # one flat folder: the decoded file
     folder = VolumeFolder(volume, path)
     node = folder._node(folder.path)
     out = []
@@ -901,6 +903,39 @@ def archive_kind(f: MacFile) -> str | None:
     if d[:4] == b"PK\x03\x04":
         return "zip"
     return None
+
+
+def container_kind(path: str | os.PathLike) -> str | None:
+    """The encoding at path, when load_file decodes it as one — MacBinary,
+    BinHex or AppleSingle — else None for a plain file.  Damaged or
+    unreadable reads as None too: load_file already said what was wrong."""
+    try:
+        raw = Path(path).read_bytes()
+        if _parse_macbinary(raw) is not None:
+            return "MacBinary"
+        if _parse_binhex(raw) is not None:
+            return "BinHex"
+        if _parse_apple_single(raw) is not None:
+            return "AppleSingle"
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+class ContainerFolder:
+    """The contents of an encoded container — MacBinary, BinHex,
+    AppleSingle — as the folder holding the one Mac file it decodes to,
+    for a Filer window to list."""
+
+    def __init__(self, contents: MacFile, name: str):
+        self.contents = contents
+        self.name = name                      # the container's own name, for the title
+
+    def files(self) -> list[MacFile]:
+        return [self.contents]
+
+    def find(self, name: str) -> MacFile | None:
+        return self.contents if self.contents.name.lower() == name.lower() else None
 
 
 def open_application(path: str | os.PathLike, name: str | None = None) -> MacFile:
