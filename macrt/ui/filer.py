@@ -32,7 +32,8 @@ from PyQt6.QtWidgets import (
     QTreeWidgetItem, QWidget,
 )
 
-from ..macfile import HostFolder, MacFile, archive_kind, is_control_panel, launch_target, list_folder
+from ..macfile import (ContainerFolder, HostFolder, MacFile, archive_kind, is_control_panel,
+                       launch_target, list_folder)
 from ..process import size_resource
 from ..m68k.segload import has_code, why_no_code
 from ..resfork import InvalidForkError, is_fork, read_fork
@@ -342,6 +343,9 @@ class FilerWindow(_Hosted):
         if isinstance(volume, HostFolder):
             self._title_icon = FOLDER_ICON
             self.setWindowTitle(path[-1] if path else str(volume.path.name) or "Host Folder")
+        elif isinstance(volume, ContainerFolder):
+            self._title_icon = ARCHIVE_ICON
+            self.setWindowTitle(volume.name)
         else:
             self._title_icon = _container_icon(volume, path)
             self.setWindowTitle(self.path[-1] if self.path else self.volume.name)
@@ -402,6 +406,8 @@ class FilerWindow(_Hosted):
     def frame(self) -> chrome.Frame:
         if isinstance(self.volume, HostFolder):
             title = self.path[-1] if self.path else str(self.volume.path.name) or "Host Folder"
+        elif isinstance(self.volume, ContainerFolder):
+            title = self.volume.name
         else:
             title = self.path[-1] if self.path else self.volume.name
         return chrome.Frame(kind=WindowKind.DOCUMENT, title=title,
