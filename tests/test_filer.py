@@ -12,7 +12,7 @@ from macrt.macfile import ContainerFolder, HostFolder, MacFile, open_disks
 from macrt.resfork import build_fork, Resource, resPurgeable
 from macrt.toolbox import constants as k
 from macrt.ui import theme
-from macrt.ui.filer import ARCHIVE_ICON, FilerOptions, _container_icon
+from macrt.ui.filer import ARCHIVE_ICON, SPECIAL_MENU_ID, FilerOptions, _container_icon
 from macrt.ui.stdfile import DISK_ICON, DOCUMENT_ICON, FOLDER_ICON
 from builders import binhex
 from test_files import FORK, apple_single, macbinary
@@ -164,6 +164,14 @@ def _dblclick(win, name, settle):
     settle(30)
     QTest.mouseDClick(vp, LB, NO_MODS, c)
     settle(150)
+
+
+def _front_the_filer(h, win):
+    """Click in a Filer window's list, so its own menus come back to the bar."""
+    c = win.tree.visualItemRect(_item(win, "Games")).center()
+    h.click(*h.mac(win.tree.viewport(), c))
+    h.settle()
+    assert h.d.front_filer is win
 
 
 def test_the_window_lists_the_folder(harness):
@@ -945,3 +953,50 @@ def test_a_multi_nested_application_launches(harness, tmp_path, monkeypatch):
     assert len(launched) == 1
     assert launched[0][0] == "Core"
     assert launched[0][1]["app"].name == "Core"
+
+
+# -- Special > Shutdown -----------------------------------------------------
+def test_special_shutdown_closes_the_windows_before_the_qt_app(harness, monkeypatch):
+    h = harness(disks=[_volume()])
+    win = h.d.open_filer(h.d.config.disks[0])
+    h.settle()
+    special = h.d.filer_menus.menus[SPECIAL_MENU_ID]
+    assert special.items[6].enabled              # Special > Shutdown is choosable
+    at_quit = []
+    monkeypatch.setattr(h.app, "quit", lambda: at_quit.append(win.isVisible()))
+    h.choose(h.d.global_bar, "Special", 7)
+    h.wait_until(lambda: h.d.shutting_down, what="the display to shut down")
+    assert at_quit == [False]                    # the windows are shut, then Qt goes
+
+
+def test_shutdown_asks_each_running_application_to_quit(harness):
+    h = harness(disks=[_volume()])
+    win = h.d.open_filer(h.d.config.disks[0])
+    alpha = h.launch(Recorder("Alpha", at=(30, 60)))
+    _front_the_filer(h, win)
+    h.choose(h.d.global_bar, "Special", 7)
+    h.wait_until(lambda: h.d.shutting_down, what="the display to shut down")
+    assert alpha.events.killed                   # its quit was asked for
+    h.wait_until(lambda: not alpha.thread.is_alive(), what="Alpha's thread to end")
+
+
+def test_a_quit_that_raises_does_not_stop_the_shutdown(harness, monkeypatch):
+    h = harness(disks=[_volume()])
+    win = h.d.open_filer(h.d.config.disks[0])
+    alpha = h.launch(Recorder("Alpha", at=(30, 60)))
+    beta = h.launch(Recorder("Beta", at=(30, 120)))
+    _front_the_filer(h, win)
+
+    def boom():
+        raise RuntimeError("Alpha refuses to quit")
+
+    alpha.quit = boom                            # the first application's quit fails
+    order = []
+    monkeypatch.setattr(h.app, "quit",
+                        lambda: order.append(("app.quit", beta.events.killed)))
+    h.choose(h.d.global_bar, "Special", 7)
+    h.wait_until(lambda: h.d.shutting_down, what="the display to shut down")
+    assert order == [("app.quit", True)]         # the rest still quit, root last
+    alpha.events.kill()       # only its shutdown call raised: let it stop for teardown
+    h.wait_until(lambda: not alpha.thread.is_alive() and not beta.thread.is_alive(),
+                  what="both threads to end")

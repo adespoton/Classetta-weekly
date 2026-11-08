@@ -57,9 +57,9 @@ from ..toolbox.types import Point, Rect
 from ..toolbox.windows import WindowRecord, describe_proc
 from . import chrome, theme
 from .bridge import GuiBridge
-from .filer import (APPLE_MENU_ID, FILE_MENU_ID, AboutClassettaWindow, AboutWindow,
-                    ContentViewerWindow, FilerMenus, FilerOptions, FilerWindow,
-                    GetInfoWindow)
+from .filer import (APPLE_MENU_ID, FILE_MENU_ID, SPECIAL_MENU_ID, AboutClassettaWindow,
+                    AboutWindow, ContentViewerWindow, FilerMenus, FilerOptions,
+                    FilerWindow, GetInfoWindow)
 from .keymap import key_message, modifiers_from_qt
 from .menubar import MenuBarWidget, MenuTracker, PopUpTracker
 from .tracking import BoxTracker, DragTracker, GrowTracker, Tracker
@@ -359,20 +359,13 @@ class Display(QObject):
         return outputs
 
     def shutdown(self, quit_app: bool = True) -> None:
+        """Close every window, ask each application to quit, and only
+        then let the Qt application go.  An application whose quit
+        raises must not keep the rest of the sequence from happening."""
         if self._shut_down:
             return
         self._shut_down = True
         self.bridge.closed = True
-        self.system.screen.close()
-        for out in self.sound:
-            out.close()
-        if self.tracker is not None:
-            self.tracker.cancel()
-        for proc in self.processes:
-            proc.kill()
-        app = QApplication.instance()
-        app.removeEventFilter(self._router)
-        self._app_bar_timer.stop()
         widgets = [*self.views.values(), *self.app_bars.values(), *self.filer_windows,
                    self.global_bar, self.host_window, *self._alerts, *self.file_dialogs,
                    *self.print_dialogs, *self.disk_dialogs, *self.color_dialogs,
@@ -381,6 +374,19 @@ class Display(QObject):
             if w is not None:
                 w.hide()
                 w.deleteLater()
+        self.system.screen.close()
+        for out in self.sound:
+            out.close()
+        if self.tracker is not None:
+            self.tracker.cancel()
+        app = QApplication.instance()
+        app.removeEventFilter(self._router)
+        self._app_bar_timer.stop()
+        for proc in list(self.processes):
+            try:
+                proc.quit()
+            except Exception:  # noqa: BLE001 - one app's failure must not skip the rest
+                traceback.print_exc()
         if quit_app:
             app.quit()
 
@@ -985,6 +991,8 @@ class Display(QObject):
             front = self.front_filer
             if front is not None:
                 front.close()
+        elif menu_id == SPECIAL_MENU_ID and item == 7:
+            self.shutdown()                    # Special > Shutdown
 
     def bar_image(self, proc: Process) -> QImage | None:
         """The menu bar as proc's DrawMenuBar draws it in the screen
