@@ -1,0 +1,237 @@
+# Filer Implementation Plan
+
+## Instructions for the coding agent
+
+Work on **one task at a time**, in the order listed below. Do not start later tasks until their prerequisites are complete.
+
+For each task:
+
+1. Inspect the relevant existing code and tests before editing.
+2. Implement only the task described; avoid unrelated refactors.
+3. Add or update tests for the behavior.
+4. Run the relevant tests and report their results.
+5. Summarize the implementation, changed files, and any follow-up work.
+6. Stop and wait for approval before beginning the next task.
+
+Preserve existing behavior unless a task explicitly changes it. If the codebase differs from an assumption in this plan, report the discrepancy and propose the smallest adjustment before expanding scope.
+
+## Design decisions
+
+- **The Filer is one active application with many windows.** Filer windows as a
+  whole are treated just like an active app: when any Filer window is
+  frontmost, the Filer owns the menu bar and menu state (one menu bar for all
+  Filer windows, as the Finder had); when an emulated process is frontmost, the
+  bar shows that process's menus as it does today. Filer activation participates
+  in the same paths as an app becoming active — `refresh_bars`, `_owner` /
+  `bar_at` / `find_window` routing, `restack` — and Filer menu commands are
+  dispatched host-side (the Application-menu precedent in `MenuTracker._chosen`).
+
+## Completion checklist
+
+### Foundations and menus
+
+- [x] **1. Map existing launch, Filer, menu, and format paths**
+  - Trace how applications are launched and how Filer windows are created.
+  - Identify selection and frontmost-window handling.
+  - Locate existing encodings, archive, and disk-image handlers.
+  - Record relevant tests and the smallest suitable extension points.
+  - Do not implement features in this task.
+
+- [x] **2. Build the menu-bar scaffold**
+  - Add a menu bar to the relevant application interface.
+  - Ensure it reflects the features available to the running application.
+  - Support updating the menu state when the active application or frontmost window changes.
+  - Add tests or a documented manual verification procedure.
+
+- [x] **3. Add the initial Finder 6.1-style menu structure**
+  - Add the initial menu headings and planned command placeholders.
+  - Keep commands disabled until their corresponding behavior is implemented.
+  - Ensure disabled commands cannot be invoked through the UI.
+  - Add tests for the initial menu structure and disabled state.
+
+- [x] **4. Add About Classetta menu**
+  - Add **About Classetta…**, modeled on Apple’s **About This Macintosh…**.
+  - Verify the command opens the About window and can be dismissed.
+
+- [x] **5. Define minimal item capabilities and selection context**
+  - Provide a small, shared way for menu commands to identify the selected item and its supported actions.
+  - Ensure commands operate on the selected item in the frontmost Filer window.
+  - Avoid adding capabilities not needed by the tasks that follow.
+  - Add tests for selection context and capability checks.
+
+### Core Filer commands and host folders
+
+- [x] **6. Implement File → Open**
+  - Launch the selected item in the frontmost Filer window using the existing launch behavior.
+  - Define and test behavior for no selection, unsupported items, and launch errors.
+  - Enable the menu item only when it can be used.
+
+- [x] **7. Implement basic Get Info**
+  - Add **File → Get Info** for the selected item.
+  - Display an Apple-like info window with the item’s icon, name, and other details already available in the project.
+  - Define behavior for no selection and missing metadata.
+  - Enable the menu item only when applicable.
+
+- [x] **8. Extend Get Info with fork and metadata details**
+  - Display whether the item has a data fork and/or resource fork.
+  - Display its type and creator codes when available.
+  - Display special attributes that can be read from existing metadata.
+  - Keep the window usable when some metadata is absent.
+
+- [x] **9. Display contents of data-fork-only files**
+  - Add **File → Display Contents** for files with a data fork but no resource fork.
+  - Open a hex viewer directly, without a resource-list window.
+  - Add an option at the top of the viewer to switch to a text-only view.
+  - Test empty, unreadable, and ordinary data forks.
+
+- [x] **10. Use application resource-driven icons throughout the Filer UI**
+  - Show an item’s own icon, read from its resource fork, wherever the Filer draws a generic icon for it: application and custom-icon file rows in the list, folder rows whose `Icon` file carries one, Get Info’s icon and title bar, the Content Viewer’s title bar, and the running-application rows of About Classetta.
+  - Keep the existing generic icons as the fallback when an item has no icon of its own or its resources are unreadable.
+  - Share the extraction with the title-bar path: suite icons first, then a bare `ICON`; halved to 16 for rows and title bars, full size for Get Info.
+  - Test an item that wears its own icon, one that keeps its generic icon, and unreadable resources.
+
+- [ ] **11. Display resource forks and their contents**
+  - For a file with a resource fork, show a window listing its resources.
+  - Include a **DATA** item when the file also has a data fork.
+  - Opening a resource or **DATA** opens it in the hex viewer with the text-only option.
+  - Test resource-only and resource-plus-data files.
+
+- [ ] **11b. Update Get Info for minimum and desired heap sizes**
+  - Update Get Info window to display application's minimum reserved heap and desired reserved heap, like in System 7 Finder.
+
+- [ ] **12. Open host-system folders in Filer windows**
+  - Allow a host-system folder to be opened as a Filer window.
+  - Support browsing, selection, and the applicable item commands.
+  - Preserve existing behavior for other kinds of Filer windows.
+  - Test empty folders, ordinary folders, and inaccessible folders.
+
+### Existing formats and nested browsing
+
+- [ ] **13. Add Open to Filer View for existing non-disk-image file types**
+  - Add an explicit way to request Filer view, potentially a `--filer` flag.
+  - Keep the current action as the default for each existing file type.
+  - Start with file types the application already handles.
+  - Test both the default launch action and explicit Filer-view behavior.
+
+- [ ] **14. Bring existing encodings and containers into the Filer UI**
+  - Reuse existing handlers for formats already supported by the application.
+  - Open their contents in Filer windows.
+  - Do not add new format support in this task.
+  - Test representative existing formats and invalid inputs.
+
+- [ ] **15. Enable drill-down through existing containers**
+  - Allow supported containers to be opened from within a Filer window.
+  - Support nested browsing for existing encodings and container types.
+  - Handle unsupported or corrupt nested items without crashing the Filer window.
+  - Test at least one nested-container case.
+
+- [ ] **16. Launch applications found in existing nested containers**
+  - Allow an application found through the supported nested-browsing path to be launched.
+  - Test a directly contained application and one found inside multiple existing containers.
+  - Preserve the normal launch behavior for non-nested items.
+
+### Process lifecycle
+
+- [ ] **17. Implement graceful Shutdown**
+  - Add **Special → Shutdown**.
+  - Close all windows and request a graceful quit from all running subprocesses.
+  - Terminate the root process only after the shutdown sequence completes.
+  - Test subprocesses that exit normally and handle shutdown errors without skipping cleanup.
+
+- [ ] **18. Implement Restart**
+  - Add **Special → Restart**.
+  - Reuse the graceful shutdown sequence from task 17.
+  - After shutdown, rerun the original command with the same parameters.
+  - Test argument preservation and ensure relaunch occurs only after shutdown completes.
+
+### Disk Tracker 1 and 2
+
+- [ ] **19. Export Filer contents to Disk Tracker 2 format**
+  - Export the current Filer contents to the Disk Tracker 2 file format.
+  - Preserve the metadata supported by the export format.
+  - Test representative contents and handle export failures cleanly.
+
+- [ ] **19b. Add support for Disk Tracker 1.x format**
+  - Add support for reading and handling the original Disk Tracker 1.x format in the `disktracker` library.
+  - Omit newer catalog features (Finder comments, item notes, large-volume extensions) absent in the original format.
+  - Ensure clear detection and differentiation between Disk Tracker 1.x and 2.x files.
+  - Add tests covering Disk Tracker 1.x files and error/fallback paths.
+
+- [ ] **20. Display Disk Tracker 1 and 2 files as read-only Filer windows**
+  - Open Disk Tracker 1 and 2 files in a Filer-style display-only window.
+  - Show a distinct window-bar icon to indicate display-only status.
+  - Disable opening selected files.
+  - Keep **Get Info** available for recorded metadata.
+  - Test missing metadata and attempts to invoke disabled actions.
+
+- [ ] **21. Implement color icons and other elements with --depth greater than 2**
+  - When the Filer runs with the `--depth` option set to a value greater than 2, enable color icons and other high-colour display elements.
+  - For `--depth 8` (true colour), display full 256-colour icons where available, and enable colorised UI elements where supported.
+  - For `--depth 4` (high-colour), use a reduced palette of up to 16 colours for icons and UI elements.
+  - Ensure fallback to 1-bit icons when `--depth` is 1 or when colour icons are unavailable.
+  - Update Get Info windows, application icons in the list, and other UI elements to respect the depth setting.
+  - Test that the Filer correctly switches between colour and monochrome modes based on the depth option.
+
+### New format support
+
+- [ ] **22. Establish the smallest reusable format-opening interface**
+  - Base the interface on the existing format handlers integrated in task 14.
+  - Support opening a recognized container in a Filer window.
+  - Include a clear unsupported-format and invalid-input path.
+  - Avoid implementing unrelated formats or speculative generality.
+
+- [ ] **23. Port MacExtract to a Python archive library**
+  - Reimplement [uzTools/MacExtract](https://github.com/uzTools/MacExtract) in Python as a standalone, reusable library, not tied to this project; it replaces the planned `unar` integration.
+  - Provide two library operations: list an archive's contents, and extract an archive's contents.
+  - Use the library in the Filer to list and extract archive contents.
+  - Cover its Mac formats (StuffIt, Compact Pro, BinHex, MacBinary, PackIt, AppleLink, DiskDoubler, and the rest listed in its README) in small tested batches.
+  - Test valid, corrupt, password-protected, and unsupported archives.
+
+- [ ] **24. Add CHD support**
+  - Add CHD handling through an appropriate reader or adapter.
+  - Open supported contents in a Filer window.
+  - Add tests or representative fixtures for detection and browsing.
+
+- [ ] **25. Add qcow2 support**
+  - Add qcow2 handling through an appropriate reader or adapter.
+  - Open supported contents in a Filer window.
+  - Add tests or representative fixtures for detection and browsing.
+
+- [ ] **26. Add other selected QEMU and MAME formats**
+  - Add explicitly identified formats in small, independently testable batches.
+  - Use an appropriate reader or adapter for each batch.
+  - Do not treat "all QEMU and MAME formats" as one task.
+  - Document formats that are not supported.
+
+- [ ] **26b. Add NDIF and UDIF disk-image reading**
+  - Read compressed Apple disk images: NDIF (DiskCopy 6) and UDIF (`.dmg`, `.smi`).
+  - Open their contents through the existing disk-image path (`macrt.macfile`), raw and DiskCopy 4.2 images staying as they are.
+  - Support at least single-partition images first; handle segmented/multi-part images in a later increment if needed.
+  - Report unsupported UDIF encodings and corrupt images without crashing.
+  - Test detection, extraction to a readable volume, and failure paths.
+
+- [ ] **27. CD-image support incrementally**
+  - Add one tested CD-image path first, then expand in separate increments.
+  - Cover ISO, Toast, and BIN/CUE images.
+  - Cover the requested HFS, HFS+, UDF, and Rock Ridge contents as separate, verifiable format/filesystem combinations.
+  - Handle unsupported filesystems and malformed images without crashing.
+
+- [ ] **28. Extend drill-down to newly supported formats**
+  - Allow newly supported archives and disk images to participate in nested browsing.
+  - Add one format at a time or in small tested batches.
+  - Track nesting and report failures without losing access to the parent Filer window.
+
+- [ ] **29. Launch applications executable multiple levels deep**
+  - Launch an application reached through nested encodings, archives, disk images, or filesystems.
+  - Test progressively deeper nesting, including a case with multiple container types.
+  - Ensure failures identify the level or item that could not be opened.
+
+## General acceptance criteria
+
+A task is complete when:
+
+- Its stated behavior works without breaking existing behavior.
+- Relevant automated tests pass, or a specific manual test procedure is documented when automated coverage is not practical.
+- The corresponding menu item is enabled only when the feature is usable.
+- Errors such as unsupported formats, corrupt input, missing metadata, or inaccessible folders are handled without crashing unrelated windows or the application.
+- The change is small enough to review independently.

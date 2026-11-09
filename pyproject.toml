@@ -17,7 +17,7 @@ dev = ["pytest>=8"]
 macrt = "macrt.demo:main"
 
 [tool.setuptools.packages.find]
-include = ["macrt*"]
+include = ["macrt*", "disktracker*"]
 
 [tool.setuptools.package-data]
 "macrt.ui" = ["fonts/*"]
