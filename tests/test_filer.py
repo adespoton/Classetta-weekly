@@ -1,13 +1,15 @@
 """The Filer window a disk image opens in when no --app names what to run."""
 
 import machfs
+import os
 import pytest
 import struct
+import sys
 from PyQt6.QtCore import Qt
 from PyQt6.QtTest import QTest
 
 from conftest import LB, NO_MODS, Recorder
-from macrt.demo import open_targets, parse_args
+from macrt.demo import finish, open_targets, parse_args
 from macrt.macfile import ContainerFolder, HostFolder, MacFile, open_disks
 from macrt.resfork import build_fork, Resource, resPurgeable
 from macrt.toolbox import constants as k
@@ -1000,3 +1002,37 @@ def test_a_quit_that_raises_does_not_stop_the_shutdown(harness, monkeypatch):
     alpha.events.kill()       # only its shutdown call raised: let it stop for teardown
     h.wait_until(lambda: not alpha.thread.is_alive() and not beta.thread.is_alive(),
                   what="both threads to end")
+
+
+# -- Special > Restart ------------------------------------------------------
+def test_special_restart_reruns_the_original_command_after_the_shutdown(
+        harness, monkeypatch):
+    h = harness(disks=[_volume()])
+    win = h.d.open_filer(h.d.config.disks[0])
+    alpha = h.launch(Recorder("Alpha", at=(30, 60)))
+    _front_the_filer(h, win)
+    special = h.d.filer_menus.menus[SPECIAL_MENU_ID]
+    assert special.items[5].enabled              # Special > Restart is choosable
+    command = ["python3", "-m", "macrt", "Browse.dsk", "--filer"]
+    monkeypatch.setattr(sys, "orig_argv", command)
+    runs = []
+    monkeypatch.setattr(os, "execvp", lambda prog, argv: runs.append((prog, argv)))
+    h.choose(h.d.global_bar, "Special", 6)
+    h.wait_until(lambda: h.d.shutting_down, what="the display to shut down")
+    assert h.d.restarting
+    assert runs == []                            # nothing relaunches yet
+    finish(h.d, 0)
+    assert runs == [("python3", command)]        # the original command, same parameters
+    assert not alpha.thread.is_alive()           # after the applications have gone
+
+
+def test_shutdown_leaves_the_command_alone(harness, monkeypatch):
+    h = harness(disks=[_volume()])
+    h.d.open_filer(h.d.config.disks[0])
+    runs = []
+    monkeypatch.setattr(os, "execvp", lambda prog, argv: runs.append(argv))
+    h.choose(h.d.global_bar, "Special", 7)
+    h.wait_until(lambda: h.d.shutting_down, what="the display to shut down")
+    finish(h.d, 0)
+    assert not h.d.restarting
+    assert runs == []                            # only Restart runs anything again

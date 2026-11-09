@@ -1254,7 +1254,7 @@ class FilerMenus:
                 "(by Icon;(by Small Icon;(by Name;(by Date;(by Size;(by Kind")),
             Menu(SPECIAL_MENU_ID, "Special", parse_menu_items(
                 "(Clean Up Window;(Empty Trash;(Erase Disk…;(Set Startup…;"
-                "(-;(Restart;Shutdown")),
+                "(-;Restart;Shutdown")),
         )}
 
     def bar_menus(self) -> list[Menu]:

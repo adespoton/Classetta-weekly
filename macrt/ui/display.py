@@ -227,6 +227,7 @@ class Display(QObject):
         self._swallow_release = False
         self._last_clicked: QWidget | None = None
         self._shut_down = False
+        self.restarting = False    # Special > Restart: run the original command again after
         self.system_errors: list[tuple[str, int, str]] = []    # (app, ID, what happened)
         self._alerts: list[QMessageBox] = []
         self.file_dialogs: list = []              # Standard File's, open now
@@ -991,6 +992,9 @@ class Display(QObject):
             front = self.front_filer
             if front is not None:
                 front.close()
+        elif menu_id == SPECIAL_MENU_ID and item == 6:
+            self.restarting = True             # Special > Restart
+            self.shutdown()                    # the same graceful shutdown first
         elif menu_id == SPECIAL_MENU_ID and item == 7:
             self.shutdown()                    # Special > Shutdown
 

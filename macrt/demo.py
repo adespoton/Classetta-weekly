@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import logging
 import math
+import os
 import re
 import signal
 import sys
@@ -457,8 +458,17 @@ def main(argv=None) -> int:
     heartbeat.timeout.connect(lambda: None)
     heartbeat.start()
     status = app.exec()
+    return finish(display, status)
+
+
+def finish(display: Display, status: int) -> int:
+    """After the Qt event loop ends: finish the shutdown, wait for the
+    applications' threads, and, when Special > Restart asked for it,
+    run the original command again with the same parameters."""
     display.shutdown(quit_app=False)
     display.join()
+    if display.restarting:
+        os.execvp(sys.orig_argv[0], sys.orig_argv)
     return status
 
 
