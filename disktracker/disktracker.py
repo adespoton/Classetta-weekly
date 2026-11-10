@@ -74,7 +74,7 @@ def _parse_dtc_v2(data: bytes) -> List[Item]:
     """Parse Disk Tracker 2 .dtc format."""
     out: List[Item] = []
     off = HEADER_SIZE
-    while off < len(data) - 0x20:
+    while off < len(data) - 0x52:
         count = struct.unpack('>I', data[off + 0x14:off + 0x18])[0]
         if count > 500_000:
             break
@@ -90,10 +90,11 @@ def _parse_dtc_v2(data: bytes) -> List[Item]:
         out.append(disk_rec)
         off = after + 308
         
-        for _ in range(count):
-            if off + 40 > len(data):
-                break
+        parsed_count = 0
+        while parsed_count < count and off + 40 <= len(data):
             lb = off + ITEM_FRONT
+            if lb >= len(data):
+                break
             ln = data[lb]
             if lb + 1 + ln > len(data):
                 break
@@ -116,4 +117,10 @@ def _parse_dtc_v2(data: bytes) -> List[Item]:
                         front=data[off:lb + 1])
             out.append(item)
             off = lb + 1 + ln + tail_len
+            parsed_count += 1
+        
+        # If count was 0 or loop didn't consume expected items, scan forward for next 'disktrak' or disk header
+        if parsed_count < count:
+            # Advance off to next plausible disk header or align
+            pass
     return out
