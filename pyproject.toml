@@ -15,6 +15,7 @@ dev = ["pytest>=8"]
 
 [project.scripts]
 macrt = "macrt.demo:main"
+disktracker = "disktracker.__main__:main"
 
 [tool.setuptools.packages.find]
 include = ["macrt*", "disktracker*"]
