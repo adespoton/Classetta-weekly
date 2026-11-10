@@ -2,5 +2,7 @@
 
 from .disktracker import parse_dtc, Disk, Item, parse_dtc_v1
 from .writer import write_dtc
+from .index import build_dtc, index_image, index_images
 
-__all__ = ["parse_dtc", "parse_dtc_v1", "write_dtc", "Disk", "Item"]
+__all__ = ["parse_dtc", "parse_dtc_v1", "write_dtc", "Disk", "Item",
+           "build_dtc", "index_image", "index_images"]
