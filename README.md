@@ -89,6 +89,8 @@ The demo launches two apps. **Sampler** opens every window kind from its
 python -m macrt App.bin                       # MacBinary
 python -m macrt App.hqx --list                # BinHex; list the resources and exit
 python -m macrt Disk.dsk                      # a Filer window; double-click to run what's on it
+python -m macrt Catalog.dtc                   # open a Disk Tracker 1 or 2 index file in a read-only Filer window
+python -m macrt App.bin --filer               # show a loose file's folder in a Filer window
 python -m macrt Disk.dsk --app "Disk:Games:App"   # or pick one by name or Mac path
 python -m macrt App.bin --view                # its menus and windows, without its code
 python -m macrt App.bin --trace-traps         # log every trap it calls
@@ -332,7 +334,10 @@ can read them in its own way.
   Basilisk II's `.rsrc/` and `.finf/`, Executor's `%app`, a bare `app.rsrc`,
   or macOS's `..namedfork/rsrc`. `open_application` is what the command line
   uses: it also opens disk images and refuses StuffIt and zip archives with a
-  hint. `load_volume` opens HFS
+  hint. Disk Tracker index files (`.dtc`, `.dt1`) open too: the
+  [`disktracker` package](disktracker/README.md) reads them, and their
+  contents show in a read-only Filer window with a catalog icon of their
+  own. `load_volume` opens HFS
   disk images, raw, DiskCopy 4.2 or behind an Apple partition map, into
   machfs's form, walking their catalog and extents trees with machfs's
   B*-tree reader but leaving each file's forks on the disk until they're

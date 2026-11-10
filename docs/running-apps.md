@@ -201,7 +201,16 @@ python -m macrt "System 6.0.8.dsk"                  # a disk with one applicatio
 python -m macrt "System 6.0.8.dsk" --app TeachText
 python -m macrt Tools.img --app "Tools:Disk Tools:Disk First Aid"
 python -m macrt Paint.dsk                           # a 400K MFS floppy from 1984
+python -m macrt Catalog.dtc                         # a Disk Tracker index, browsed read-only
 ```
+
+Disk Tracker's own index files open too: a `.dtc` or `.dt1` file lists
+its recorded contents in a Filer window that stays read-only — its
+title bar carries a catalog icon of its own rather than a disk's,
+nothing in it opens, and File ▸ Get Info shows what the index recorded:
+size, type, creator, and creation and modification dates. To build such
+an index from a list of disk images, see
+[disktracker/README.md](../disktracker/README.md).
 
 `--app` takes the application's name, or its Mac path with folders
 separated by colons, starting from the disk's name or from any folder
@@ -334,6 +343,7 @@ python -m macrt FILE... [--app NAME]... [options]
 | Option | What it does |
 | --- | --- |
 | `--app NAME` | Picks the application on a disk image, by name or Mac path. A document's name launches the application that made it, with the document open (see [Opening a document](#opening-a-document)). Repeat it to run several. |
+| `--filer` | Shows a loose file in a Filer window instead of running it: the window lists the folder it's in (an encoding lists what it decodes to), so you can look through it rather than launch it. |
 | `--list` | Lists the file's resources and exits. |
 | `--view` | Shows the application's menus, windows and dialogs from its resources, without running its code. Useful when the code won't run. |
 | `--trace-traps` | Logs every Toolbox and OS trap the application calls. |
@@ -385,7 +395,14 @@ the disk — double-click an application to run it (its launch is as if it
 had been named on the command line, so several can be started from the
 one window), a document to open it with the application that made it, or
 a folder to open a window of that folder too. The window stays up, and
-its close box closes it, like a real Filer window's.
+its close box closes it, like a real Filer window's. Its menu bar has
+the Filer's own menus: File (Open, Get Info, Display Contents, Close,
+Eject), View (by Icon, by Name, by Date, by Size, by Kind), and Special
+(Clean Up Window, Empty Trash, Erase Disk, Set Startup, Restart,
+Shutdown). File ▸ Get Info
+(key I) shows an item's size, type, creator, and its creation and
+modification dates. A Disk Tracker index (`.dtc`, `.dt1`) opens in such
+a window too, but read-only: see [Disk images](#disk-images).
 
 An image nothing is launched from, one with no application on it or, with
 `--app`, none of the names, is a disk of documents. Every image is in a
