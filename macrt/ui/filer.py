@@ -43,7 +43,7 @@ from ..toolbox.menus import Menu, parse_menu_items
 from ..toolbox.windows import WindowKind
 from ..viewer import describe, viewer_main
 from . import chrome, theme
-from .stdfile import (DISK_ICON, DOCUMENT_ICON, FOLDER_ICON, icon,
+from .stdfile import (CATALOG_ICON, DISK_ICON, DOCUMENT_ICON, FOLDER_ICON, icon,
                       icon_from_bitmap)
 from .tracking import BoxTracker, DragTracker
 from .window import _Hosted
@@ -103,7 +103,8 @@ ARCHIVE_ICON = [
 # what the container is: the volume (its disk image), a folder, or a
 # file — an archive to look through, what no window opens yet.
 CONTAINER_ICONS = {"volume": DISK_ICON, "folder": FOLDER_ICON,
-                   "archive": ARCHIVE_ICON, "document": DOCUMENT_ICON}
+                   "archive": ARCHIVE_ICON, "document": DOCUMENT_ICON,
+                   "catalog": CATALOG_ICON}
 
 
 @dataclass(frozen=True)
@@ -275,6 +276,10 @@ def _container_icon(volume: machfs.Volume, path: tuple[str, ...] = ()) -> list[s
     custom = _custom_icon(node)
     if custom is not None:
         return custom
+    # DiskTracker catalogs get their own icon
+    from disktracker.filer_adapter import DiskTrackerVolume
+    if isinstance(node, DiskTrackerVolume):
+        return CATALOG_ICON
     kind = ("volume" if isinstance(node, machfs.Volume)
             else "folder" if isinstance(node, machfs.Folder)
             else "archive" if archive_kind(node) else "document")
@@ -831,9 +836,20 @@ class GetInfoWindow(AboutWindow):
                 lines.append(f"Flags: 0x{item.flags:04X}")
         else:
             lines.append("Kind: Folder")
+        # Add creation and modification dates if available
+        if hasattr(item, 'crdate') and item.crdate:
+            from datetime import datetime, timezone, timedelta
+            mac_epoch = datetime(1904, 1, 1, tzinfo=timezone.utc)
+            dt = mac_epoch + timedelta(seconds=item.crdate)
+            lines.append(f"Created: {dt.strftime('%a, %b %d, %Y, %I:%M %p')}")
+        if hasattr(item, 'mddate') and item.mddate:
+            from datetime import datetime, timezone, timedelta
+            mac_epoch = datetime(1904, 1, 1, tzinfo=timezone.utc)
+            dt = mac_epoch + timedelta(seconds=item.mddate)
+            lines.append(f"Modified: {dt.strftime('%a, %b %d, %Y, %I:%M %p')}")
         super().__init__(display, f"{item.name} Info", lines,
                          title_icon=item_icon(item) or _generic_icon(item),
-                         content_size=(320, 200), parent=parent)
+                         content_size=(320, 236), parent=parent)
         self.item = item
         # The item's own icon at its full size, for the box; None keeps
         # the generic one for what it is.

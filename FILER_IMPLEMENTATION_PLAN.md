@@ -164,6 +164,11 @@ Preserve existing behavior unless a task explicitly changes it. If the codebase 
   - Keep **Get Info** available for recorded metadata.
   - Test missing metadata and attempts to invoke disabled actions.
 
+- [ ] **20b. Add disk image batch indexing to disktracker library**
+  - Add support in the `disktracker` library to accept a list of disk images (e.g., HFS/ISO/raw volumes).
+  - Parse their filesystem contents and output a fully structured `.dtc` catalog file indexing their contents.
+  - Test batch generation against sample disk images.
+
 - [ ] **21. Implement color icons and other elements with --depth greater than 2**
   - When the Filer runs with the `--depth` option set to a value greater than 2, enable color icons and other high-colour display elements.
   - For `--depth 8` (true colour), display full 256-colour icons where available, and enable colorised UI elements where supported.

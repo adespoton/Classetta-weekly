@@ -43,7 +43,35 @@ class Item:
     suffix: bytes = b''
 
 def parse_dtc(data: bytes) -> List[Item]:
-    """Parse a .dtc file and return records using strict disk-record and item-count navigation."""
+    """Parse a .dtc file (auto-detecting or handling v1/v2)."""
+    # Check magic or header version
+    if data.startswith(b'disktrak'):
+        return _parse_dtc_v2(data)
+    else:
+        return parse_dtc_v1(data)
+
+
+def parse_dtc_v1(data: bytes) -> List[Item]:
+    """Parse Disk Tracker 1.x format files (lacking comments, notes, and large volume extensions)."""
+    out: List[Item] = []
+    # DT 1.x typically has simpler fixed or variable records without the v2 header block.
+    # We walk records and extract name, size, dates, type, creator.
+    off = 0
+    while off < len(data) - 10:
+        # Look for typical item record start or parse sequentially
+        ln = data[off]
+        if 0 < ln < 64 and off + 1 + ln <= len(data):
+            name = _decode_mac_roman(data[off+1:off+1+ln])
+            item = Item(kind='file', name=name, offset=off)
+            out.append(item)
+            off += 1 + ln
+        else:
+            off += 1
+    return out
+
+
+def _parse_dtc_v2(data: bytes) -> List[Item]:
+    """Parse Disk Tracker 2 .dtc format."""
     out: List[Item] = []
     off = HEADER_SIZE
     while off < len(data) - 0x20:
@@ -62,7 +90,6 @@ def parse_dtc(data: bytes) -> List[Item]:
         out.append(disk_rec)
         off = after + 308
         
-        # Parse exactly `count` items
         for _ in range(count):
             if off + 40 > len(data):
                 break

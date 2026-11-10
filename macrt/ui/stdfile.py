@@ -200,6 +200,18 @@ DESKTOP_ICON = [
     "....######....",
 ]
 
+CATALOG_ICON = [
+    "################",
+    "#..............#",
+    "#.###########.#",
+    "#.#.........#.#",
+    "#.###########.#",
+    "#.#.........#.#",
+    "#.###########.#",
+    "#..............#",
+    "################",
+]
+
 ICONS = {"folder": FOLDER_ICON, "document": DOCUMENT_ICON, "volume": DISK_ICON,
          "application": theme.GENERIC_APP_ICON, "desktop": DESKTOP_ICON}
 

@@ -72,6 +72,8 @@ class MacFile:
     # The documents it's launched with, as when they're opened in the
     # Finder: the Finder information it's given lists them.
     documents: tuple[MacFile, ...] = field(default=(), repr=False)
+    crdate: int = 0                     # creation date (Mac epoch)
+    mddate: int = 0                     # modification date (Mac epoch)
 
     def __post_init__(self):
         if not self.key:
@@ -267,7 +269,8 @@ class _VolumeFile(MacFile):
 def _from_machfs(volume: machfs.Volume, folder: VolumeFolder, name: str,
                  f: machfs.File) -> MacFile:
     key = ":".join((volume.name, *folder.path, name))
-    return _VolumeFile(f, name, None, None, bytes(f.type), bytes(f.creator), f.flags, key, folder)
+    return _VolumeFile(f, name, None, None, bytes(f.type), bytes(f.creator), f.flags, key, folder,
+                       crdate=getattr(f, 'crdate', 0), mddate=getattr(f, 'mddate', 0))
 
 
 # ---------------------------------------------------------------------------
@@ -588,12 +591,72 @@ def _read_hfs(data) -> machfs.Volume:
         todo.extend(v for v in folder.values() if isinstance(v, machfs.Folder))
     vol = machfs.Volume()
     vol.update(cnids[2])
+    # Read Desktop DB/DF for Finder metadata before removing them
+    _apply_desktop_metadata(vol, disk, cnids)
     for name in ("Desktop", "Desktop DB", "Desktop DF"):
         vol.pop(name, None)
     _link_aliases(crdate, cnids)
     vol.crdate, vol.mddate, vol.bkdate = crdate, mddate, bkdate
     vol.name = bytes(disk[mdb + 37:mdb + 37 + min(disk[mdb + 36], 27)]).decode("mac_roman")
     return vol
+
+
+def _parse_desktop_db(data: bytes) -> dict[int, dict]:
+    """Parse a Desktop DB file, returning CNID → Finder info mapping.
+    
+    Each entry contains: v (vertical position), h (horizontal position),
+    flags (view settings: bit 0 = icon view, bit 1 = list view, etc.).
+    """
+    if len(data) < 8:
+        return {}
+    
+    # Header: bytes 0-1 unused, 2-3 first free, 4-5 end used, 6-7 heap start
+    heap_start = struct.unpack_from('>H', data, 6)[0]
+    if heap_start >= len(data):
+        return {}
+    
+    result = {}
+    offset = heap_start
+    while offset + 3 <= len(data):
+        rec_type = data[offset]
+        if rec_type == 0:  # Free block
+            break
+        rec_size = struct.unpack_from('>H', data, offset + 1)[0]
+        if rec_size < 10 or offset + 3 + rec_size > len(data):
+            break
+        
+        if rec_type == 0x01:  # Desktop resource record
+            cnid, v, h, flags = struct.unpack_from('>IHHH', data, offset + 3)
+            result[cnid] = {'v': v, 'h': h, 'flags': flags}
+        
+        offset += 3 + rec_size
+    
+    return result
+
+
+def _apply_desktop_metadata(vol: machfs.Volume, disk, cnids: dict) -> None:
+    """Apply Desktop DB/DF metadata to volume files."""
+    # Try to read Desktop DB
+    try:
+        # Desktop DB is typically at CNID 3 (root) or as a file named "Desktop DB"
+        db_file = vol.get("Desktop DB")
+        if db_file is not None:
+            # Read the file's data fork
+            if hasattr(db_file, 'data'):
+                db_data = bytes(db_file.data)
+                metadata = _parse_desktop_db(db_data)
+                # Apply metadata to files by CNID
+                for cnid, info in metadata.items():
+                    if cnid in cnids:
+                        node = cnids[cnid]
+                        if hasattr(node, 'x'):
+                            node.x = info['h']
+                            node.y = info['v']
+                        if hasattr(node, 'flags'):
+                            # Merge view flags into Finder flags
+                            node.flags = (node.flags & ~0x0007) | (info['flags'] & 0x0007)
+    except Exception:
+        pass  # Desktop DB is optional; ignore parsing errors
 
 
 def _image(path: Path) -> bytes | mmap.mmap:
@@ -1074,6 +1137,12 @@ def launch_target(f: MacFile) -> MacFile:
 
 def _volume_or_file(path: str | os.PathLike) -> tuple[machfs.Volume | None, MacFile | None]:
     path = Path(path)
+    if path.suffix.lower() in ('.dtc', '.dt1'):
+        try:
+            from disktracker.filer_adapter import DiskTrackerVolume
+            return DiskTrackerVolume(path), None
+        except Exception as e:
+            raise ValueError(f"{path.name}: could not load Disk Tracker catalog: {e}")
     raw = _image(path) if path.exists() else b""          # app with only app.rsrc
     volume, problem = None, None
     if is_disk_image(raw):
