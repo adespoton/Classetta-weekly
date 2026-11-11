@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import struct
 
+from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor, QImage
 
 from .color import STANDARD_4BIT, STANDARD_8BIT
@@ -102,6 +103,12 @@ def bitmap_icon(data: bytes, size: tuple[int, int] = LARGE, masked: bool = True)
     width, height = size
     rb = (width + 7) // 8
     n = rb * height
+    if len(data) == 128 and size != LARGE:
+        large_icon = bitmap_icon(data, LARGE, masked=False)
+        if large_icon is None:
+            return None
+        img = large_icon.image().scaled(width, height, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        return Icon(width, height, _mono_rows(img), None)
     if len(data) < n:
         return None
     mask = _rows(data, rb, height, n) if masked and len(data) >= 2 * n else None
