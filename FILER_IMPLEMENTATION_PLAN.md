@@ -90,7 +90,7 @@ Preserve existing behavior unless a task explicitly changes it. If the codebase 
   - Share the extraction with the title-bar path: suite icons first, then a bare `ICON`; halved to 16 for rows and title bars, full size for Get Info.
   - Test an item that wears its own icon, one that keeps its generic icon, and unreadable resources.
 
-- [ ] **11. Display resource forks and their contents**
+- [x] **11. Display resource forks and their contents**
   - For a file with a resource fork, show a window listing its resources.
   - Include a **DATA** item when the file also has a data fork.
   - Opening a resource or **DATA** opens it in the hex viewer with the text-only option.

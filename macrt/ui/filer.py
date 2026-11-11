@@ -555,10 +555,9 @@ class FilerWindow(_Hosted):
         if item is None:
             return set()
         actions = {"open", "info"}
-        actions = {"open", "info"}
-        actions = {"open", "info"}
         try:
-            has_data = item.type != FOLDER and (len(item.data) > 0 or len(item.rsrc) > 0)
+            dlen, rlen = item.sizes()
+            has_data = item.type != FOLDER and (dlen > 0 or rlen > 0)
         except Exception:
             has_data = item.type != FOLDER
         if has_data:
@@ -578,20 +577,6 @@ class FilerWindow(_Hosted):
                 self.display.open_filer(self.volume, self.path + (item.name,), self.options)
             return
         self._open(item)
-
-    def display_contents(self) -> None:
-        """Open a Resource/Content Viewer window for the selected file."""
-        item = self.selected_item()
-        if item is None:
-            return
-        win = ContentViewerWindow(self.display, item)
-        self.display.viewer_windows.append(win)
-        fr = self.frameGeometry()
-        win.move(fr.center().x() - win.width() // 2,
-                 fr.center().y() - win.height() // 2)
-        win.show()
-        win.raise_()
-        win.activateWindow()
 
     def get_info(self) -> None:
         """Open a Get Info window for the currently selected item."""
@@ -613,7 +598,6 @@ class FilerWindow(_Hosted):
         item = self.selected_item()
         if item is None:
             return
-        # TODO: Replace ContentViewerWindow with one that supports resource forks
         win = ContentViewerWindow(self.display, item)
         self.display.viewer_windows.append(win)
         fr = self.frameGeometry()

@@ -725,6 +725,86 @@ def test_content_viewer_ordinary_and_text_only_fork(harness):
     h.settle()
 
 
+def test_content_viewer_resource_only_file(harness):
+    h = harness(disks=[_volume()])
+    win = h.d.open_filer(h.d.config.disks[0])
+    h.settle()
+    win.tree.setCurrentItem(_item(win, "Widget"))
+    h.settle()
+    assert _file_menu_display_contents_enabled(h) is True
+    win.display_contents()
+    h.settle()
+    viewer = h.d.viewer_windows[-1]
+    rows = [viewer.list_widget.item(i).text() for i in range(viewer.list_widget.count())]
+    assert not any(row.startswith("DATA") for row in rows)
+    assert any("Greeting" in row for row in rows)
+    greeting_row = next(i for i in range(viewer.list_widget.count())
+                        if "Greeting" in viewer.list_widget.item(i).text())
+    viewer.list_widget.setCurrentRow(greeting_row)
+    h.settle()
+    assert "05 48 65 6C 6C 6F" in viewer.text_edit.toPlainText()
+    viewer.checkbox.setChecked(True)
+    h.settle()
+    assert "Hello" in viewer.text_edit.toPlainText()
+    viewer.close()
+    h.settle()
+    assert h.d.viewer_windows == []
+
+
+def test_content_viewer_resource_and_data_file(harness):
+    v = _volume()
+    mixed = machfs.File()
+    mixed.type, mixed.creator = b"APPL", b"TEST"
+    mixed.data = b"A data fork."
+    mixed.rsrc = bytearray(FORK)
+    v["Mixed"] = mixed
+
+    h = harness(disks=[v])
+    win = h.d.open_filer(h.d.config.disks[0])
+    h.settle()
+    win.tree.setCurrentItem(_item(win, "Mixed"))
+    h.settle()
+    assert _file_menu_display_contents_enabled(h) is True
+    win.display_contents()
+    h.settle()
+    viewer = h.d.viewer_windows[-1]
+    rows = [viewer.list_widget.item(i).text() for i in range(viewer.list_widget.count())]
+    assert rows[0].startswith("DATA")
+    assert f"({len(b'A data fork.'):,} bytes)" in rows[0]
+    assert any("Greeting" in row for row in rows)
+    assert viewer.list_widget.currentRow() == 0     # DATA selected first
+    assert "41 20 64 61 74 61" in viewer.text_edit.toPlainText()     # "A data"
+    greeting_row = next(i for i in range(viewer.list_widget.count())
+                        if "Greeting" in viewer.list_widget.item(i).text())
+    viewer.list_widget.setCurrentRow(greeting_row)
+    h.settle()
+    assert "05 48 65 6C 6C 6F" in viewer.text_edit.toPlainText()
+    viewer.close()
+    h.settle()
+
+
+def test_content_viewer_corrupt_resource_fork(harness):
+    v = _volume()
+    bad = machfs.File()
+    bad.type, bad.creator = b"APPL", b"TEST"
+    bad.data = b""
+    bad.rsrc = b"not a resource fork"
+    v["BadRes"] = bad
+
+    h = harness(disks=[v])
+    win = h.d.open_filer(h.d.config.disks[0])
+    h.settle()
+    win.tree.setCurrentItem(_item(win, "BadRes"))
+    h.settle()
+    win.display_contents()
+    h.settle()
+    viewer = h.d.viewer_windows[-1]
+    assert viewer.list_widget.count() == 0
+    assert "(empty)" in viewer.text_edit.toPlainText()
+    viewer.close()
+    h.settle()
+
+
 def test_content_viewer_empty_and_unreadable_fork(harness, monkeypatch):
     v = _volume(games=False)
     empty_file = machfs.File()
