@@ -609,25 +609,25 @@ class FilerWindow(_Hosted):
         win.raise_()
         win.activateWindow()
 
-    def exportable(self) -> bool:
-        """Export Catalog works on what can be browsed — volumes, host
+    def savable(self) -> bool:
+        """Save Catalog works on what can be browsed — volumes, host
         folders, encoded containers — not on the read-only views of
         Disk Tracker catalogs."""
-        from ..export_dtc import exportable
-        return exportable(self.volume)
+        from ..save_dtc import savable
+        return savable(self.volume)
 
-    def export_catalog(self) -> None:
+    def save_catalog(self) -> None:
         """Write what the window browses to a Disk Tracker 2 catalog."""
-        from ..export_dtc import build_catalog, default_export_name
+        from ..save_dtc import build_catalog, default_save_name
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export Disk Tracker 2 catalog", default_export_name(self.volume),
+            self, "Save Disk Tracker 2 catalog", default_save_name(self.volume),
             "Disk Tracker catalogs (*.dtc)")
         if not path:
             return
         try:
             data = build_catalog(self.volume)
         except Exception as e:
-            self._say(f"Couldn't export the catalog: {e}")
+            self._say(f"Couldn't save the catalog: {e}")
             return
         try:
             Path(path).write_bytes(data)
@@ -1281,7 +1281,7 @@ class FilerMenus:
             Menu(APPLE_MENU_ID, k.APPLE_MENU_TITLE,
                  parse_menu_items("About Classetta…;(-")),
             Menu(FILE_MENU_ID, "File", parse_menu_items(
-                 "(Open/O;(-;(Get Info…/I;(Display Contents/ ;(-;(Export Catalog…/X;(Close/W;(Eject/E")),
+                 "(Open/O;(-;(Get Info…/I;(Display Contents/ ;(-;(Save Catalog…/S;(Close/W;(Eject/E")),
             Menu(EDIT_MENU_ID, "Edit", parse_menu_items(
                 "(Undo/Z;(-;(Cut/X;(Copy/C;(Paste/V;(Clear;(Select All/A")),
             Menu(VIEW_MENU_ID, "View", parse_menu_items(
@@ -1293,19 +1293,19 @@ class FilerMenus:
 
     def bar_menus(self) -> list[Menu]:
         """The Filer's menu headings, with File > Open, File > Get Info,
-        File > Display Contents and File > Export Catalog enabled only
+        File > Display Contents and File > Save Catalog enabled only
         where appropriate."""
         front = self.display.front_filer
         openable = front is not None and "open" in front.selected_actions()
         infoable = front is not None and "info" in front.selected_actions()
         displayable = front is not None and "display_contents" in front.selected_actions()
-        exportable = front is not None and front.exportable()
+        savable = front is not None and front.savable()
         closeable = front is not None
         file_menu = self.menus[FILE_MENU_ID]
         if file_menu.items:
             file_menu.items[0].enabled = openable
             file_menu.items[2].enabled = infoable
             file_menu.items[3].enabled = displayable
-            file_menu.items[5].enabled = exportable
+            file_menu.items[5].enabled = savable
             file_menu.items[6].enabled = closeable
         return list(self.menus.values())

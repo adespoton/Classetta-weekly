@@ -991,7 +991,7 @@ class Display(QObject):
         elif menu_id == FILE_MENU_ID and item == 6:
             front = self.front_filer
             if front is not None:
-                front.export_catalog()
+                front.save_catalog()
         elif menu_id == FILE_MENU_ID and item == 7:
             front = self.front_filer
             if front is not None:

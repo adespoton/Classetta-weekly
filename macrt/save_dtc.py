@@ -1,4 +1,4 @@
-"""Export what a Filer window browses to a Disk Tracker 2 catalog.
+"""Save what a Filer window browses to a Disk Tracker 2 catalog.
 
 The whole volume is indexed, not just the window's folder: one disk
 record, then its files and folders beneath it in pre-order, depths set,
@@ -26,7 +26,7 @@ def _host_time(seconds: float) -> int:
     return int(seconds) + MAC_EPOCH
 
 
-def default_export_name(volume) -> str:
+def default_save_name(volume) -> str:
     """The file name the save dialog starts with."""
     if isinstance(volume, HostFolder):
         stem = volume.root.path.name or "Volume"
@@ -95,7 +95,7 @@ def _walk_host(folder, depth):
             try:
                 f = load_file(p, folder)
             except (ValueError, OSError):
-                continue                        # damaged; the rest still export
+                continue                        # damaged; the rest still save
             size = len(f.data) + len(f.rsrc)
             items.append(Item(kind="file", name=f.name, type=f.type, creator=f.creator,
                               size=size, depth=depth,
@@ -134,13 +134,13 @@ def build_catalog(volume) -> bytes:
         children, _, _ = _walk_volume(volume, (), 1)
         created, modified = getattr(volume, "crdate", 0), getattr(volume, "mddate", 0)
     else:
-        raise ValueError(f"nothing to export from {volume!r}")
+        raise ValueError(f"nothing to save from {volume!r}")
     disk = Item(kind="disk", name=name, offset=HEADER_SIZE,
                 created=created, modified=modified, items=len(children))
     return write_dtc([disk, *children])
 
 
-def exportable(volume) -> bool:
-    """True for what the Export Catalog command can index: browse views,
+def savable(volume) -> bool:
+    """True for what the Save Catalog command can index: browse views,
     not read-only Disk Tracker catalog views."""
     return not isinstance(volume, DiskTrackerVolume)

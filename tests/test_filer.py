@@ -1060,7 +1060,7 @@ def test_special_shutdown_closes_the_windows_before_the_qt_app(harness, monkeypa
     assert at_quit == [False]                    # the windows are shut, then Qt goes
 
 
-def _file_menu_export_enabled(h) -> bool:
+def _file_menu_save_enabled(h) -> bool:
     for menu, _cell in h.d.global_bar.cells():
         if menu.title == "File":
             return menu.items[5].enabled
@@ -1075,21 +1075,21 @@ def _save_dialog(monkeypatch, out):
     monkeypatch.setattr("macrt.ui.filer.QFileDialog", _SaveDialog)
 
 
-def test_file_export_menu_item_enabled_state(harness):
+def test_file_save_menu_item_enabled_state(harness):
     h = harness(disks=[_volume()])
     win = h.d.open_filer(h.d.config.disks[0])
     h.settle()
-    assert _file_menu_export_enabled(h) is True
+    assert _file_menu_save_enabled(h) is True
 
 
-def test_file_export_catalog_from_volume(harness, tmp_path, monkeypatch):
+def test_file_save_catalog_from_volume(harness, tmp_path, monkeypatch):
     from disktracker import parse_dtc
     h = harness(disks=[_volume()])
     win = h.d.open_filer(h.d.config.disks[0])
     h.settle()
     out = tmp_path / "Browse.dtc"
     _save_dialog(monkeypatch, out)
-    win.export_catalog()
+    win.save_catalog()
     h.settle()
     items = parse_dtc(out.read_bytes())
     disk = items[0]
@@ -1104,7 +1104,7 @@ def test_file_export_catalog_from_volume(harness, tmp_path, monkeypatch):
     assert by_name["Game"].depth == games.depth + 1
 
 
-def test_file_export_catalog_from_host_folder(harness, tmp_path, monkeypatch):
+def test_file_save_catalog_from_host_folder(harness, tmp_path, monkeypatch):
     from disktracker import parse_dtc
     folder = tmp_path / "host"
     folder.mkdir()
@@ -1118,7 +1118,7 @@ def test_file_export_catalog_from_host_folder(harness, tmp_path, monkeypatch):
     h.settle()
     out = tmp_path / "host.dtc"
     _save_dialog(monkeypatch, out)
-    win.export_catalog()
+    win.save_catalog()
     h.settle()
     items = parse_dtc(out.read_bytes())
     assert items[0].kind == "disk" and items[0].name == "host"
@@ -1130,7 +1130,7 @@ def test_file_export_catalog_from_host_folder(harness, tmp_path, monkeypatch):
     assert by_name["inner.txt"].depth == sub_item.depth + 1
 
 
-def test_file_export_catalog_disabled_for_disk_tracker_views(harness, tmp_path):
+def test_file_save_catalog_disabled_for_disk_tracker_views(harness, tmp_path):
     from disktracker import build_dtc
     from disktracker.filer_adapter import DiskTrackerVolume
     alpha = machfs.Volume()
@@ -1146,20 +1146,20 @@ def test_file_export_catalog_disabled_for_disk_tracker_views(harness, tmp_path):
     h = harness(disks=[])
     win = h.d.open_filer(DiskTrackerVolume(cat))
     h.settle()
-    assert _file_menu_export_enabled(h) is False
+    assert _file_menu_save_enabled(h) is False
 
 
-def test_file_export_catalog_cancelled_dialog_writes_nothing(harness, tmp_path, monkeypatch):
+def test_file_save_catalog_cancelled_dialog_writes_nothing(harness, tmp_path, monkeypatch):
     h = harness(disks=[_volume()])
     win = h.d.open_filer(h.d.config.disks[0])
     h.settle()
     _save_dialog(monkeypatch, None)             # the dialog is cancelled
-    win.export_catalog()
+    win.save_catalog()
     h.settle()
     assert list(tmp_path.iterdir()) == []
 
 
-def test_file_export_catalog_from_container(harness, tmp_path, monkeypatch):
+def test_file_save_catalog_from_container(harness, tmp_path, monkeypatch):
     from disktracker import parse_dtc
     p = tmp_path / "App.bin"
     p.write_bytes(macbinary("Inner", b"payload", FORK))
@@ -1169,10 +1169,10 @@ def test_file_export_catalog_from_container(harness, tmp_path, monkeypatch):
     h = harness(disks=[])
     win = h.d.open_filer(filers[0])
     h.settle()
-    assert _file_menu_export_enabled(h) is True
+    assert _file_menu_save_enabled(h) is True
     out = tmp_path / "app.dtc"
     _save_dialog(monkeypatch, out)
-    win.export_catalog()
+    win.save_catalog()
     h.settle()
     items = parse_dtc(out.read_bytes())
     assert items[0].kind == "disk" and items[0].name == "App.bin"

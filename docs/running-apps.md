@@ -397,13 +397,13 @@ had been named on the command line, so several can be started from the
 one window), a document to open it with the application that made it, or
 a folder to open a window of that folder too. The window stays up, and
 its close box closes it, like a real Filer window's. Its menu bar has
-the Filer's own menus: File (Open, Get Info, Display Contents, Export
+the Filer's own menus: File (Open, Get Info, Display Contents, Save
 Catalog, Close, Eject), View (by Icon, by Name, by Date, by Size,
 by Kind), and Special
 (Clean Up Window, Empty Trash, Erase Disk, Set Startup, Restart,
 Shutdown). File ▸ Get Info
 (key I) shows an item's size, type, creator, and its creation and
-modification dates. File ▸ Export Catalog (key X) writes what the
+modification dates. File ▸ Save Catalog (key S) writes what the
 window browses — the whole volume, host folder or encoded container —
 to a Disk Tracker 2 catalog (`.dtc`) of its own; the command is off in
 the read-only windows Disk Tracker catalogs open in. A Disk Tracker
