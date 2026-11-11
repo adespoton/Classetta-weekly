@@ -37,6 +37,11 @@ def _u16(data: bytes, off: int) -> int:
     return struct.unpack_from(">H", data, off)[0]
 
 
+def _i16(data: bytes, off: int) -> int:
+    """Resource ids and local ids are signed 16-bit values."""
+    return struct.unpack_from(">h", data, off)[0]
+
+
 try:
     b"\xa5".decode("mac_roman")
 
@@ -69,7 +74,7 @@ def parse_bundle(data: bytes) -> dict[bytes, dict[int, int]]:
             break
         mapping: dict[int, int] = {}
         for _ in range(count):
-            mapping[_u16(data, off)] = _u16(data, off + 2)
+            mapping[_i16(data, off)] = _i16(data, off + 2)
             off += 4
         out[rtype] = mapping
     return out
@@ -79,7 +84,7 @@ def parse_fref(data: bytes) -> tuple[bytes, int] | None:
     """A 'FREF' resource as (file type, local icon id); None if short."""
     if len(data) < 6:
         return None
-    return data[:4], _u16(data, 4)
+    return data[:4], _i16(data, 4)
 
 
 def parse_kind(data: bytes) -> dict[bytes, str]:
@@ -267,17 +272,9 @@ def associated_kind(f: MacFile) -> str | None:
     return f"{_strip_wrapper(app.name)} document"
 
 
-def associated_icon_rows(f: MacFile, *, large: bool = False) -> tuple[str, ...] | None:
-    """The rows ('#'/'.') of the icon the creating app declares for f's
-    type, through its BNDL/FREF resources; None without one."""
-    app = associated_app(f)
-    if app is None:
-        return None
-    fork = bytes(app.rsrc)
-    info = _app_info(fork)
-    if info is None:
-        return None
-    resid = info.icon_resource_id(f.type)
+def _rows_for(info: AppInfo, resid: int | None, large: bool) -> tuple[str, ...] | None:
+    """The rows ('#'/'.') of an icon family at resource id resid, as
+    declared in info's fork; None without one."""
     if resid is None:
         return None
 
@@ -300,6 +297,30 @@ def associated_icon_rows(f: MacFile, *, large: bool = False) -> tuple[str, ...] 
     if not large and len(rows[0]) > 16:
         rows = [row[::2] for row in rows[::2]]
     return tuple(rows)
+
+
+def _info_for_fork(fork: bytes) -> AppInfo | None:
+    if not fork:
+        return None
+    return _app_info(fork)
+
+
+def associated_icon_rows(f: MacFile, *, large: bool = False) -> tuple[str, ...] | None:
+    """The rows ('#'/'.') of the icon the creating app declares for f's
+    type, through its BNDL/FREF resources; None without one."""
+    app = associated_app(f)
+    if app is None:
+        return None
+    info = _info_for_fork(bytes(app.rsrc))
+    return None if info is None else _rows_for(info, info.icon_resource_id(f.type), large)
+
+
+def declared_icon_rows(f: MacFile, *, large: bool = False) -> tuple[str, ...] | None:
+    """The rows ('#'/'.') of the icon f's own bundle resources declare
+    for f's own type: an extension's or a control panel's family, which
+    the Finder shows for the file itself; None without one."""
+    info = _info_for_fork(bytes(f.rsrc) if f.rsrc else b"")
+    return None if info is None else _rows_for(info, info.icon_resource_id(f.type), large)
 
 
 def _bitmap(icon) -> list[str]:

@@ -1321,3 +1321,104 @@ def test_get_info_shows_the_document_kind(harness):
     for w in h.d.info_windows:
         w.close()
     h.settle()
+
+
+def _system_volume(name, ftype, resources, creator=b"TEST", flags=0):
+    """A volume holding one system file (a control panel, an extension,
+    an accessory or a font) with the given resources in its fork."""
+    v = machfs.Volume()
+    v.name = name
+    f = machfs.File()
+    f.type, f.creator, f.flags = ftype, creator, flags
+    f.rsrc = bytearray(build_fork(resources)) if resources else b""
+    f.data = b"body"
+    v["The Thing"] = f
+    return v
+
+
+def _icon_family_resources(resid, ftype, local_id):
+    small = b"\xcc" * 32
+    image = bytes([0xF0]) * 128
+    return [
+        Resource(b"ICN#", resid, image + b"\xff" * 128),
+        Resource(b"ics#", resid, small + b"\xff" * 32),
+        Resource(b"FREF", resid, ftype + struct.pack(">H", local_id) + b"\x00"),
+        Resource(b"BNDL", resid,
+                 b"TEST" + b"\x00" * 2 + struct.pack(">H", 2)
+                 + b"ICN#" + struct.pack(">H", 1) + struct.pack(">hh", local_id, resid)
+                 + b"FREF" + struct.pack(">H", 1) + struct.pack(">hh", 10, resid)),
+    ]
+
+
+def _listed_file(win, name):
+    return win.entries[name]
+
+
+def test_a_control_panel_wears_its_own_icon_from_its_fork():
+    from macrt.ui.filer import item_icon
+    v = _system_volume("Control Panels", b"cdev",
+                       _icon_family_resources(-4064, b"cdev", 0))
+    from macrt.macfile import list_folder
+    doc = next(f for f in list_folder(v) if f.name == "The Thing")
+    rows = item_icon(doc)
+    assert rows is not None
+    assert rows == ["##..##..##..##.."] * 16
+
+
+def test_an_extension_wears_the_icon_its_bundle_declares():
+    from macrt.ui.filer import item_icon
+    from macrt.macfile import list_folder
+    # INITs keep their family wherever they please; the bundle says where.
+    v = _system_volume("Extensions", b"INIT",
+                       _icon_family_resources(5000, b"INIT", 1))
+    doc = next(f for f in list_folder(v) if f.name == "The Thing")
+    assert item_icon(doc) == ["##..##..##..##.."] * 16
+
+
+def test_a_control_panel_without_an_icon_uses_the_type_default():
+    from macrt.ui.filer import item_icon, _icon_for, _generic_icon, SYSTEM_FILE_BITMAPS
+    from macrt.macfile import list_folder
+    v = _system_volume("Control Panels", b"cdev", [])
+    doc = next(f for f in list_folder(v) if f.name == "The Thing")
+    assert item_icon(doc) is None          # no icon of its own
+    assert _icon_for(doc) == "control_panel"
+    assert _generic_icon(doc) is SYSTEM_FILE_BITMAPS["control_panel"]
+
+
+def test_a_desk_accessory_without_an_icon_uses_the_type_default():
+    from macrt.ui.filer import _icon_for, _generic_icon, SYSTEM_FILE_BITMAPS
+    from macrt.macfile import list_folder
+    v = _system_volume("Apple Menu Items", b"dmov", [])
+    doc = next(f for f in list_folder(v) if f.name == "The Thing")
+    assert _icon_for(doc) == "desk_accessory"
+    assert _generic_icon(doc) is SYSTEM_FILE_BITMAPS["desk_accessory"]
+
+
+def test_a_font_without_an_icon_uses_the_type_default():
+    from macrt.ui.filer import _icon_for, _generic_icon, SYSTEM_FILE_BITMAPS
+    from macrt.macfile import list_folder
+    for ftype in (b"FFIL", b"FONT"):
+        v = _system_volume("Fonts", ftype, [])
+        doc = next(f for f in list_folder(v) if f.name == "The Thing")
+        assert _icon_for(doc) == "font"
+        assert _generic_icon(doc) is SYSTEM_FILE_BITMAPS["font"]
+
+
+def test_system_files_have_kind_strings(harness):
+    for ftype, kind in ((b"cdev", "Control Panel"), (b"INIT", "Extension"),
+                        (b"dmov", "Desk Accessory"), (b"FFIL", "Font"),
+                        (b"FONT", "Font")):
+        v = _system_volume("System Folder", ftype, [])
+        h = harness(disks=[v])
+        win = h.d.open_filer(h.d.config.disks[0])
+        h.settle()
+        rows = dict(_rows(win))
+        assert rows["The Thing"] == kind
+        win.tree.setCurrentItem(_item(win, "The Thing"))
+        h.settle()
+        win.get_info()
+        h.settle()
+        assert any(f"Kind: {kind}" in line for line in h.d.info_windows[0]._lines)
+        for w in h.d.info_windows:
+            w.close()
+        h.settle()

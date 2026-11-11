@@ -45,7 +45,8 @@ from ..toolbox.menus import Menu, parse_menu_items
 from ..toolbox.windows import WindowKind
 from ..viewer import describe, viewer_main
 from . import chrome, theme
-from .stdfile import (CATALOG_ICON, DISK_ICON, DOCUMENT_ICON, FOLDER_ICON, icon,
+from .stdfile import (CATALOG_ICON, CONTROL_PANEL_ICON, DESK_ACCESSORY_ICON, DISK_ICON,
+                      DOCUMENT_ICON, EXTENSION_ICON, FONT_ICON, FOLDER_ICON, icon,
                       icon_from_bitmap)
 from .tracking import BoxTracker, DragTracker
 from .window import _Hosted
@@ -65,7 +66,15 @@ QHeaderView::section { background: white; color: black; border: none;
 """
 FOLDER = b"fldr"
 KINDS = [(b"ZSYS", "System file"), (b"zsys", "System file"), (b"cdev", "Control Panel"),
-         (b"FFIL", "Font")]
+         (b"INIT", "Extension"), (b"dmov", "Desk Accessory"), (b"FFIL", "Font"),
+         (b"FONT", "Font")]
+# Types the system itself provides a default icon for, shown when the
+# file declares no icon family of its own (a control panel's is at
+# -4064 by convention).  Maps to the key icon() knows.
+SYSTEM_FILE_ICONS = {b"cdev": "control_panel", b"INIT": "extension",
+                     b"dmov": "desk_accessory", b"FFIL": "font", b"FONT": "font"}
+SYSTEM_FILE_BITMAPS = {"control_panel": CONTROL_PANEL_ICON, "extension": EXTENSION_ICON,
+                       "desk_accessory": DESK_ACCESSORY_ICON, "font": FONT_ICON}
 # The padlock beside Name while the window is view-only: solid body, white
 # keyhole (the transparency behind it), close to the one System 6 drew.
 LOCK = [
@@ -135,7 +144,9 @@ def _kind(f: MacFile) -> str:
 def _icon_for(f: MacFile) -> str:
     if f.type == FOLDER:
         return "folder"
-    return "application" if f.is_application else "document"
+    if f.is_application:
+        return "application"
+    return SYSTEM_FILE_ICONS.get(f.type, "document")
 
 
 def _lock() -> QIcon:
@@ -163,21 +174,24 @@ def _halve(bitmap: list[str]) -> list[str]:
 
 
 @lru_cache(maxsize=256)
-def _icon_rows(rsrc: bytes, large: bool) -> tuple[str, ...] | None:
+def _icon_rows(rsrc: bytes, large: bool,
+               prefer: tuple[int, ...] = (128,)) -> tuple[str, ...] | None:
     """The '#'/'.' rows a resource fork's icon gives, kept as a tuple so
     the cache shares them safely: the small one for rows and title bars
     (halved when the fork only has a 32-by-32), the full one for Get
-    Info; None for a fork that holds no icon."""
+    Info; None for a fork that holds no icon.  prefer names the
+    resource ids to try, in order, before falling back to any id."""
     if not is_fork(rsrc):
         return None
     try:
         resources = read_fork(rsrc)
     except (InvalidForkError, ValueError, DecompressError, Exception):
         return None
-    # The custom icon's id (128) first, then any id, for a fork that
-    # keeps its icon in the old way.
-    for pool in ({r.type: r.data for r in resources if r.id == 128},
-                 {r.type: r.data for r in resources}):
+    # The preferred ids first (a control panel's family is at -4064),
+    # then any id, for a fork that keeps its icon in the old way.
+    pools = [{r.type: r.data for r in resources if r.id == rid} for rid in prefer]
+    pools.append({r.type: r.data for r in resources})
+    for pool in pools:
         if not pool:
             continue
 
@@ -226,8 +240,9 @@ def _custom_icon(node: machfs.Volume | machfs.Folder | machfs.File,
 
 def item_icon(f: MacFile, *, large: bool = False) -> list[str] | None:
     """The icon the item's own resources give it — an application's or a
-    marked file's from its resource fork, a folder's from its Icon file —
-    else None for an item with no icon of its own."""
+    marked file's from its resource fork, a folder's from its Icon file,
+    a system file's declared family — else None for an item with no icon
+    of its own."""
     if f.type == FOLDER:
         volume = getattr(f.folder, "volume", None)
         if volume is None:
@@ -241,10 +256,19 @@ def item_icon(f: MacFile, *, large: bool = False) -> list[str] | None:
             return None
     if f.is_application or f.flags & HAS_CUSTOM_ICON:
         return _icon_from(bytes(f.rsrc), large)
-    from ..assoc import associated_icon_rows
+    from ..assoc import associated_icon_rows, declared_icon_rows
     own = associated_icon_rows(f, large=large)
     if own is not None:
         return list(own)
+    if f.type in SYSTEM_FILE_ICONS:
+        # A system file may carry its own family (a control panel's is
+        # at -4064 by convention); the Finder shows it in place of the
+        # system's default.
+        rows = declared_icon_rows(f, large=large)
+        if rows is None:
+            prefer = (-4064, 128) if f.type == b"cdev" else (128,)
+            rows = _icon_rows(bytes(f.rsrc), large, prefer=prefer)
+        return None if rows is None else list(rows)
     return None
 
 
@@ -259,6 +283,9 @@ def _generic_icon(f: MacFile) -> list[str]:
             return ARCHIVE_ICON
     except Exception:               # an unreadable data fork says nothing
         pass
+    system = SYSTEM_FILE_ICONS.get(f.type)
+    if system is not None:
+        return SYSTEM_FILE_BITMAPS[system]
     return DOCUMENT_ICON
 
 
