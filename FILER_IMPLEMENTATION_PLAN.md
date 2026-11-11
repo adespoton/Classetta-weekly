@@ -146,7 +146,7 @@ Preserve existing behavior unless a task explicitly changes it. If the codebase 
 
 ### Disk Tracker 1 and 2
 
-- [ ] **19. Export Filer contents to Disk Tracker 2 format**
+- [x] **19. Export Filer contents to Disk Tracker 2 format**
   - Export the current Filer contents to the Disk Tracker 2 file format.
   - Preserve the metadata supported by the export format.
   - Test representative contents and handle export failures cleanly.

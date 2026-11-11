@@ -1060,6 +1060,126 @@ def test_special_shutdown_closes_the_windows_before_the_qt_app(harness, monkeypa
     assert at_quit == [False]                    # the windows are shut, then Qt goes
 
 
+def _file_menu_export_enabled(h) -> bool:
+    for menu, _cell in h.d.global_bar.cells():
+        if menu.title == "File":
+            return menu.items[5].enabled
+    raise AssertionError("the menu bar is showing no File menu")
+
+
+def _save_dialog(monkeypatch, out):
+    class _SaveDialog:
+        @staticmethod
+        def getSaveFileName(*_args, **_kwargs):
+            return (str(out), "") if out is not None else ("", "")
+    monkeypatch.setattr("macrt.ui.filer.QFileDialog", _SaveDialog)
+
+
+def test_file_export_menu_item_enabled_state(harness):
+    h = harness(disks=[_volume()])
+    win = h.d.open_filer(h.d.config.disks[0])
+    h.settle()
+    assert _file_menu_export_enabled(h) is True
+
+
+def test_file_export_catalog_from_volume(harness, tmp_path, monkeypatch):
+    from disktracker import parse_dtc
+    h = harness(disks=[_volume()])
+    win = h.d.open_filer(h.d.config.disks[0])
+    h.settle()
+    out = tmp_path / "Browse.dtc"
+    _save_dialog(monkeypatch, out)
+    win.export_catalog()
+    h.settle()
+    items = parse_dtc(out.read_bytes())
+    disk = items[0]
+    assert disk.kind == "disk" and disk.name == "Browse"
+    assert disk.items == len(items) - 1
+    by_name = {i.name: i for i in items[1:]}
+    assert by_name["Widget"].kind == "file" and by_name["Widget"].type == b"APPL"
+    assert by_name["Letter"].kind == "file"
+    games = by_name["Games"]
+    assert games.kind == "folder" and games.items == 1
+    assert games.descendants == 1 and games.size == by_name["Game"].size
+    assert by_name["Game"].depth == games.depth + 1
+
+
+def test_file_export_catalog_from_host_folder(harness, tmp_path, monkeypatch):
+    from disktracker import parse_dtc
+    folder = tmp_path / "host"
+    folder.mkdir()
+    (folder / "doc.txt").write_bytes(b"hello")
+    sub = folder / "sub"
+    sub.mkdir()
+    (sub / "inner.txt").write_bytes(b"world!")
+
+    h = harness(disks=[])
+    win = h.d.open_filer(HostFolder(folder))
+    h.settle()
+    out = tmp_path / "host.dtc"
+    _save_dialog(monkeypatch, out)
+    win.export_catalog()
+    h.settle()
+    items = parse_dtc(out.read_bytes())
+    assert items[0].kind == "disk" and items[0].name == "host"
+    by_name = {i.name: i for i in items[1:]}
+    assert by_name["doc.txt"].size == 5 and by_name["doc.txt"].created != 0
+    sub_item = by_name["sub"]
+    assert sub_item.kind == "folder" and sub_item.descendants == 1
+    assert sub_item.size == 6 == by_name["inner.txt"].size
+    assert by_name["inner.txt"].depth == sub_item.depth + 1
+
+
+def test_file_export_catalog_disabled_for_disk_tracker_views(harness, tmp_path):
+    from disktracker import build_dtc
+    from disktracker.filer_adapter import DiskTrackerVolume
+    alpha = machfs.Volume()
+    alpha.name = "Alpha CD"
+    f = machfs.File()
+    f.data = b"alpha"
+    alpha["a.txt"] = f
+    img = tmp_path / "Alpha CD.hfs"
+    img.write_bytes(alpha.write(1024 * 1024))
+    cat = tmp_path / "catalog"
+    cat.write_bytes(build_dtc([str(img)]))
+
+    h = harness(disks=[])
+    win = h.d.open_filer(DiskTrackerVolume(cat))
+    h.settle()
+    assert _file_menu_export_enabled(h) is False
+
+
+def test_file_export_catalog_cancelled_dialog_writes_nothing(harness, tmp_path, monkeypatch):
+    h = harness(disks=[_volume()])
+    win = h.d.open_filer(h.d.config.disks[0])
+    h.settle()
+    _save_dialog(monkeypatch, None)             # the dialog is cancelled
+    win.export_catalog()
+    h.settle()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_file_export_catalog_from_container(harness, tmp_path, monkeypatch):
+    from disktracker import parse_dtc
+    p = tmp_path / "App.bin"
+    p.write_bytes(macbinary("Inner", b"payload", FORK))
+    args = parse_args([str(p), "--filer"])
+    _, _, filers, error = open_targets(args)
+    assert error is None
+    h = harness(disks=[])
+    win = h.d.open_filer(filers[0])
+    h.settle()
+    assert _file_menu_export_enabled(h) is True
+    out = tmp_path / "app.dtc"
+    _save_dialog(monkeypatch, out)
+    win.export_catalog()
+    h.settle()
+    items = parse_dtc(out.read_bytes())
+    assert items[0].kind == "disk" and items[0].name == "App.bin"
+    assert len(items) == 2
+    assert items[1].name == "Inner" and items[1].type == b"APPL"
+
+
 def test_shutdown_asks_each_running_application_to_quit(harness):
     h = harness(disks=[_volume()])
     win = h.d.open_filer(h.d.config.disks[0])
