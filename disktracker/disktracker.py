@@ -202,10 +202,9 @@ def _parse_item_at(data: bytes, off: int):
         # Candidate meta positions: the exact byte after name1's NUL (most
         # records — meta often begins with NULs, e.g. flen==0 records carry
         # no full name), or the first non-NUL byte for writers that
-        # zero-pad between name1's NUL and the meta (AppleWorks/'osas'
-        # embedded records in ARPLE).  Pick the candidate whose next_off
-        # lands on a parseable record; otherwise keep the exact position
-        # (historical behaviour).
+        # zero-pad between name1's NUL and the meta.  Pick the candidate
+        # whose next_off lands on a parseable record; otherwise keep the
+        # exact position (historical behaviour).
         candidates = [mp]
         m2 = mp
         while m2 < len(data) and data[m2] == 0:
@@ -273,8 +272,12 @@ def _is_item_start(data: bytes, off: int) -> bool:
 
 def _item_chain_ok(data: bytes, parsed) -> bool:
     """True if the record following a parsed item is itself parseable
-    (as an item or a disk record).  Rejects phantom one-off parses."""
+    (as an item or a disk record).  Rejects phantom one-off parses.
+    A successor that lands exactly at end of data is accepted: a disk
+    whose only record ends the file has nothing to chain against."""
     _, nxt = parsed
+    if nxt == len(data):
+        return True
     return _is_item_start(data, nxt) or _is_disk_record(data, nxt)
 
 
@@ -286,7 +289,7 @@ def _find_first_item(data: bytes, after_name: int, max_scan: int = 5000) -> int 
     item has depth=1, parses cleanly, and its successor must parse too —
     single phantom records in the header suffix pass a depth==1 test.
     """
-    end = min(after_name + max_scan, len(data) - 60)
+    end = min(after_name + max_scan, len(data))
     for candidate in range(after_name, end):
         depth = int.from_bytes(data[candidate + 29:candidate + 31], 'big')
         if depth != 1:

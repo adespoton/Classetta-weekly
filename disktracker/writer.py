@@ -17,14 +17,18 @@ def write_dtc(items: List[Union[Item, dict]]) -> bytes:
 
     # Group items: a disk record and the items that follow it
     groups: list[tuple[Item, list[Item]]] = []
+    orphans: list[Item] = []
     for i in items:
         if isinstance(i, Item) and i.kind == 'disk':
             groups.append((i, []))
-        elif groups and isinstance(i, Item):
+        elif isinstance(i, Item) and groups:
             groups[-1][1].append(i)
-    if not groups:
-        # Create a default root disk if none specified
-        groups = [(Item(kind='disk', name='Untitled Disk', offset=HEADER_SIZE), [])]
+        elif isinstance(i, Item):
+            orphans.append(i)
+    if orphans or not groups:
+        # Items have no disk record ahead of them: give them a default
+        # root disk rather than dropping them silently.
+        groups.insert(0, (Item(kind='disk', name='Untitled Disk', offset=HEADER_SIZE), orphans))
 
     out = bytearray(header)
 
