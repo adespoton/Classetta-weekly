@@ -19,7 +19,15 @@ class CatalogFile(machfs.File):
 
 
 class DiskTrackerVolume(machfs.Volume):
-    """Wraps a parsed Disk Tracker file into a read-only machfs.Volume structure for Filer display."""
+    """Wraps a parsed Disk Tracker file into a read-only machfs.Volume structure for Filer display.
+
+    The volume root lists only the indexed disks, one folder per disk
+    record, in catalog order: opening a catalog in the Filer starts at
+    the list of disk images it indexes.  Each disk's items are inside its
+    folder, so a multi-disk catalog stays per-disk instead of merging
+    every disk's top level into the root.  Disks listed under the same
+    name are separate folders: the first keeps the plain name and later
+    copies get ' (2)', ' (3)', … suffixes."""
     def __init__(self, path: str | Path):
         super().__init__()
         path = Path(path)
@@ -28,17 +36,29 @@ class DiskTrackerVolume(machfs.Volume):
         data = path.read_bytes()
         items = parse_dtc(data)
 
-        first_disk = True
-        stack = [self]  # stack of folders at each depth level
+        counts = {}
+        used = set()
+        stack = [self]  # folders the current item can hang off, by depth
         for item in items:
             if item.kind == 'disk':
-                if first_disk:
-                    self.name = item.name
-                    first_disk = False
-                # Reset the folder stack per disk: depth is relative to
-                # each disk, so a stale deep stack from the previous
-                # disk would misattach this disk's depth-1 folders.
-                stack = [self]
+                name = item.name
+                count = counts.get(name, 0) + 1
+                while True:
+                    display = name if count == 1 else f'{name} ({count})'
+                    if display not in used:
+                        break
+                    count += 1
+                counts[name] = count
+                used.add(display)
+                folder = machfs.Folder()
+                try:
+                    self[display] = folder
+                except Exception:
+                    pass
+                # depth is relative to each disk, so restart the stack
+                # there; items seen before the first disk (a malformed
+                # catalog) hang off the root rather than being dropped
+                stack = [folder]
                 continue
 
             # Ensure stack is long enough

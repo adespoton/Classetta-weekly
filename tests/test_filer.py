@@ -6,6 +6,7 @@ import pytest
 import struct
 import sys
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QFontMetrics
 from PyQt6.QtTest import QTest
 
 from conftest import LB, NO_MODS, Recorder
@@ -184,6 +185,14 @@ def test_the_window_lists_the_folder(harness):
     assert _rows(win) == [("Games", "folder"), ("Letter", "document"),
                           ("Widget", "application")]
     assert win in h.d.filer_windows
+
+
+def test_the_name_column_fits_32_Ws_without_truncating(harness):
+    h = harness(disks=[_n_volume()])
+    win = h.d.open_filer(h.d.config.disks[0])
+    h.settle()
+    fm = QFontMetrics(win.tree.font())
+    assert win.tree.columnWidth(0) >= fm.horizontalAdvance("W" * 32)
 
 
 def test_the_header_wears_the_lock_while_the_window_is_view_only(harness):

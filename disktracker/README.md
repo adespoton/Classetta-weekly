@@ -70,8 +70,13 @@ from disktracker.filer_adapter import DiskTrackerVolume
 volume = DiskTrackerVolume('catalog.dtc')   # a machfs.Volume-shaped tree
 ```
 
-Files report their catalog sizes without any fork data existing; the
-window gets a distinct catalog icon in its title bar.
+The volume root lists only the indexed disks, one folder per disk
+record, in catalog order; a disk's recorded items are inside its
+folder, so a multi-disk catalog stays per-disk.  Disks listed under the
+same name appear as separate folders: the first keeps the plain name,
+later copies get ' (2)', ' (3)', … suffixes.  Files report their
+catalog sizes without any fork data existing; the window gets a distinct
+catalog icon in its title bar.
 
 ## Command line
 

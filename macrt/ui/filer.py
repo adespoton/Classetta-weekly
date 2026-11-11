@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING
 
 import machfs
 from PyQt6.QtCore import QEvent, QSize, Qt
-from PyQt6.QtGui import QIcon, QPainter, QPixmap
+from PyQt6.QtGui import QFontMetrics, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QHeaderView, QListWidget, QMessageBox, QPlainTextEdit, QTreeWidget,
     QTreeWidgetItem, QWidget,
@@ -360,9 +360,16 @@ class FilerWindow(_Hosted):
         self._opened_at = 0.0
         self.entries: dict[str, MacFile] = {}
         self.tree = QTreeWidget(self)
+        self._content_width = CONTENT[0]
         self._fill()
         self.tree.setStyleSheet(LIST_STYLE)
         self.tree.setFont(theme.body_font())
+        # Size the list so the Name column fits 32 W's without truncating,
+        # whatever the host's stand-in for the Mac font measures: text +
+        # icon and padding (16px icon + padding, plus headroom for a
+        # vertical scrollbar's width) + the fixed Size and Kind columns.
+        fm = QFontMetrics(self.tree.font())
+        self._content_width = max(CONTENT[0], fm.horizontalAdvance('W' * 32) + 30 + 56 + 84)
         self.tree.setRootIsDecorated(False)
         self.tree.setIndentation(0)
         self.tree.setUniformRowHeights(True)
@@ -420,7 +427,7 @@ class FilerWindow(_Hosted):
                             go_away=True, pressed=self._pressed)
 
     def content_size(self) -> tuple[int, int]:
-        return CONTENT
+        return (getattr(self, '_content_width', CONTENT[0]), CONTENT[1])
 
     def _relayout(self) -> None:
         f = self.frame()

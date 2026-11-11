@@ -205,7 +205,8 @@ python -m macrt Catalog.dtc                         # a Disk Tracker index, brow
 ```
 
 Disk Tracker's own index files open too: a `.dtc` or `.dt1` file lists
-its recorded contents in a Filer window that stays read-only — its
+the disks it indexes in the Filer window's root — one folder per disk,
+each holding that disk's recorded contents — and stays read-only — its
 title bar carries a catalog icon of its own rather than a disk's,
 nothing in it opens, and File ▸ Get Info shows what the index recorded:
 size, type, creator, and creation and modification dates. To build such
