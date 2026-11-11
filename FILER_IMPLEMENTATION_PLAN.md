@@ -96,10 +96,10 @@ Preserve existing behavior unless a task explicitly changes it. If the codebase 
   - Opening a resource or **DATA** opens it in the hex viewer with the text-only option.
   - Test resource-only and resource-plus-data files.
 
-- [ ] **11b. Update Get Info for minimum and desired heap sizes**
+- [x] **11b. Update Get Info for minimum and desired heap sizes**
   - Update Get Info window to display application's minimum reserved heap and desired reserved heap, like in System 7 Finder.
 
-- [ ] **12. Open host-system folders in Filer windows**
+- [x] **12. Open host-system folders in Filer windows**
   - Allow a host-system folder to be opened as a Filer window.
   - Support browsing, selection, and the applicable item commands.
   - Preserve existing behavior for other kinds of Filer windows.
@@ -107,38 +107,38 @@ Preserve existing behavior unless a task explicitly changes it. If the codebase 
 
 ### Existing formats and nested browsing
 
-- [ ] **13. Add Open to Filer View for existing non-disk-image file types**
+- [x] **13. Add Open to Filer View for existing non-disk-image file types**
   - Add an explicit way to request Filer view, potentially a `--filer` flag.
   - Keep the current action as the default for each existing file type.
   - Start with file types the application already handles.
   - Test both the default launch action and explicit Filer-view behavior.
 
-- [ ] **14. Bring existing encodings and containers into the Filer UI**
+- [x] **14. Bring existing encodings and containers into the Filer UI**
   - Reuse existing handlers for formats already supported by the application.
   - Open their contents in Filer windows.
   - Do not add new format support in this task.
   - Test representative existing formats and invalid inputs.
 
-- [ ] **15. Enable drill-down through existing containers**
+- [x] **15. Enable drill-down through existing containers**
   - Allow supported containers to be opened from within a Filer window.
   - Support nested browsing for existing encodings and container types.
   - Handle unsupported or corrupt nested items without crashing the Filer window.
   - Test at least one nested-container case.
 
-- [ ] **16. Launch applications found in existing nested containers**
+- [x] **16. Launch applications found in existing nested containers**
   - Allow an application found through the supported nested-browsing path to be launched.
   - Test a directly contained application and one found inside multiple existing containers.
   - Preserve the normal launch behavior for non-nested items.
 
 ### Process lifecycle
 
-- [ ] **17. Implement graceful Shutdown**
+- [x] **17. Implement graceful Shutdown**
   - Add **Special → Shutdown**.
   - Close all windows and request a graceful quit from all running subprocesses.
   - Terminate the root process only after the shutdown sequence completes.
   - Test subprocesses that exit normally and handle shutdown errors without skipping cleanup.
 
-- [ ] **18. Implement Restart**
+- [x] **18. Implement Restart**
   - Add **Special → Restart**.
   - Reuse the graceful shutdown sequence from task 17.
   - After shutdown, rerun the original command with the same parameters.
@@ -157,14 +157,14 @@ Preserve existing behavior unless a task explicitly changes it. If the codebase 
   - Ensure clear detection and differentiation between Disk Tracker 1.x and 2.x files.
   - Add tests covering Disk Tracker 1.x files and error/fallback paths.
 
-- [ ] **20. Display Disk Tracker 1 and 2 files as read-only Filer windows**
+- [x] **20. Display Disk Tracker 1 and 2 files as read-only Filer windows**
   - Open Disk Tracker 1 and 2 files in a Filer-style display-only window.
   - Show a distinct window-bar icon to indicate display-only status.
   - Disable opening selected files.
   - Keep **Get Info** available for recorded metadata.
   - Test missing metadata and attempts to invoke disabled actions.
 
-- [ ] **20b. Add disk image batch indexing to disktracker library**
+- [x] **20b. Add disk image batch indexing to disktracker library**
   - Add support in the `disktracker` library to accept a list of disk images (e.g., HFS/ISO/raw volumes).
   - Parse their filesystem contents and output a fully structured `.dtc` catalog file indexing their contents.
   - Test batch generation against sample disk images.
