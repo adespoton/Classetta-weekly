@@ -160,8 +160,11 @@ def color_suite_icon(get, size: tuple[int, int], depth: int) -> Icon | None:
     bw, four, eight = SIZES[size]
     candidates = ((eight, 8), (four, 4)) if depth >= 8 else ((four, 4),)
     one = get(bw)
-    masked = bitmap_icon(one, size) if one else None
-    mask = masked.mask if masked else None
+    if not one and size == LARGE:
+        one = get("ICON")
+    masked = len(one) >= 2 * size[0] * size[1] // 8 if one else False
+    masked_icon = bitmap_icon(one, size, masked=masked) if one else None
+    mask = masked_icon.mask if masked_icon else None
     for kind, bits in candidates:
         data = get(kind)
         if not data:
@@ -184,7 +187,10 @@ def suite_icon(get, size: tuple[int, int]) -> Icon | None:
     one, all of it (the mask is the 1-bit one's)."""
     bw, four, eight = SIZES[size]
     one = get(bw)
-    icon = bitmap_icon(one, size) if one else None
+    if not one and size == LARGE:
+        one = get("ICON")
+    masked = len(one) >= 2 * size[0] * size[1] // 8 if one else False
+    icon = bitmap_icon(one, size, masked=masked) if one else None
     if icon is not None:
         return icon
     for kind, depth in ((eight, 8), (four, 4)):
