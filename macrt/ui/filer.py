@@ -40,7 +40,7 @@ from ..process import size_resource
 from ..m68k.segload import has_code, why_no_code
 from ..resfork import InvalidForkError, is_fork, read_fork
 from ..toolbox import constants as k
-from ..toolbox.icons import LARGE, MINI, SMALL, Icon, bitmap_icon, suite_icon
+from ..toolbox.icons import LARGE, MINI, SMALL, Icon, bitmap_icon, color_suite_icon, suite_icon
 from ..toolbox.menus import Menu, parse_menu_items
 from ..toolbox.windows import WindowKind
 from ..viewer import describe, viewer_main
@@ -445,7 +445,8 @@ class FilerWindow(_Hosted):
             except Exception:
                 size = "--"
             item = QTreeWidgetItem([f.name, size, _kind(f)])
-            item.setIcon(0, _qicon(item_icon(f)) or icon(_icon_for(f)))
+            item.setIcon(0, item_icon_qicon(f, depth=_depth(self.display))
+                         or icon(_icon_for(f)))
             self.tree.addTopLevelItem(item)
 
     # -- frame ------------------------------------------------------------
@@ -751,6 +752,72 @@ class FilerWindow(_Hosted):
         self.display.show_alert(QMessageBox.Icon.Warning, "Could Not Open", message)
 
 
+def _depth(display) -> int:
+    """The screen depth the Filer may use for colour, as the guest sees
+    it: the running System's, so a guest that changes depth changes the
+    Filer with it.  None only for a Display without a System (nothing
+    here runs without one)."""
+    system = getattr(display, "system", None)
+    return getattr(system, "depth", 1)
+
+
+def _icon_qicon(icon: Icon) -> QIcon:
+    q = QIcon()
+    q.addPixmap(QPixmap.fromImage(icon.pixels))
+    return q
+
+
+@lru_cache(maxsize=256)
+def _fork_color_icon(rsrc: bytes, large: bool, depth: int,
+                     preferred: tuple[int, ...]) -> QIcon | None:
+    """A resource fork's colour icon at the preferred ids (in order) then
+    any id; None when there is no colour icon for it."""
+    if not is_fork(rsrc):
+        return None
+    try:
+        resources = read_fork(rsrc)
+    except Exception:
+        return None
+    size = LARGE if large else SMALL
+    pools = [{r.type: r.data for r in resources if r.id == rid}
+             for rid in preferred]
+    pools.append({r.type: r.data for r in resources})
+    for pool in pools:
+        if not pool:
+            continue
+        icon = color_suite_icon(lambda kind: pool.get(kind.encode("ascii")),
+                                size, depth)
+        if icon is not None:
+            return _icon_qicon(icon)
+    return None
+
+
+def item_icon_qicon(f: MacFile, *, large: bool = False, depth: int = 1) -> QIcon | None:
+    """f's icon as a QIcon: its colour family at depth > 2 when its
+    resources have one the depth can show, else the 1-bit icon (inverted
+    when selected); None for an item with no icon of its own."""
+    if depth <= 2 or f.type == FOLDER:
+        rows = item_icon(f, large=large)
+        return None if rows is None else icon_from_bitmap(rows)
+    q = None
+    if f.is_application or f.flags & HAS_CUSTOM_ICON:
+        q = _fork_color_icon(bytes(f.rsrc), large, depth, (128,))
+    else:
+        from ..assoc import associated_color_icon, declared_color_icon
+        icon = associated_color_icon(f, large=large, depth=depth)
+        if icon is not None:
+            q = _icon_qicon(icon)
+        elif f.type in SYSTEM_FILE_ICONS:
+            icon = declared_color_icon(f, large=large, depth=depth)
+            q = _icon_qicon(icon) if icon is not None else _fork_color_icon(
+                bytes(f.rsrc), large, depth,
+                (-4064, 128) if f.type == b"cdev" else (128,))
+    if q is not None:
+        return q
+    rows = item_icon(f, large=large)
+    return None if rows is None else icon_from_bitmap(rows)
+
+
 class AboutWindow(_Hosted):
     """An About window, modeled on the System 7 About dialogs: a small
     window with a title bar and close box, its lines of text drawn in the
@@ -759,11 +826,13 @@ class AboutWindow(_Hosted):
     def __init__(self, display: Display, title: str, lines: list[str],
                  title_icon: list[str] | None = None,
                  content_size: tuple[int, int] = (280, 100),
-                 parent: QWidget | None = None):
+                 parent: QWidget | None = None,
+                 title_pixmap: QPixmap | None = None):
         super().__init__(display, parent)
         self._title = title
         self._lines = lines
         self._title_icon = title_icon
+        self._title_pixmap = title_pixmap
         self._content_size = content_size
         self.setWindowTitle(title)
         self._hilited = True
@@ -772,8 +841,8 @@ class AboutWindow(_Hosted):
 
     def frame(self) -> chrome.Frame:
         return chrome.Frame(kind=WindowKind.DOCUMENT, title=self._title,
-                            title_icon=self._title_icon, hilited=self._hilited,
-                            go_away=True, pressed=self._pressed)
+                            title_icon=self._title_icon, title_pixmap=self._title_pixmap,
+                            hilited=self._hilited, go_away=True, pressed=self._pressed)
 
     def content_size(self) -> tuple[int, int]:
         return self._content_size
@@ -896,13 +965,23 @@ class GetInfoWindow(AboutWindow):
             mac_epoch = datetime(1904, 1, 1, tzinfo=timezone.utc)
             dt = mac_epoch + timedelta(seconds=item.mddate)
             lines.append(f"Modified: {dt.strftime('%a, %b %d, %Y, %I:%M %p')}")
+        depth = _depth(display)
+        title_pixmap = None
+        if depth > 2:
+            q = item_icon_qicon(item, depth=depth)
+            title_pixmap = q.pixmap(16, 16) if q is not None else None
         super().__init__(display, f"{item.name} Info", lines,
                          title_icon=item_icon(item) or _generic_icon(item),
-                         content_size=(320, 236), parent=parent)
+                         content_size=(320, 236), parent=parent,
+                         title_pixmap=title_pixmap)
         self.item = item
         # The item's own icon at its full size, for the box; None keeps
         # the generic one for what it is.
         self._own_icon = item_icon(item, large=True)
+        self._own_pixmap = None
+        if depth > 2:
+            q = item_icon_qicon(item, large=True, depth=depth)
+            self._own_pixmap = q.pixmap(32, 32) if q is not None else None
 
     def paintEvent(self, event):  # noqa: N802
         f = self.frame()
@@ -915,7 +994,9 @@ class GetInfoWindow(AboutWindow):
 
         # Draw icon: the item's own when it has one, else the generic one
         own = self._own_icon
-        if own is not None:
+        if self._own_pixmap is not None:
+            p.drawPixmap(rect.left() + 16, rect.top() + 16, self._own_pixmap)
+        elif own is not None:
             icon_w, icon_h = theme.bitmap_size(own)
             theme.draw_bitmap(p, rect.left() + 16 + (32 - icon_w) // 2,
                               rect.top() + 16 + (32 - icon_h) // 2,
@@ -942,9 +1023,15 @@ class ContentViewerWindow(AboutWindow):
     """A viewer window for a file's contents (data and/or resource fork list and viewer)."""
 
     def __init__(self, display: Display, item: MacFile):
+        depth = _depth(display)
+        title_pixmap = None
+        if depth > 2:
+            q = item_icon_qicon(item, depth=depth)
+            title_pixmap = q.pixmap(16, 16) if q is not None else None
         super().__init__(display, item.name, [],
                          title_icon=item_icon(item) or _generic_icon(item),
-                         content_size=(720, 480))
+                         content_size=(720, 480), parent=None,
+                         title_pixmap=title_pixmap)
         self.item = item
         self.text_only = False
 
@@ -1074,19 +1161,26 @@ class AboutClassettaWindow(AboutWindow):
         # is reserved for it and how far its heap has grown — then each
         # running application the same way (System/Filer processes outside
         # the application heap are not among them).
+        depth = _depth(display)
         sys_heap = system.sys_heap
         processes = [("System", (sys_heap.limit - sys_heap.start) // 1024,
                       (sys_heap.end - sys_heap.start) // 1024,
-                      theme.GENERIC_APP_ICON)]
+                      theme.GENERIC_APP_ICON, None)]
         for proc in display.processes:
             if proc.name not in ("System", "Filer"):
                 partition_size = (proc.partition.end - proc.partition.start) // 1024
                 heap_used = (proc.partition.heap.end - proc.partition.heap.start) // 1024
-                # The running application's own icon, else the generic one
+                # The running application's own icon, else the generic one;
+                # at depth > 2, its colour one when it has it
                 row_icon = (theme.GENERIC_APP_ICON if proc.app is None
                             else _icon_from(bytes(proc.app.rsrc))
                                  or theme.GENERIC_APP_ICON)
-                processes.append((proc.name, partition_size, heap_used, row_icon))
+                row_pixmap = None
+                if depth > 2 and proc.app is not None:
+                    q = _fork_color_icon(bytes(proc.app.rsrc), False, depth, (128,))
+                    row_pixmap = q.pixmap(16, 16) if q is not None else None
+                processes.append((proc.name, partition_size, heap_used, row_icon,
+                                  row_pixmap))
 
         # Build the window - no title icon
         title = "About Classetta"
@@ -1203,7 +1297,7 @@ class AboutClassettaWindow(AboutWindow):
         bar_end = content.right() - (self._scroll_bar_width if has_scrollbar else 0)
 
         # Draw application rows
-        for i, (name, partition_size, heap_used, row_icon) in enumerate(
+        for i, (name, partition_size, heap_used, row_icon, row_pixmap) in enumerate(
                 self._processes):
             row_y = self._app_list_y + i * row_height - self._scroll_offset
 
@@ -1218,9 +1312,13 @@ class AboutClassettaWindow(AboutWindow):
 
             # Draw the application's own icon (the generic one when it has none)
             p.setFont(body)
-            row_icon_w, row_icon_h = theme.bitmap_size(row_icon)
-            theme.draw_bitmap(p, col1_x, row_y + (row_height - row_icon_h) // 2,
-                              row_icon, theme.BLACK)
+            if row_pixmap is not None:
+                p.drawPixmap(col1_x, row_y + (row_height - row_pixmap.height()) // 2,
+                             row_pixmap)
+            else:
+                row_icon_w, row_icon_h = theme.bitmap_size(row_icon)
+                theme.draw_bitmap(p, col1_x, row_y + (row_height - row_icon_h) // 2,
+                                  row_icon, theme.BLACK)
 
             # Draw application name, up to the memory column
             max_name = mem_x - col2_x - 6

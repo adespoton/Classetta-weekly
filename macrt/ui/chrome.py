@@ -26,7 +26,8 @@ from functools import lru_cache
 
 from PyQt6.QtCore import QRect, QRectF, Qt
 from PyQt6.QtGui import (
-    QBitmap, QBrush, QColor, QFontMetrics, QImage, QPainter, QPainterPath, QPen, QRegion,
+    QBitmap, QBrush, QColor, QFontMetrics, QImage, QPainter, QPainterPath, QPen, QPixmap,
+    QRegion,
 )
 
 from ..memory import BusError
@@ -51,6 +52,7 @@ class Frame:
     kind: WindowKind
     title: str = ""
     title_icon: list[str] | None = None   # '#'/'.' rows drawn beside the title
+    title_pixmap: QPixmap | None = None   # drawn instead of title_icon, at depth > 2
     hilited: bool = True
     go_away: bool = False
     zoom: bool = False
@@ -338,8 +340,9 @@ def _title_text_rect(f: Frame, w: int, tr: QRect, cb, zb) -> QRect | None:
     box = theme.BOX_INSET + theme.BOX_SIZE + theme.BOX_CLEARANCE + pad
     left = box if f.go_away else pad
     right = w - (box if f.zoom and f.kind is WindowKind.DOCUMENT else pad)
-    lead = (theme.bitmap_size(f.title_icon)[0] + theme.TITLE_ICON_GAP
-            if f.title_icon else 0)
+    lead = ((f.title_pixmap.width() if f.title_pixmap is not None
+             else theme.bitmap_size(f.title_icon)[0]) + theme.TITLE_ICON_GAP
+            if f.title_pixmap is not None or f.title_icon else 0)
     x = max((w - m.horizontalAdvance(f.title) - lead) // 2, left)
     text = m.elidedText(f.title, Qt.TextElideMode.ElideRight, max(right - x - lead, 0))
     if not text:
@@ -348,7 +351,11 @@ def _title_text_rect(f: Frame, w: int, tr: QRect, cb, zb) -> QRect | None:
 
 
 def _paint_title(p: QPainter, f: Frame, r: QRect, color) -> None:
-    if f.title_icon:
+    if f.title_pixmap is not None:
+        pm = f.title_pixmap
+        p.drawPixmap(r.x(), r.y() + (r.height() - pm.height()) // 2, pm)
+        r = r.adjusted(pm.width() + theme.TITLE_ICON_GAP, 0, 0, 0)
+    elif f.title_icon:
         iw, ih = theme.bitmap_size(f.title_icon)
         theme.draw_bitmap(p, r.x(), r.y() + (r.height() - ih) // 2, f.title_icon, color)
         r = r.adjusted(iw + theme.TITLE_ICON_GAP, 0, 0, 0)

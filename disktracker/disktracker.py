@@ -7,6 +7,16 @@ from typing import List, Union
 HEADER_SIZE = 0x2F0
 ITEM_FRONT = 39
 
+# Disk Tracker 1.x layout (from the .dt1 samples, cross-checked against
+# the 2.x conversion code in the OS X binary): a 0x37e-byte header, then
+# per disk a 76-byte volume record followed by `descendants`
+# variable-length item records (36 fixed bytes, then a Pascal name).
+# A gap of padding may follow before the next volume record.
+V1_HEADER_SIZE = 0x37e
+V1_VOLUME_SIZE = 76
+V1_ITEM_BASE = 37       # 36 fixed bytes, name length at +0x24, name at +0x25
+V1_SCAN_LIMIT = 0x4000  # max gap searched for the next volume record
+
 try:
     b'\xa5'.decode('mac_roman')
 
@@ -44,30 +54,111 @@ class Item:
     suffix: bytes = b''
 
 def parse_dtc(data: bytes) -> List[Item]:
-    """Parse a .dtc file (auto-detecting or handling v1/v2)."""
-    # Check magic or header version
+    """Parse a .dtc or .dt1 file (auto-detecting 1.x or 2.x format)."""
     if data.startswith(b'disktrak'):
+        if len(data) >= 0x10 and struct.unpack('>I', data[12:16])[0] == 1:
+            return parse_dtc_v1(data)
         return _parse_dtc_v2(data)
-    else:
-        return parse_dtc_v1(data)
+    return parse_dtc_v1(data)
+
+
+def _v1_volume_ok(data: bytes, off: int) -> bool:
+    if off + V1_VOLUME_SIZE > len(data):
+        return False
+    rec = data[off:off+V1_VOLUME_SIZE]
+    ln = rec[0x24]
+    if not (1 <= ln <= 39 and off + 0x25 + ln <= len(data)):
+        return False
+    name = rec[0x25:0x25+ln]
+    if not all(b >= 0x20 for b in name):
+        return False
+    items, desc = struct.unpack('>II', rec[0x1c:0x24])
+    if not (0 < desc <= 500000):
+        return False
+    created, modified = struct.unpack('>II', rec[0x12:0x1a])
+    if created <= 0x80000000 and modified <= 0x80000000:
+        return False
+    depth, = struct.unpack('>H', rec[0x1a:0x1c])
+    return depth == 0
+
+
+def _v1_scan(data: bytes, start: int, limit: int) -> Union[int, None]:
+    for off in range(start, min(start + limit, len(data) - V1_VOLUME_SIZE)):
+        if _v1_volume_ok(data, off):
+            return off
+    return None
 
 
 def parse_dtc_v1(data: bytes) -> List[Item]:
     """Parse Disk Tracker 1.x format files (lacking comments, notes, and large volume extensions)."""
+    if not data.startswith(b'disktrak') or len(data) < V1_HEADER_SIZE:
+        return []
     out: List[Item] = []
-    # DT 1.x typically has simpler fixed or variable records without the v2 header block.
-    # We walk records and extract name, size, dates, type, creator.
-    off = 0
-    while off < len(data) - 10:
-        # Look for typical item record start or parse sequentially
-        ln = data[off]
-        if 0 < ln < 64 and off + 1 + ln <= len(data):
-            name = _decode_mac_roman(data[off+1:off+1+ln])
-            item = Item(kind='file', name=name, offset=off)
+    off = V1_HEADER_SIZE if _v1_volume_ok(data, V1_HEADER_SIZE) else _v1_scan(data, V1_HEADER_SIZE, V1_SCAN_LIMIT)
+    while off is not None and len(out) < 500000:
+        rec = data[off:off+V1_VOLUME_SIZE]
+        ln = rec[0x24]
+        name = _decode_mac_roman(rec[0x25:0x25+ln])
+        created, modified = struct.unpack('>II', rec[0x12:0x1a])
+        items, desc = struct.unpack('>II', rec[0x1c:0x24])
+        
+        disk_item = Item(
+            kind='disk',
+            name=name,
+            offset=off,
+            created=created,
+            modified=modified,
+            depth=0,
+            items=desc,          # total descendants count for v2 parity
+            descendants=items,   # immediate children count
+            front=rec,
+        )
+        out.append(disk_item)
+        off += V1_VOLUME_SIZE
+
+        truncated = False
+        for _ in range(desc):
+            if off + V1_ITEM_BASE > len(data):
+                truncated = True
+                break
+            it_bytes = data[off:]
+            if len(it_bytes) < V1_ITEM_BASE:
+                truncated = True
+                break
+            flags, = struct.unpack('>H', it_bytes[0:2])
+            typ = it_bytes[2:6]
+            cre = it_bytes[6:10]
+            size, parent, created, modified = struct.unpack('>IIII', it_bytes[10:26])
+            depth, items_c, desc_c = struct.unpack('>HII', it_bytes[26:36])
+            iln = it_bytes[36]
+            if off + V1_ITEM_BASE + iln > len(data):
+                truncated = True
+                break
+            iname = _decode_mac_roman(it_bytes[37:37+iln])
+            
+            is_folder = (flags & 0x8000) or (typ[2:] == b'\xff\xff')
+            kind = 'folder' if is_folder else 'file'
+            
+            item = Item(
+                kind=kind,
+                name=iname,
+                offset=off,
+                type=typ,
+                creator=cre,
+                size=size,
+                parent=parent,
+                created=created,
+                modified=modified,
+                depth=depth,
+                items=items_c,
+                descendants=desc_c,
+                front=it_bytes[:V1_ITEM_BASE],
+            )
             out.append(item)
-            off += 1 + ln
-        else:
-            off += 1
+            off += V1_ITEM_BASE + iln
+        if truncated:
+            break
+        off = _v1_scan(data, off, V1_SCAN_LIMIT)
     return out
 
 

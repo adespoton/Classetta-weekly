@@ -151,7 +151,7 @@ Preserve existing behavior unless a task explicitly changes it. If the codebase 
   - Preserve the metadata supported by the export format.
   - Test representative contents and handle export failures cleanly.
 
-- [ ] **19b. Add support for Disk Tracker 1.x format**
+- [x] **19b. Add support for Disk Tracker 1.x format**
   - Add support for reading and handling the original Disk Tracker 1.x format in the `disktracker` library.
   - Omit newer catalog features (Finder comments, item notes, large-volume extensions) absent in the original format.
   - Ensure clear detection and differentiation between Disk Tracker 1.x and 2.x files.
@@ -169,7 +169,7 @@ Preserve existing behavior unless a task explicitly changes it. If the codebase 
   - Parse their filesystem contents and output a fully structured `.dtc` catalog file indexing their contents.
   - Test batch generation against sample disk images.
 
-- [ ] **21. Implement color icons and other elements with --depth greater than 2**
+- [x] **21. Implement color icons and other elements with --depth greater than 2**
   - When the Filer runs with the `--depth` option set to a value greater than 2, enable color icons and other high-colour display elements.
   - For `--depth 8` (true colour), display full 256-colour icons where available, and enable colorised UI elements where supported.
   - For `--depth 4` (high-colour), use a reduced palette of up to 16 colours for icons and UI elements.

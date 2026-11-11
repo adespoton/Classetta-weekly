@@ -25,7 +25,7 @@ from functools import lru_cache
 
 from .macfile import HostFolder, MacFile, VolumeFolder, load_file, volume_files
 from .resfork import InvalidForkError, is_fork, read_fork
-from .toolbox.icons import LARGE, MINI, SMALL, bitmap_icon, suite_icon
+from .toolbox.icons import LARGE, MINI, SMALL, bitmap_icon, color_suite_icon, suite_icon
 
 FT_APPLICATION_NAME = b"apnm"      # the ftApplicationName entry in a 'kind' resource
 REGION_US = 0                      # verUS: the only region macrt reads
@@ -303,6 +303,40 @@ def _info_for_fork(fork: bytes) -> AppInfo | None:
     if not fork:
         return None
     return _app_info(fork)
+
+
+def _color_for(info: AppInfo, resid: int | None, size: tuple[int, int],
+                depth: int):
+    """The colour icon family at resid in info's fork, for depth; None
+    without one."""
+    if info is None or resid is None:
+        return None
+
+    def get(kind: str) -> bytes | None:
+        return info.by_id.get((kind.encode("ascii"), resid))
+
+    return color_suite_icon(get, size, depth)
+
+
+def declared_color_icon(f: MacFile, *, large: bool = False, depth: int = 1):
+    """The colour icon f's own bundle resources declare for its own
+    type, for depth; None without one."""
+    info = _info_for_fork(bytes(f.rsrc) if f.rsrc else b"")
+    size = LARGE if large else SMALL
+    return _color_for(info, info.icon_resource_id(f.type) if info else None,
+                      size, depth)
+
+
+def associated_color_icon(f: MacFile, *, large: bool = False, depth: int = 1):
+    """The colour icon the creating app declares for f's type, for
+    depth; None without one."""
+    app = associated_app(f)
+    if app is None:
+        return None
+    info = _info_for_fork(bytes(app.rsrc))
+    size = LARGE if large else SMALL
+    return _color_for(info, info.icon_resource_id(f.type) if info else None,
+                      size, depth)
 
 
 def associated_icon_rows(f: MacFile, *, large: bool = False) -> tuple[str, ...] | None:

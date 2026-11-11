@@ -6,7 +6,7 @@ import pytest
 import struct
 import sys
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QFontMetrics
+from PyQt6.QtGui import QColor, QFontMetrics
 from PyQt6.QtTest import QTest
 
 from conftest import LB, NO_MODS, Recorder
@@ -1422,3 +1422,110 @@ def test_system_files_have_kind_strings(harness):
         for w in h.d.info_windows:
             w.close()
         h.settle()
+
+
+def _colour_icon_family_resources(resid, ftype, local_id):
+    """An icon family with its colour members too, for --depth above 2."""
+    return _icon_family_resources(resid, ftype, local_id) + [
+        Resource(b"ics4", resid, b"\x11" * 128),       # every pixel colour 1
+        Resource(b"ics8", resid, b"\xd7" * 256),      # every pixel colour 215
+        Resource(b"icl4", resid, b"\x11" * 512),
+        Resource(b"icl8", resid, b"\xd7" * 1024),
+    ]
+
+
+def _colour_system_volume():
+    return _system_volume("Control Panels", b"cdev",
+                          _colour_icon_family_resources(-4064, b"cdev", 0))
+
+
+def test_colour_icons_at_each_depth(harness):
+    from macrt.macfile import list_folder
+    from macrt.ui.filer import item_icon_qicon
+    v = _colour_system_volume()
+    doc = next(f for f in list_folder(v) if f.name == "The Thing")
+    want = {1: QColor(0, 0, 0), 2: QColor(0, 0, 0),
+            4: QColor(252, 243, 5), 8: QColor(238, 0, 0)}
+    for depth, colour in want.items():
+        q = item_icon_qicon(doc, depth=depth)
+        assert q is not None and not q.isNull()
+        img = q.pixmap(16, 16).toImage()
+        assert img.pixelColor(0, 0) == colour, f"depth {depth}"
+
+
+def test_get_info_shows_colour_icons_at_depth_8(harness):
+    v = _colour_system_volume()
+    h = harness(disks=[v], model="ii")
+    win = h.d.open_filer(v)
+    h.settle()
+    win.tree.setCurrentItem(_item(win, "The Thing"))
+    h.settle()
+    win.get_info()
+    h.settle()
+    assert len(h.d.info_windows) == 1
+    info = h.d.info_windows[0]
+    assert info._own_pixmap is not None
+    assert info._own_pixmap.toImage().pixelColor(0, 0) == QColor(238, 0, 0)
+    assert info.frame().title_pixmap is not None
+    info.close()
+    h.settle()
+
+
+def test_get_info_shows_the_16_colour_icon_at_depth_4(harness):
+    v = _colour_system_volume()
+    h = harness(disks=[v], model="ii", depth=4)
+    win = h.d.open_filer(v)
+    h.settle()
+    win.tree.setCurrentItem(_item(win, "The Thing"))
+    h.settle()
+    win.get_info()
+    h.settle()
+    assert len(h.d.info_windows) == 1
+    info = h.d.info_windows[0]
+    assert info._own_pixmap is not None
+    assert info._own_pixmap.toImage().pixelColor(0, 0) == QColor(252, 243, 5)
+    info.close()
+    h.settle()
+
+
+def test_get_info_falls_back_to_bitmaps_at_depth_1(harness):
+    v = _colour_system_volume()
+    h = harness(disks=[v])
+    win = h.d.open_filer(v)
+    h.settle()
+    win.tree.setCurrentItem(_item(win, "The Thing"))
+    h.settle()
+    win.get_info()
+    h.settle()
+    assert len(h.d.info_windows) == 1
+    info = h.d.info_windows[0]
+    assert info._own_pixmap is None
+    assert info.frame().title_pixmap is None
+    info.close()
+    h.settle()
+
+
+def test_the_apple_menu_wears_the_rainbow_at_colour_depth(harness):
+    green = QColor("#61BB46").rgb() & 0xFFFFFF
+    for cfg in ({"model": "ii"}, {"model": "ii", "depth": 4}):
+        v = _volume()
+        h = harness(disks=[v], **cfg)
+        win = h.d.open_filer(v)
+        h.settle()
+        assert any(m.is_apple for m, _ in h.d.global_bar.cells()), cfg
+        img = h.d.global_bar.image()
+        found = any(img.pixelColor(x, y).rgb() & 0xFFFFFF == green
+                    for y in range(img.height()) for x in range(img.width()))
+        assert found, cfg
+
+
+def test_the_apple_menu_stays_black_and_white_at_depth_1(harness):
+    v = _volume()
+    h = harness(disks=[v])
+    win = h.d.open_filer(v)
+    h.settle()
+    img = h.d.global_bar.image()
+    green = QColor("#61BB46").rgb() & 0xFFFFFF
+    found = any(img.pixelColor(x, y).rgb() & 0xFFFFFF == green
+                for y in range(img.height()) for x in range(img.width()))
+    assert not found

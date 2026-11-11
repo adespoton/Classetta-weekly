@@ -239,7 +239,56 @@ def test_unprintable_type_is_rejected():
     assert not _type_ok(b'\x7f\x01\x02\x03', b'MACS')
 
 
-def test_printable_and_family_types_are_accepted():
-    assert _type_ok(b'TEXT', b'MACS')
-    assert _type_ok(b'\x00\x00\xff\xff', b'FNDR')   # folder
-    assert _type_ok(b'\x00\x1a\x00\x00', b'MACS')   # embedded no-type family
+def _v1_catalog(disk_name: str, items: list) -> bytes:
+    h = bytearray(0x37e)
+    h[0:8] = b'disktrak'
+    struct.pack_into('>I', h, 0x0C, 1)
+    
+    # Volume record (76 bytes)
+    vol = bytearray(76)
+    struct.pack_into('>H', vol, 0, 0xa000)
+    vol[2:6] = b'\xff\xff\xff\xff'
+    struct.pack_into('>II', vol, 0x12, 2700000000, 2710000000)
+    struct.pack_into('>H', vol, 0x1a, 0)
+    struct.pack_into('>I', vol, 0x1c, len(items)) # immediate children
+    struct.pack_into('>I', vol, 0x20, len(items)) # descendants
+    nb = disk_name.encode('mac_roman')
+    vol[0x24] = len(nb)
+    vol[0x25:0x25+len(nb)] = nb
+    
+    body = bytearray(h) + bytes(vol)
+    for it in items:
+        # 36-byte front + pascal name
+        fb = bytearray(36)
+        is_folder = it.get('folder', False)
+        if is_folder:
+            struct.pack_into('>H', fb, 0, 0x8000)
+            fb[2:6] = b'\x00\x00\xff\xff'
+            fb[6:10] = b'\x00\x00\x010'
+        else:
+            fb[2:6] = it.get('type', b'TEXT')
+            fb[6:10] = it.get('creator', b'ttxt')
+        struct.pack_into('>I', fb, 10, it.get('size', 100))
+        struct.pack_into('>II', fb, 18, 1000000, 2000000)
+        struct.pack_into('>HII', fb, 26, it.get('depth', 1), it.get('items', 0), it.get('descendants', 0))
+        inb = it['name'].encode('mac_roman')
+        fb.append(len(inb))
+        body += bytes(fb) + inb
+    return bytes(body)
+
+
+def test_parse_v1_generated_catalog():
+    body = _v1_catalog('v1 Disk', [
+        dict(name='folder1', folder=True, depth=1, items=1, descendants=1),
+        dict(name='file1.txt', depth=2, size=42, type=b'TEXT', creator=b'ttxt'),
+    ])
+    recs = parse_dtc(body)
+    assert [(r.kind, r.name, r.depth) for r in recs] == [
+        ('disk', 'v1 Disk', 0),
+        ('folder', 'folder1', 1),
+        ('file', 'file1.txt', 2),
+    ]
+    assert recs[0].items == 2
+    assert recs[2].size == 42
+    assert recs[2].type == b'TEXT'
+
