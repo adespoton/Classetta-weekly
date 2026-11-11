@@ -107,7 +107,7 @@ def bitmap_icon(data: bytes, size: tuple[int, int] = LARGE, masked: bool = True)
         large_icon = bitmap_icon(data, LARGE, masked=False)
         if large_icon is None:
             return None
-        img = large_icon.image().scaled(width, height, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        img = large_icon.image().scaled(width, height, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.FastTransformation)
         return Icon(width, height, _mono_rows(img), None)
     if len(data) < n:
         return None
