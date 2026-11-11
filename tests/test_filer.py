@@ -182,7 +182,7 @@ def test_the_window_lists_the_folder(harness):
     win = h.d.open_filer(h.d.config.disks[0])
     h.settle()
     assert win.isVisible()
-    assert _rows(win) == [("Games", "folder"), ("Letter", "document"),
+    assert _rows(win) == [("Games", "folder"), ("Letter", "Widget document"),
                           ("Widget", "application")]
     assert win in h.d.filer_windows
 
@@ -1245,3 +1245,79 @@ def test_shutdown_leaves_the_command_alone(harness, monkeypatch):
     finish(h.d, 0)
     assert not h.d.restarting
     assert runs == []                            # only Restart runs anything again
+
+
+def _bundle_volume() -> machfs.Volume:
+    """A volume with an application declaring its bundle and a document
+    it created: the Filer should know the document's icon and kind."""
+    v = machfs.Volume()
+    v.name = "SurfDisk"
+    image, mask = bytes([0xF0]) * 128, b"\xff" * 128
+    small, small_mask = b"\xcc" * 32, b"\xff" * 32
+    def _pstring(s):
+        encoded = s.encode("mac_roman")
+        return bytes([len(encoded)]) + encoded
+
+    kind = (b"WAVE" + struct.pack(">H", 0)
+            + b"apnm" + _pstring("SurfSoft Works")
+            + b"SWTD" + _pstring("SurfSoft Works text doc"))
+    resources = [
+        Resource(b"ICN#", 200, image + mask),
+        Resource(b"ics#", 200, small + small_mask),
+        Resource(b"FREF", 150, b"SWTD" + struct.pack(">H", 3) + b"\x00"),
+        Resource(b"BNDL", 128,
+                 b"WAVE" + b"\x00" * 2 + struct.pack(">H", 2)
+                 + b"ICN#" + struct.pack(">H", 1) + struct.pack(">HH", 3, 200)
+                 + b"FREF" + struct.pack(">H", 1) + struct.pack(">HH", 10, 150)),
+        Resource(b"kind", 1000, kind),
+    ]
+    app = machfs.File()
+    app.type, app.creator = b"APPL", b"WAVE"
+    app.rsrc = build_fork(resources)
+    v["SurfWorks"] = app
+    doc = machfs.File()
+    doc.type, doc.creator = b"SWTD", b"WAVE"
+    doc.data = b"dear sir"
+    v["Letter"] = doc
+    lone = machfs.File()
+    lone.type, lone.creator = b"TEXT", b"NOPE"
+    lone.data = b"lone"
+    v["Lone"] = lone
+    return v
+
+
+def _filer_rows(win):
+    out = {}
+    for i in range(win.tree.topLevelItemCount()):
+        item = win.tree.topLevelItem(i)
+        out[item.text(0)] = item.text(2)
+    return out
+
+
+def test_a_document_shows_its_apps_kind_string_and_icon(harness):
+    from macrt.ui.filer import item_icon
+    h = harness(disks=[_bundle_volume()])
+    win = h.d.open_filer(h.d.config.disks[0])
+    h.settle()
+    rows = _filer_rows(win)
+    assert rows["Letter"] == "SurfSoft Works text doc"
+    assert rows["Lone"] == "document"
+    doc = win.entries["Letter"]
+    icon = item_icon(doc)
+    assert icon == ["##..##..##..##.."] * 16
+    assert icon != DOCUMENT_ICON
+
+
+def test_get_info_shows_the_document_kind(harness):
+    h = harness(disks=[_bundle_volume()])
+    win = h.d.open_filer(h.d.config.disks[0])
+    h.settle()
+    win.tree.setCurrentItem(_item(win, "Letter"))
+    h.settle()
+    win.get_info()
+    h.settle()
+    assert any("Kind: SurfSoft Works text doc" in line
+               for line in h.d.info_windows[0]._lines)
+    for w in h.d.info_windows:
+        w.close()
+    h.settle()

@@ -128,7 +128,8 @@ def _kind(f: MacFile) -> str:
         return "folder"
     if f.is_application:
         return "application"
-    return next((name for t, name in KINDS if f.type == t), "document")
+    from ..assoc import associated_kind
+    return associated_kind(f) or next((name for t, name in KINDS if f.type == t), "document")
 
 
 def _icon_for(f: MacFile) -> str:
@@ -240,6 +241,10 @@ def item_icon(f: MacFile, *, large: bool = False) -> list[str] | None:
             return None
     if f.is_application or f.flags & HAS_CUSTOM_ICON:
         return _icon_from(bytes(f.rsrc), large)
+    from ..assoc import associated_icon_rows
+    own = associated_icon_rows(f, large=large)
+    if own is not None:
+        return list(own)
     return None
 
 
@@ -838,6 +843,7 @@ class GetInfoWindow(AboutWindow):
 
     def __init__(self, display: Display, item: MacFile, parent: QWidget | None = None):
         lines = [f"Name: {item.name}"]
+        lines.append(f"Kind: {_kind(item) if item.type != FOLDER else 'Folder'}")
         if item.type != FOLDER:
             data, rsrc = item.sizes()
             lines.append(f"Data fork: {data:,} bytes")
@@ -852,8 +858,6 @@ class GetInfoWindow(AboutWindow):
             lines.append(f"Creator: {item.creator.decode('latin1', errors='replace')}")
             if item.flags:
                 lines.append(f"Flags: 0x{item.flags:04X}")
-        else:
-            lines.append("Kind: Folder")
         # Add creation and modification dates if available
         if hasattr(item, 'crdate') and item.crdate:
             from datetime import datetime, timezone, timedelta
