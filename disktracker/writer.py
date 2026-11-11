@@ -2,7 +2,7 @@
 
 import struct
 from typing import List, Union
-from .disktracker import Disk, Item, HEADER_SIZE
+from .disktracker import Disk, Item, HEADER_SIZE, _wide_tail
 
 def write_dtc(items: List[Union[Item, dict]]) -> bytes:
     """Generate a valid DiskTracker 2 .dtc byte string from items.
@@ -41,6 +41,11 @@ def write_dtc(items: List[Union[Item, dict]]) -> bytes:
         name_b = disk.name.encode('mac_roman', 'replace')
         d_rec[0x52] = len(name_b)
         d_rec[0x53:0x53+len(name_b)] = name_b
+        # Name echoed at +0x19, as in real Disk Tracker catalogs —
+        # the parser's disk-record detection requires it.
+        echo_end = 0x19 + len(name_b)
+        if echo_end < 0x52:
+            d_rec[0x19:echo_end] = name_b
         
         # Suffix / padding
         if disk.suffix:
@@ -52,7 +57,11 @@ def write_dtc(items: List[Union[Item, dict]]) -> bytes:
         for it in disk_items:
             # Item record layout
             is_folder = (it.kind == 'folder')
-            tail_len = 5 if is_folder else 1
+            typ = it.type if it.type else (b'FNDR' if not is_folder else b'\x00\x00\xff\xff')
+            # Tail length must match the parser's rule for the record
+            # family: the embedded/no-type family (or folders) carries a
+            # 5-byte tail even for files.
+            tail_len = 5 if (is_folder or _wide_tail(typ)) else 1
             # front byte + 38 bytes + type(4) + ...
             rec_len = 39 + 1 + len(it.name.encode('mac_roman', 'replace')) + tail_len
             item_b = bytearray(rec_len)
@@ -64,7 +73,6 @@ def write_dtc(items: List[Union[Item, dict]]) -> bytes:
                 item_b[38] = 0x00
 
             # type/creator/size/parent/created/modified/depth/items/descendants
-            typ = it.type if it.type else (b'FNDR' if not is_folder else b'\x00\x00\xff\xff')
             cre = it.creator if it.creator else b'MACS'
             
             struct.pack_into('>4s', item_b, 39 - 38, typ)

@@ -28,11 +28,17 @@ class DiskTrackerVolume(machfs.Volume):
         data = path.read_bytes()
         items = parse_dtc(data)
 
-        # Build tree using depth field (pre-order DFS)
+        first_disk = True
         stack = [self]  # stack of folders at each depth level
         for item in items:
             if item.kind == 'disk':
-                self.name = item.name
+                if first_disk:
+                    self.name = item.name
+                    first_disk = False
+                # Reset the folder stack per disk: depth is relative to
+                # each disk, so a stale deep stack from the previous
+                # disk would misattach this disk's depth-1 folders.
+                stack = [self]
                 continue
 
             # Ensure stack is long enough
