@@ -175,7 +175,7 @@ def _halve(bitmap: list[str]) -> list[str]:
 
 @lru_cache(maxsize=256)
 def _icon_rows(rsrc: bytes, large: bool,
-               prefer: tuple[int, ...] = (128,)) -> tuple[str, ...] | None:
+               prefer: tuple[int, ...] = (128, 0, 1, -4064, -15775)) -> tuple[str, ...] | None:
     """The '#'/'.' rows a resource fork's icon gives, kept as a tuple so
     the cache shares them safely: the small one for rows and title bars
     (halved when the fork only has a 32-by-32), the full one for Get
@@ -187,16 +187,21 @@ def _icon_rows(rsrc: bytes, large: bool,
         resources = read_fork(rsrc)
     except (InvalidForkError, ValueError, DecompressError, Exception):
         return None
-    # The preferred ids first (a control panel's family is at -4064),
-    # then any id, for a fork that keeps its icon in the old way.
-    pools = [{r.type: r.data for r in resources if r.id == rid} for rid in prefer]
-    pools.append({r.type: r.data for r in resources})
-    for pool in pools:
-        if not pool:
-            continue
 
+    # Try preferred IDs first, then any ID
+    all_ids = tuple(r.id for r in resources)
+    id_tries = tuple(dict.fromkeys(prefer + all_ids))
+    
+    for rid in id_tries:
         def get(kind: str) -> bytes | None:
-            return pool.get(kind.encode("ascii"))
+            kbytes = kind.encode("ascii")
+            for r in resources:
+                if r.type == kbytes and r.id == rid:
+                    return r.data
+            for r in resources:
+                if r.type == kbytes:
+                    return r.data
+            return None
 
         order = (LARGE, SMALL, MINI) if large else (SMALL, LARGE, MINI)
         icon = None
@@ -204,8 +209,16 @@ def _icon_rows(rsrc: bytes, large: bool,
             icon = suite_icon(get, size)
             if icon is not None:
                 break
-        if icon is None and b"ICON" in pool:       # an ICON, which no suite names
-            icon = bitmap_icon(pool[b"ICON"], LARGE, masked=False)
+        if icon is None:
+            for r in resources:
+                if r.type == b"ICON" and r.id == rid:
+                    icon = bitmap_icon(r.data, LARGE, masked=False)
+                    break
+            if icon is None:
+                for r in resources:
+                    if r.type == b"ICON":
+                        icon = bitmap_icon(r.data, LARGE, masked=False)
+                        break
         if icon is not None:
             bitmap = _bitmap(icon)
             if not large and len(bitmap[0]) > 16:
