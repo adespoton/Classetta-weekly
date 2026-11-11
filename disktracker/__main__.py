@@ -7,6 +7,12 @@ import sys
 from .disktracker import parse_dtc
 from .writer import write_dtc
 
+def _indent(it) -> str:
+    """Leading spaces by depth: the text exports show a file's nesting."""
+    depth = getattr(it, 'depth', 0) or 0
+    return '  ' * (max(depth, 1) - 1)
+
+
 def main():
     # Handle top-level flags (--scan, --todt1, --todt2, --totxt) before subcommands
     if len(sys.argv) > 1 and sys.argv[1] in ('--scan', '--todt1', '--todt2', '--totxt'):
@@ -68,7 +74,8 @@ def main():
                 for it in items:
                     typ = it.type.decode('latin-1', 'replace')
                     cre = it.creator.decode('latin-1', 'replace')
-                    f.write(f"{it.name}\t{it.size}\t{it.kind}\t{typ}\t{cre}\t0\t0\t0\t0\t{it.items}\t\t\t{it.name}\t\t\t\t\t\n")
+                    pad = _indent(it)
+                    f.write(f"{pad}{it.name}\t{it.size}\t{it.kind}\t{typ}\t{cre}\t0\t0\t0\t0\t{it.items}\t\t\t{it.name}\t\t\t\t\t\n")
             print(f'Exported {len(items)} records to text -> {out}')
             return
 
@@ -101,7 +108,8 @@ def main():
         with open(out_path, 'w', encoding='utf-8') as f:
             f.write('name\tkind\ttyp\tcreator\tparent\tsize\tcreated\tmodified\titems\tdesc\n')
             for it in items:
-                f.write(f"{it.name}\t{it.kind}\t{it.type.decode('latin-1', 'replace')}\t{it.creator.decode('latin-1', 'replace')}\t{it.parent}\t{it.size}\t{it.created}\t{it.modified}\t{it.items}\t{it.descendants}\n")
+                pad = _indent(it)
+                f.write(f"{pad}{it.name}\t{it.kind}\t{it.type.decode('latin-1', 'replace')}\t{it.creator.decode('latin-1', 'replace')}\t{it.parent}\t{it.size}\t{it.created}\t{it.modified}\t{it.items}\t{it.descendants}\n")
         print(f'Parsed {len(items)} records, wrote to {out_path}')
         if args.validate_txt:
             txt_path = args.file.rsplit('.', 1)[0] + '.txt'
