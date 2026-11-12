@@ -192,12 +192,16 @@ Preserve existing behavior unless a task explicitly changes it. If the codebase 
   - Include a clear unsupported-format and invalid-input path.
   - Avoid implementing unrelated formats or speculative generality.
 
-- [ ] **23. Port MacExtract to a Python archive library**
-  - Reimplement [uzTools/MacExtract](https://github.com/uzTools/MacExtract) in Python as a standalone, reusable library, not tied to this project; it replaces the planned `unar` integration.
+- [x] **23. Port MacExtract to a Python archive library**
+  - Reimplement [uzTools/MacExtract](https://github.com/uzTools/MacExtract) in Python as a standalone, reusable library, not tied to this project; it replaces the planned `unar` integration. Published as [macextract.py](https://github.com/adespoton/macextract.py), with the import package `macextract`; the Filer depends on it via the git URL in `pyproject.toml`.
   - Provide two library operations: list an archive's contents, and extract an archive's contents.
-  - Use the library in the Filer to list and extract archive contents.
-  - Cover its Mac formats (StuffIt, Compact Pro, BinHex, MacBinary, PackIt, AppleLink, DiskDoubler, and the rest listed in its README) in small tested batches.
+  - Use the library in the Filer to list and extract archive contents. The Filer sniffs with the library's format registry (`macextract.formats.FORMATS`), so every registered format — and each format added later — is browsable and extractable with no Filer change. File ▸ Extract (or the selected archive, in any listing) extracts to a folder you pick; resource forks travel as `._name` AppleDoubles.
+  - Format coverage (small tested batches, valid/corrupt/password-protected/unsupported): MacBinary I/II/III, BinHex 4.0, AppleSingle/Double, uuencode, btoa, base64, MIME attachments, PackIt, AppleLink `.pkg`. The remaining formats are task 23a.
   - Test valid, corrupt, password-protected, and unsupported archives.
+
+- [ ] **23a. Finish the macextract.py format ports**
+  - The remaining formats from uzTools/MacExtract's README, in small tested batches, each shipped list + extract with tests before the next begins: StuffIt classic → StuffIt 5 → StuffIt arsenic → Compact Pro → DiskDoubler → Now Compress → MacCompress (.Z) → ARC → LZH/LHA → PackIt splits → DiskDoubler/StuffIt split volumes → MAR → Apple Backup → Tomes → zip/gzip/tar → StuffIt SpaceSaver (with the Aladdin tables, attribution per its NOTICE). StuffIt X never; PC formats (RAR, 7-Zip, bzip2, xz) never.
+  - Every batch is automatically browsable in the Filer once its format is registered in macextract.py; no per-format Filer work.
 
 - [ ] **24. Add CHD support**
   - Add CHD handling through an appropriate reader or adapter.

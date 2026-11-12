@@ -37,7 +37,8 @@ from PyQt6.QtCore import QTimer
 from PyQt6.QtWidgets import QApplication
 
 from .m68k.segload import has_code, why_no_code
-from .macfile import (ContainerFolder, HostFolder, container_kind, is_control_panel,
+from .macfile import (ContainerFolder, HostFolder, archive_entries, ArchiveFolder,
+                     container_kind, is_control_panel,
                       open_application, open_disks)
 from .resfork import is_fork
 from .toolbox import constants as k
@@ -374,9 +375,16 @@ def open_targets(args):
             # file it decodes to; anything else shows its folder.
             if container_kind(f.key) is not None:
                 filers.append(ContainerFolder(f, Path(f.key).name))
-            elif not any(isinstance(v, HostFolder) and v.path == f.folder.path
-                         for v in filers):
-                filers.append(f.folder)
+            else:
+                try:
+                    entries = archive_entries(f.data, f.name) if f.data else None
+                except ValueError as e:
+                    return None, None, None, str(e)
+                if entries is not None:
+                    filers.append(ArchiveFolder(entries, Path(f.key).name, f.data))
+                elif not any(isinstance(v, HostFolder) and v.path == f.folder.path
+                             for v in filers):
+                    filers.append(f.folder)
             continue
         if not f.rsrc and is_fork(f.data):
             return None, None, None, (f"{f.name}'s resource fork is in its data fork: it "

@@ -398,7 +398,7 @@ one window), a document to open it with the application that made it, or
 a folder to open a window of that folder too. The window stays up, and
 its close box closes it, like a real Filer window's. Its menu bar has
 the Filer's own menus: File (Open, Get Info, Display Contents, Save
-Catalog, Close, Eject), View (by Icon, by Name, by Date, by Size,
+Catalog, Extract, Close, Eject), View (by Icon, by Name, by Date, by Size,
 by Kind), and Special
 (Clean Up Window, Empty Trash, Erase Disk, Set Startup, Restart,
 Shutdown). File ▸ Get Info
@@ -406,9 +406,21 @@ Shutdown). File ▸ Get Info
 modification dates. File ▸ Save Catalog (key S) writes what the
 window browses — the whole volume, host folder or encoded container —
 to a Disk Tracker 2 catalog (`.dtc`) of its own; the command is off in
-the read-only windows Disk Tracker catalogs open in. A Disk Tracker
+the read-only windows Disk Tracker catalogs open in. File ▸ Extract
+writes what the window browses, or the selected archive, to a folder
+you pick — resource forks beside their data forks as `._name`
+AppleDoubles, as The Unarchiver leaves them. A Disk Tracker
 index (`.dtc`, `.dt1`) opens in such
 a window too, but read-only: see [Disk images](#disk-images).
+
+Archives the Filer recognises — MacBinary, BinHex and AppleSingle, and
+every format its `macextract.py` dependency knows (PackIt, AppleLink,
+MIME, uuencode and its kin) — open in a Filer window like a folder: the
+archive's files listed, each openable as usual, and one window per
+nested archive. New formats are recognised as they are added to
+macextract.py; there is nothing to configure and no per-format code to
+write. A damaged archive says so when you try to open it; nothing else
+happens to it.
 
 An image nothing is launched from, one with no application on it or, with
 `--app`, none of the names, is a disk of documents. Every image is in a

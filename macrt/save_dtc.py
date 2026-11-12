@@ -14,7 +14,7 @@ is the catalog itself.
 import os
 import machfs
 
-from .macfile import ContainerFolder, HostFolder, VolumeFolder, load_file
+from .macfile import ArchiveFolder, ContainerFolder, HostFolder, VolumeFolder, load_file
 from disktracker.disktracker import HEADER_SIZE, Item
 from disktracker.filer_adapter import DiskTrackerVolume
 from disktracker.writer import write_dtc
@@ -143,4 +143,4 @@ def build_catalog(volume) -> bytes:
 def savable(volume) -> bool:
     """True for what the Save Catalog command can index: browse views,
     not read-only Disk Tracker catalog views."""
-    return not isinstance(volume, DiskTrackerVolume)
+    return not isinstance(volume, (DiskTrackerVolume, ArchiveFolder))

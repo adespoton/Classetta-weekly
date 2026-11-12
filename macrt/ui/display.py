@@ -995,6 +995,10 @@ class Display(QObject):
         elif menu_id == FILE_MENU_ID and item == 7:
             front = self.front_filer
             if front is not None:
+                front.extract()
+        elif menu_id == FILE_MENU_ID and item == 8:
+            front = self.front_filer
+            if front is not None:
                 front.close()
         elif menu_id == SPECIAL_MENU_ID and item == 6:
             self.restarting = True             # Special > Restart

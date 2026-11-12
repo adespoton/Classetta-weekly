@@ -34,8 +34,9 @@ from PyQt6.QtWidgets import (
 
 from pathlib import Path
 
-from ..macfile import (ContainerFolder, HostFolder, MacFile, archive_kind, container_contents,
-                       is_control_panel, launch_target, list_folder)
+from ..macfile import (ArchiveFolder, ContainerFolder, HostFolder, MacFile, archive_entries,
+                       archive_kind, container_contents, extract_archive, is_control_panel,
+                       launch_target, list_folder)
 from ..process import size_resource
 from ..m68k.segload import has_code, why_no_code
 from ..resfork import InvalidForkError, is_fork, read_fork
@@ -329,7 +330,8 @@ def _container_icon(volume: machfs.Volume, path: tuple[str, ...] = ()) -> list[s
         return CATALOG_ICON
     kind = ("volume" if isinstance(node, machfs.Volume)
             else "folder" if isinstance(node, machfs.Folder)
-            else "archive" if archive_kind(node) else "document")
+            else "archive" if isinstance(node, ArchiveFolder) or archive_kind(node)
+            else "document")
     return CONTAINER_ICONS[kind]
 
 
@@ -385,7 +387,8 @@ class FilerWindow(_Hosted):
     title bar wears an icon of the container it lists — the disk image
     at the root, a folder inside — the container's own when it has one."""
 
-    def __init__(self, display: Display, volume: machfs.Volume | HostFolder,
+    def __init__(self, display: Display,
+                 volume: machfs.Volume | HostFolder | ContainerFolder | ArchiveFolder,
                  path: tuple[str, ...] = (), options: FilerOptions | None = None,
                  parent: QWidget | None = None):
         super().__init__(display, parent)
@@ -395,7 +398,7 @@ class FilerWindow(_Hosted):
         if isinstance(volume, HostFolder):
             self._title_icon = FOLDER_ICON
             self.setWindowTitle(path[-1] if path else str(volume.path.name) or "Host Folder")
-        elif isinstance(volume, ContainerFolder):
+        elif isinstance(volume, (ContainerFolder, ArchiveFolder)):
             self._title_icon = ARCHIVE_ICON
             self.setWindowTitle(volume.name)
         else:
@@ -466,7 +469,7 @@ class FilerWindow(_Hosted):
     def frame(self) -> chrome.Frame:
         if isinstance(self.volume, HostFolder):
             title = self.path[-1] if self.path else str(self.volume.path.name) or "Host Folder"
-        elif isinstance(self.volume, ContainerFolder):
+        elif isinstance(self.volume, (ContainerFolder, ArchiveFolder)):
             title = self.volume.name
         else:
             title = self.path[-1] if self.path else self.volume.name
@@ -655,6 +658,37 @@ class FilerWindow(_Hosted):
         win.raise_()
         win.activateWindow()
 
+    def extractable(self) -> bool:
+        """Extract… works on a window browsing an archive, or on the
+        selected archive file in any listing; macextract decides what
+        an archive is, so new formats get this with no change here."""
+        if isinstance(self.volume, ArchiveFolder):
+            return True
+        item = self.selected_item()
+        return (item is not None and item.type != FOLDER
+                and archive_kind(item) == "archive")
+
+    def extract(self) -> None:
+        """Extract the archive being browsed (or the selected one)
+        into a folder the user picks."""
+        if isinstance(self.volume, ArchiveFolder):
+            raw, stem = self.volume.raw, self.volume.name
+        else:
+            item = self.selected_item()
+            if item is None or item.type == FOLDER or archive_kind(item) != "archive":
+                return
+            raw, stem = item.data, item.name
+        dest = QFileDialog.getExistingDirectory(self, f"Extract {stem} to…")
+        if not dest:
+            return
+        try:
+            written = extract_archive(raw, dest)
+        except ValueError as e:
+            self._say(str(e))
+            return
+        self.display.show_alert(QMessageBox.Icon.Information, "Extract",
+                                f"Extracted {len(written)} file(s) to {dest}")
+
     def savable(self) -> bool:
         """Save Catalog works on what can be browsed — volumes, host
         folders, encoded containers — not on the read-only views of
@@ -722,6 +756,15 @@ class FilerWindow(_Hosted):
             return
         if nested is not None:
             self.display.open_filer(ContainerFolder(nested, f.name), (), self.options)
+            return
+        try:
+            entries = archive_entries(f.data, f.name) if f.data else None
+        except ValueError as e:
+            self._say(str(e))
+            return
+        if entries is not None:
+            self.display.open_filer(ArchiveFolder(entries, f.name, f.data), (),
+                                    self.options)
             return
         try:
             target = launch_target(f)
@@ -1423,7 +1466,7 @@ class FilerMenus:
             Menu(APPLE_MENU_ID, k.APPLE_MENU_TITLE,
                  parse_menu_items("About Classetta…;(-")),
             Menu(FILE_MENU_ID, "File", parse_menu_items(
-                 "(Open/O;(-;(Get Info…/I;(Display Contents/ ;(-;(Save Catalog…/S;(Close/W;(Eject/E")),
+                 "(Open/O;(-;(Get Info…/I;(Display Contents/ ;(-;(Save Catalog…/S;(Extract…;(Close/W;(Eject/E")),
             Menu(EDIT_MENU_ID, "Edit", parse_menu_items(
                 "(Undo/Z;(-;(Cut/X;(Copy/C;(Paste/V;(Clear;(Select All/A")),
             Menu(VIEW_MENU_ID, "View", parse_menu_items(
@@ -1435,13 +1478,14 @@ class FilerMenus:
 
     def bar_menus(self) -> list[Menu]:
         """The Filer's menu headings, with File > Open, File > Get Info,
-        File > Display Contents and File > Save Catalog enabled only
-        where appropriate."""
+        File > Display Contents, File > Save Catalog and File > Extract
+        enabled only where appropriate."""
         front = self.display.front_filer
         openable = front is not None and "open" in front.selected_actions()
         infoable = front is not None and "info" in front.selected_actions()
         displayable = front is not None and "display_contents" in front.selected_actions()
         savable = front is not None and front.savable()
+        extractable = front is not None and front.extractable()
         closeable = front is not None
         file_menu = self.menus[FILE_MENU_ID]
         if file_menu.items:
@@ -1449,5 +1493,6 @@ class FilerMenus:
             file_menu.items[2].enabled = infoable
             file_menu.items[3].enabled = displayable
             file_menu.items[5].enabled = savable
-            file_menu.items[6].enabled = closeable
+            file_menu.items[6].enabled = extractable
+            file_menu.items[7].enabled = closeable
         return list(self.menus.values())

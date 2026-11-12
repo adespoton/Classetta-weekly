@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import binascii
 import copy
+import io
 import mmap
 import os
 import struct
@@ -674,7 +675,8 @@ def volume_files(volume: machfs.Volume) -> Iterator[MacFile]:
             yield _from_machfs(volume, VolumeFolder(volume, path[:-1]), path[-1], node)
 
 
-def list_folder(volume: machfs.Volume | HostFolder, path: tuple[str, ...] = ()) -> list[MacFile]:
+def list_folder(volume: machfs.Volume | HostFolder | ContainerFolder | ArchiveFolder,
+                path: tuple[str, ...] = ()) -> list[MacFile]:
     """One folder's contents, as the Finder's window lists them: its
     files, and its subfolders as MacFiles of type 'fldr' with no forks,
     each keeping its place in the folder it's in."""
@@ -686,8 +688,8 @@ def list_folder(volume: machfs.Volume | HostFolder, path: tuple[str, ...] = ()) 
                 return []
             folder = HostFolder(sub, folder.root)
         return folder.files()
-    if isinstance(volume, ContainerFolder):
-        return volume.files()               # one flat folder: the decoded file
+    if isinstance(volume, (ContainerFolder, ArchiveFolder)):
+        return volume.files()            # flat: the decoded file / the archive's entries
     folder = VolumeFolder(volume, path)
     node = folder._node(folder.path)
     out = []
@@ -925,12 +927,26 @@ def load_file(path: str | os.PathLike, folder: Folder | None = None, *,
 # What the command line opens
 # ---------------------------------------------------------------------------
 def archive_kind(f: MacFile) -> str | None:
-    """The kind of archive f is, if it's one: something to unpack first."""
-    d = f.data
+    """The kind of archive f is, if it's one: something to unpack first.
+    Any format in macextract's registry counts — add one there and it
+    is recognised (and browsable) here with no change."""
+    d = getattr(f, "data", b"")
     if d[:4] == b"SIT!" and d[10:14] == b"rLau" or d[:16] == b"StuffIt (c)1997-":
         return "StuffIt"
     if d[:4] == b"PK\x03\x04":
         return "zip"
+    if not d:
+        return None
+    try:
+        from macextract import formats
+    except ImportError:
+        return None
+    for module in formats.FORMATS:
+        try:
+            if module.probe(d):
+                return "archive"
+        except Exception:
+            continue
     return None
 
 
@@ -994,6 +1010,80 @@ class ContainerFolder:
 
     def find(self, name: str) -> MacFile | None:
         return self.contents if self.contents.name.lower() == name.lower() else None
+
+
+class ArchiveFolder:
+    """The contents of a macextract-recognised archive, as the flat
+    folder holding its entries — for a Filer window to list.  raw keeps
+    the archive's own bytes, so Extract… can re-read it with its macextract
+    format, Finder info included."""
+
+    def __init__(self, entries: list[MacFile], name: str, raw: bytes):
+        self.entries = entries
+        self.name = name                      # the archive's own name, for the title
+        self.raw = raw
+
+    def files(self) -> list[MacFile]:
+        return self.entries
+
+    def find(self, name: str) -> MacFile | None:
+        folded = name.lower()
+        return next((f for f in self.entries if f.name.lower() == folded), None)
+
+
+def archive_entries(data: bytes, name: str = "archive") -> list[MacFile] | None:
+    """macextract's entries as MacFiles — one per file in the archive —
+    or None when macextract does not recognise the bytes.  Recognised
+    but damaged raises ValueError, as the other parsers do; an archive
+    that wants a password says so the same way."""
+    if not data:
+        return None
+    try:
+        import macextract
+    except ImportError:
+        return None
+    try:
+        archive = macextract.open(io.BytesIO(data))
+    except macextract.UnsupportedError:
+        return None
+    except macextract.PasswordRequiredError:
+        raise ValueError(f"{name} needs a password, which the Filer cannot ask for yet")
+    except macextract.BadPasswordError:
+        raise ValueError(f"{name}: the password did not open it")
+    except macextract.MacExtractError as e:
+        raise ValueError(f"{name}: {e}")
+    out: list[MacFile] = []
+    for entry in archive.entries:
+        out.append(MacFile(entry.name,
+                           archive.read(entry, "data"),
+                           archive.read(entry, "rsrc"),
+                           entry.type, entry.creator,
+                           flags=entry.finder_flags,
+                           crdate=entry.created, mddate=entry.modified))
+    return out
+
+
+def extract_archive(raw: bytes, destination, fork_mode: str = "appledouble") -> list[str]:
+    """Extract an archive's contents under destination, macextract-style:
+    data fork to <name>, and a macOS-style ._<name> AppleDouble beside it
+    when there is a resource fork or Finder info.  Returns the paths
+    written; raises ValueError with a clear message when the archive is
+    damaged or wants a password."""
+    try:
+        import macextract
+    except ImportError:
+        raise ValueError("the macextract.py library is not installed")
+    try:
+        with macextract.open(io.BytesIO(raw)) as archive:
+            return [str(p) for p in archive.extract(destination, fork_mode=fork_mode)]
+    except macextract.UnsupportedError:
+        raise ValueError("macextract does not recognise this archive")
+    except macextract.PasswordRequiredError:
+        raise ValueError("the archive needs a password, which the Filer cannot ask for yet")
+    except macextract.BadPasswordError:
+        raise ValueError("the password did not open the archive")
+    except macextract.MacExtractError as e:
+        raise ValueError(str(e))
 
 
 def open_application(path: str | os.PathLike, name: str | None = None) -> MacFile:
@@ -1131,9 +1221,11 @@ def _volume_or_file(path: str | os.PathLike) -> tuple[machfs.Volume | None, MacF
     if problem is not None and not f.rsrc:
         raise ValueError(f"{path.name}: {problem}")     # an image, but one that can't be read
     kind = archive_kind(f)
-    if kind is not None:
+    if kind in ("StuffIt", "zip"):
         raise ValueError(f"{path.name} is a {kind} archive: unpack it first, for example "
                          f"with The Unarchiver (unar {path.name})")
+    # Archive formats macextract recognises pass through: the Filer can
+    # browse them, and an attempt to launch one is refused downstream.
     return None, f
 
 

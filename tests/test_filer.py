@@ -15,7 +15,8 @@ from macrt.macfile import ContainerFolder, HostFolder, MacFile, open_disks
 from macrt.resfork import build_fork, Resource, resPurgeable
 from macrt.toolbox import constants as k
 from macrt.ui import theme
-from macrt.ui.filer import ARCHIVE_ICON, SPECIAL_MENU_ID, FilerOptions, _container_icon
+from macrt.ui.filer import (ARCHIVE_ICON, FILE_MENU_ID, SPECIAL_MENU_ID, FilerOptions,
+                             _container_icon)
 from macrt.ui.stdfile import DISK_ICON, DOCUMENT_ICON, FOLDER_ICON
 from builders import binhex
 from test_files import FORK, apple_single, macbinary
@@ -1529,3 +1530,171 @@ def test_the_apple_menu_stays_black_and_white_at_depth_1(harness):
     found = any(img.pixelColor(x, y).rgb() & 0xFFFFFF == green
                 for y in range(img.height()) for x in range(img.width()))
     assert not found
+
+
+def _packit(files):
+    """A stored PackIt image: (name, data, rsrc, type, creator) entries."""
+    out = b""
+    for name, data, rsrc, ftype, creator in files:
+        name_bytes = name.encode("mac_roman")
+        header = bytearray(94)
+        header[0] = len(name_bytes)
+        header[1:64] = name_bytes.ljust(63, b"\0")
+        header[64:68], header[68:72] = ftype, creator
+        header[72] = 0x01                       # flags >> 8
+        struct.pack_into(">II", header, 76, len(data), len(rsrc))
+        struct.pack_into(">II", header, 84, 400000000, 400000100)
+        out += b"PMag" + bytes(header) + data + rsrc + b"\xde\xad"
+    return out + b"PEnd"
+
+
+def test_an_archive_opens_as_a_listing(harness, tmp_path):
+    # Any format in macextract's registry works the same way; PackIt is
+    # the one that isn't MacBinary, BinHex or AppleSingle.
+    p = tmp_path / "Outer.pit"
+    p.write_bytes(_packit([("Inner One", b"data one", b"", b"TEXT", b"TTxt"),
+                           ("Inner App", b"data two", FORK, b"APPL", b"TEST")]))
+    args = parse_args([str(p), "--filer"])
+    targets, disks, filers, error = open_targets(args)
+    assert error is None
+    assert [type(v).__name__ for v in filers] == ["ArchiveFolder"]
+    h = harness(disks=[])
+    win = h.d.open_filer(filers[0])
+    h.settle()
+    assert win.isVisible() and win.windowTitle() == "Outer.pit"
+    assert _rows(win) == [("Inner App", "application"), ("Inner One", "document")]
+    assert h.d.filer_windows[-1] is win
+
+
+def test_a_loose_archive_shows_its_listing_by_double_click(harness, tmp_path):
+    p = tmp_path / "Outer.pit"
+    p.write_bytes(_packit([("Inner One", b"data one", b"", b"TEXT", b"TTxt")]))
+    h = harness(disks=[])
+    win = h.d.open_filer(HostFolder(tmp_path))
+    h.settle()
+    win.tree.setCurrentItem(_item(win, "Outer.pit"))
+    h.settle()
+    win.open_selected()
+    h.settle()
+    assert [w.windowTitle() for w in h.d.filer_windows] == [tmp_path.name, "Outer.pit"]
+    assert _rows(h.d.filer_windows[1]) == [("Inner One", "document")]
+
+
+def test_an_archive_on_a_volume_drills_into_its_listing(harness, tmp_path):
+    v = _volume()
+    pit = machfs.File()
+    pit.type, pit.creator = b"????", b"????"
+    pit.data = bytearray(_packit([("Inner One", b"data one", b"", b"TEXT", b"TTxt")]))
+    v["Outer.pit"] = pit
+    h = harness(disks=[v])
+    win = h.d.open_filer(v)
+    h.settle()
+    win.tree.setCurrentItem(_item(win, "Outer.pit"))
+    h.settle()
+    assert win.selected_actions() == {"open", "info", "display_contents"}
+    win.open_selected()
+    h.settle()
+    inner = h.d.filer_windows[-1]
+    assert inner.windowTitle() == "Outer.pit"
+    assert _rows(inner) == [("Inner One", "document")]
+    assert not h.d._alerts
+
+
+def test_an_archive_entry_launches(harness, tmp_path, monkeypatch):
+    p = tmp_path / "Outer.pit"
+    p.write_bytes(_packit([("Inner App", b"data two", FORK, b"APPL", b"TEST")]))
+    args = parse_args([str(p), "--filer"])
+    _, _, filers, error = open_targets(args)
+    assert error is None
+    h = harness(disks=[])
+    win = h.d.open_filer(filers[0])
+    h.settle()
+    launched = []
+    monkeypatch.setattr(h.d, "launch",
+                        lambda name, main, **kw: launched.append((name, kw)))
+    win.tree.setCurrentItem(_item(win, "Inner App"))
+    h.settle()
+    win.open_selected()
+    h.settle()
+    assert [name for name, _ in launched] == ["Inner App"]
+
+
+def test_a_damaged_archive_is_refused_by_the_command_line(tmp_path):
+    p = tmp_path / "Outer.pit"
+    p.write_bytes(_packit([("Inner One", b"data one", b"", b"TEXT", b"TTxt")])[:50])
+    args = parse_args([str(p), "--filer"])
+    targets, disks, filers, error = open_targets(args)
+    assert targets is None and filers is None
+    assert error and "Outer.pit" in error
+
+
+def test_a_damaged_archive_in_a_window_says_so_without_crashing(harness, tmp_path):
+    p = tmp_path / "Outer.pit"
+    p.write_bytes(_packit([("Inner One", b"data one", b"", b"TEXT", b"TTxt")])[:50])
+    h = harness(disks=[])
+    win = h.d.open_filer(HostFolder(tmp_path))
+    h.settle()
+    win.tree.setCurrentItem(_item(win, "Outer.pit"))
+    h.settle()
+    win.open_selected()
+    h.settle()
+    assert len(h.d.filer_windows) == 1          # no drill window
+    assert h.d._alerts and "Outer.pit" in h.d._alerts[0].text()
+
+
+def _dir_dialog(monkeypatch, out):
+    class _DirDialog:
+        @staticmethod
+        def getExistingDirectory(*_args, **_kwargs):
+            return str(out) if out is not None else ""
+    monkeypatch.setattr("macrt.ui.filer.QFileDialog", _DirDialog)
+
+
+def test_extract_menu_extracts_the_browsed_archive(harness, tmp_path, monkeypatch):
+    p = tmp_path / "Outer.pit"
+    p.write_bytes(_packit([("Inner One", b"data one", b"", b"TEXT", b"TTxt"),
+                           ("Inner App", b"data two", FORK, b"APPL", b"TEST")]))
+    args = parse_args([str(p), "--filer"])
+    _, _, filers, error = open_targets(args)
+    assert error is None
+    h = harness(disks=[])
+    win = h.d.open_filer(filers[0])
+    h.settle()
+    assert h.d.filer_menu_choice is not None
+    dest = tmp_path / "out"
+    dest.mkdir()
+    _dir_dialog(monkeypatch, dest)
+    h.d.filer_menu_choice(FILE_MENU_ID, 7)          # File > Extract…
+    h.settle()
+    assert (dest / "Inner One").read_bytes() == b"data one"
+    assert (dest / "Inner App").read_bytes() == b"data two"
+    assert (dest / "._Inner App").exists()          # AppleDouble: resource fork and Finder info
+    assert (dest / "._Inner One").exists()          # Finder info alone pairs too
+
+
+def test_extract_menu_item_enabled_state(harness, tmp_path):
+    h = harness(disks=[_volume()])
+    win = h.d.open_filer(h.d.config.disks[0])
+    h.settle()
+
+    def extract_enabled():
+        for menu, _cell in h.d.global_bar.cells():
+            if menu.title == "File":
+                return menu.items[6].enabled, menu.items[5].enabled
+        raise AssertionError("the menu bar is showing no File menu")
+
+    assert extract_enabled()[0] is False            # a volume with nothing selected
+    p = tmp_path / "Outer.pit"
+    p.write_bytes(_packit([("Inner One", b"data one", b"", b"TEXT", b"TTxt")]))
+    host = h.d.open_filer(HostFolder(tmp_path))
+    h.settle()
+    host.tree.setCurrentItem(_item(host, "Outer.pit"))
+    h.settle()
+    assert extract_enabled()[0] is True             # an archive is selected
+    _, _, filers, error = open_targets(parse_args([str(p), "--filer"]))
+    assert error is None
+    h.d.open_filer(filers[0])
+    h.settle()
+    extract, save = extract_enabled()
+    assert extract is True                          # browsing an archive
+    assert save is False                            # Save Catalog is for browse views
