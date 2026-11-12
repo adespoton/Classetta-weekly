@@ -177,6 +177,13 @@ Preserve existing behavior unless a task explicitly changes it. If the codebase 
   - Update Get Info windows, application icons in the list, and other UI elements to respect the depth setting.
   - Test that the Filer correctly switches between colour and monochrome modes based on the depth option.
 
+- [ ] **20c. Index HFS Plus disk images in disktracker**
+  - Extend the `disktracker` library's image indexing (`disktracker/index.py`'s `_read_fs`, which today knows HFS and ISO 9660) to read HFS Plus / HFSX volumes ('H+'/'HX'), the format task 27 added to the Filer path (`macrt.hfsplus`).
+  - Reuse the `macrt.hfsplus` reader (or its parsing pieces) rather than duplicating B-tree walking; cover raw volumes and Apple-partition-map-wrapped ones, as in task 27.
+  - Emit `.dtc` catalog items the same shape as the HFS and ISO paths, matching by volume and file names.
+  - Report corrupt or unsupported images with a clear error without crashing the batch.
+  - Test with generated HFS Plus fixtures (no external sample images committed to the repo).
+
 ### New format support
 
 - [x] **22. Establish the smallest reusable format-opening interface**
