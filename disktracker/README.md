@@ -18,8 +18,8 @@ the core reader, writer, and indexer.
 from disktracker import build_dtc
 
 # One .dtc indexing every image's contents: HFS volumes (raw,
-# Apple-partitioned, or hybrid) and ISO 9660 images are read; MFS is
-# recognized and refused.
+# Apple-partitioned, or hybrid), HFS Plus volumes, and ISO 9660 images
+# are read; MFS is recognized and refused.
 data = build_dtc(['MyDisk.dsk', 'Install CD.iso', 'Tools.hdv'])
 open('catalog.dtc', 'wb').write(data)
 ```

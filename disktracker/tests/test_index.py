@@ -231,3 +231,97 @@ def test_index_a_large_generated_image(big_hfs_image: Path):
     # Verify round-trip by parsing the catalog
     parsed = parse_dtc(catalog_bytes)
     assert len(parsed) == len(items)
+
+
+# -- HFS Plus -----------------------------------------------------------------
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / 'tests'))
+from hfsplus_build import hfsplus_image as _hfsplus_image
+
+
+@pytest.fixture
+def hfsplus_file(tmp_path: Path) -> Path:
+    """A small HFS Plus volume: a file at the root, a folder with one file."""
+    entries = [
+        {'kind': 'folder', 'name': 'docs'},
+        {'kind': 'file', 'name': 'inner.bin', 'parent': 'docs', 'type': b'DMdf',
+         'creator': b'DskM', 'data': b'x' * 5000},
+        {'kind': 'file', 'name': 'readme.txt', 'type': b'TEXT', 'creator': b'ttxt',
+         'data': b'hello', 'rsrc': b''},
+    ]
+    path = tmp_path / 'test.hfs+'
+    path.write_bytes(_hfsplus_image('TestPlus', entries, created=1000000))
+    return path
+
+
+def test_index_hfsplus_image(hfsplus_file: Path):
+    items = index_image(hfsplus_file)
+    disk = items[0]
+    assert (disk.kind, disk.name) == ('disk', 'TestPlus')
+    assert disk.items == len(items) - 1
+    by_name = {i.name: i for i in items[1:]}
+    readme = by_name['readme.txt']
+    assert (readme.kind, readme.depth, readme.size) == ('file', 1, 5)
+    assert (readme.type, readme.creator) == (b'TEXT', b'ttxt')
+    docs = by_name['docs']
+    assert (docs.kind, docs.depth, docs.items, docs.descendants) == ('folder', 1, 1, 1)
+    assert docs.size == 5000
+    inner = by_name['inner.bin']
+    assert (inner.kind, inner.depth, inner.size) == ('file', 2, 5000)
+    assert (inner.type, inner.creator) == (b'DMdf', b'DskM')
+
+
+def test_index_hfsplus_wrapped_in_a_partition_map(tmp_path: Path):
+    def partitioned(volume, start):
+        def entry(first, blocks, kind):
+            e = bytearray(512)
+            e[0:2] = b'PM'
+            struct.pack_into('>III', e, 4, 3, first, blocks)
+            e[48:48 + len(kind)] = kind
+            return bytes(e)
+        blocks = len(volume) // 512
+        ddm = b'ER' + struct.pack('>HI', 512, start + blocks)
+        head = (ddm.ljust(512, b'\0') + entry(1, 63, b'Apple_partition_map')
+                + entry(start, blocks, b'Apple_HFS'))
+        return head.ljust(512 * start, b'\0') + volume
+
+    raw = _hfsplus_image('WrappedPlus', [
+        {'kind': 'file', 'name': 'data.bin', 'type': b'BINA',
+         'creator': b'TEST', 'data': b'w' * 300},
+    ])
+    path = tmp_path / 'wrapped.img'
+    path.write_bytes(partitioned(raw, start=32))
+    items = index_image(path)
+    assert items[0].name == 'WrappedPlus'
+    assert [i.name for i in items[1:]] == ['data.bin']
+
+
+def test_index_hfsplus_invisible_entries_are_left_out(tmp_path: Path):
+    entries = [
+        {'kind': 'file', 'name': 'Normal', 'data': b'n'},
+        {'kind': 'file', 'name': '.DS_Store', 'data': b's', 'fdflags': 0x4000},
+        {'kind': 'folder', 'name': '.Trashes', 'frflags': 0x4000},
+        {'kind': 'file', 'name': 'Hidden', 'parent': '.Trashes', 'data': b'h'},
+    ]
+    path = tmp_path / 'hidden.hfs+'
+    path.write_bytes(_hfsplus_image('HiddenPlus', entries))
+    items = index_image(path)
+    assert [i.name for i in items[1:]] == ['Normal']
+
+
+def test_index_hfsplus_catalog_roundtrip(hfsplus_file: Path):
+    recs = parse_dtc(build_dtc([hfsplus_file]))
+    assert recs[0].kind == 'disk' and recs[0].name == 'TestPlus'
+    assert {r.name for r in recs} >= {'docs', 'inner.bin', 'readme.txt'}
+
+
+def test_a_damaged_hfsplus_image_is_refused(tmp_path: Path):
+    img = bytearray(_hfsplus_image('Broken', [
+        {'kind': 'file', 'name': 'a.txt', 'data': b'x'},
+    ]))
+    img[1024 + 44:1024 + 48] = b'\x00\x00\x00\x00'    # no total blocks
+    path = tmp_path / 'broken.hfs+'
+    path.write_bytes(bytes(img))
+    with pytest.raises(ValueError, match='no blocks|unsupported'):
+        index_image(path)

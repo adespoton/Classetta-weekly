@@ -1,9 +1,10 @@
 """Index disk images into DiskTracker .dtc catalogs.
 
 Accepts a list of disk images — an HFS volume (raw, Apple-partitioned,
-or a hybrid), or an ISO 9660 image — reads each one's directory tree,
-and emits the pre-order item list a .dtc catalog holds, so write_dtc
-can turn it into a catalog indexing every image's contents.
+or a hybrid), an HFS Plus volume, or an ISO 9660 image — reads each
+one's directory tree, and emits the pre-order item list a .dtc
+catalog holds, so write_dtc can turn it into a catalog indexing every
+image's contents.
 
 Standard library only: the library stays reusable outside this
 project.  MFS volumes are recognized and refused: their folders live
@@ -11,6 +12,7 @@ in the Finder's Desktop file, not in the File Manager's catalog.
 """
 
 import struct
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
@@ -117,6 +119,216 @@ def _read_hfs(data: bytes, at: int):
     if root is None:
         raise ValueError("the HFS volume's catalog has no root folder")
     return name, crdate, mddate, root
+
+
+# ---------------------------------------------------------------------------
+# HFS Plus ('H+'/'HX' in the volume header at offset 1024)
+# ---------------------------------------------------------------------------
+def _find_hfsplus(data: bytes) -> int | None:
+    """The image offset of the first plausible HFS Plus volume, None if
+    it has none: a scan for 'H+' or 'HX' whose fields then hold up."""
+    for at in range(0, max(0, len(data) - 1026), 512):
+        if data[at + 1024:at + 1026] not in (b'H+', b'HX'):
+            continue
+        version, = struct.unpack_from('>H', data, at + 1026)
+        block_size, total_blocks = struct.unpack_from('>II', data, at + 1024 + 40)
+        catalog_len = struct.unpack_from('>Q', data, at + 1024 + 272)[0]
+        if version not in (4, 5):
+            continue
+        if not 512 <= block_size <= 1 << 16 or block_size % 512 or not total_blocks:
+            continue
+        if catalog_len > len(data) - at:
+            continue
+        return at
+    return None
+
+
+def _hfsplus_node(tree: bytes, n: int, node_size: int) -> tuple[int, int, list[bytes]]:
+    """A B-tree node's forward link, its kind (0: index, 1: header,
+    2: map, -1: leaf) and its records."""
+    at = n * node_size
+    if at + node_size > len(tree):
+        raise ValueError("its B-tree's node's links reach past its end")
+    kind = struct.unpack_from('>b', tree, at + 8)[0]
+    count = struct.unpack_from('>H', tree, at + 10)[0]
+    link = struct.unpack_from('>I', tree, at)[0]
+    table = at + node_size - 2 * (count + 1)
+    if table < at + 14:
+        raise ValueError("its B-tree's node's record table reaches into its descriptor")
+    offsets = struct.unpack_from(f'>{count + 1}H', tree, table)[::-1]
+    if any(a >= b or b > node_size for a, b in zip(offsets, offsets[1:])):
+        raise ValueError("its B-tree's node's records are out of order")
+    return link, kind, [bytes(tree[at + a:at + b]) for a, b in zip(offsets, offsets[1:])]
+
+
+def _hfsplus_leaf_records(tree: bytes) -> Iterator[bytes]:
+    """A B-tree's leaf records in order, from its first leaf node through
+    each node's forward link to its last.  A damaged tree whose links go
+    round is a damaged tree, not one read for ever."""
+    if len(tree) < 14 + 20:
+        raise ValueError("its B-tree is too small to hold a header node")
+    if struct.unpack_from('>b', tree, 8)[0] != 1:
+        raise ValueError("its B-tree's first node is not its header node")
+    first, last = struct.unpack_from('>II', tree, 14 + 10)
+    node_size, = struct.unpack_from('>H', tree, 14 + 18)
+    if not 512 <= node_size <= 32768 or node_size & 511:
+        raise ValueError(f"its B-tree's node size ({node_size}) is not one")
+    nodes = len(tree) // node_size
+    if first >= nodes or last >= nodes:
+        raise ValueError("its B-tree's first or last leaf node does not exist")
+    seen: set[int] = set()
+    n = first
+    while n:
+        if n in seen:
+            raise ValueError("its B-tree's leaves link round in a circle")
+        seen.add(n)
+        link, kind, records = _hfsplus_node(tree, n, node_size)
+        if kind != -1:
+            raise ValueError("its B-tree's leaf link reaches a node that is not a leaf")
+        yield from records
+        if n == last:
+            return
+        n = link
+
+
+def _hfsplus_spans(block_size: int, logical: int,
+                   extents: list[tuple[int, int]],
+                   overflow: dict[tuple[int, int, int], list[tuple[int, int]]],
+                   cnid: int, kind: int) -> list[tuple[int, int]]:
+    """Where a fork's bytes are: its inline extents', then the extents
+    overflow file's."""
+    wanted = -(-logical // block_size)
+    out, all_extents, idx, blocks = [], list(extents), 0, 0
+    while blocks < wanted:
+        if idx < len(all_extents):
+            start, count = all_extents[idx]
+            idx += 1
+            if count:
+                out.append((start * block_size, (start + count) * block_size))
+                blocks += count
+            continue
+        more = overflow.get((kind, cnid, blocks))
+        if more is None:
+            raise ValueError(
+                f"its extents end at block {blocks}, but file {cnid} wants {wanted} blocks")
+        if not any(count for _, count in more):
+            raise ValueError(f"its extents overflow file has no blocks for file {cnid}")
+        all_extents += more
+    return out
+
+
+def _hfsplus_fork_data(disk: bytes, fork_at: int) -> tuple[int, list[tuple[int, int]]]:
+    """An HFSPlusForkData's logical size and its extents (block, count)."""
+    at = fork_at
+    logical = struct.unpack_from('>Q', disk, at)[0]
+    extents = [e for e in (struct.unpack_from('>II', disk, at + 16 + i * 8)
+                           for i in range(8)) if e[1]]
+    return logical, extents
+
+
+def _hfsplus_overflow(disk: bytes, block_size: int) -> dict:
+    """The extents overflow file's records, as (fork type, file, start
+    block) -> extents, read through its inline extents (it is tiny)."""
+    logical, extents = _hfsplus_fork_data(disk, 1024 + 192)
+    if not logical:
+        return {}
+    if sum(count for _, count in extents) * block_size < logical:
+        raise ValueError("its extents overflow file spans past its inline extents")
+    tree = b"".join(disk[a:b] for a, b in _hfsplus_spans(block_size, logical, extents,
+                                                         {}, 3, 0))[:logical]
+    overflow = {}
+    for rec in _hfsplus_leaf_records(tree):
+        key_length, = struct.unpack_from('>H', rec, 0)
+        at = 2 + key_length
+        if at + 64 > len(rec):
+            continue
+        fork_type = rec[2]
+        cnid, = struct.unpack_from('>I', rec, 4)
+        start, = struct.unpack_from('>I', rec, 8)
+        inline = [struct.unpack_from('>II', rec, at + i * 8) for i in range(8)]
+        overflow[fork_type, cnid, start] = [e for e in inline if e[1]]
+    return overflow
+
+
+def _hfsplus_text(raw: bytes) -> str:
+    """An HFSUniStr255's text: UTF-16 big-endian, decomposed as the Mac
+    wrote it, normalized to composed for display."""
+    return unicodedata.normalize('NFC', raw.decode('utf-16-be'))
+
+
+def _hfsplus_record(rec: bytes):
+    """A catalog record's key's parent ID, its name, its type and where
+    its data begins."""
+    if len(rec) < 8:
+        raise ValueError("its catalog holds a record too small for a key")
+    key_length, parent, name_length = struct.unpack_from('>HIH', rec, 0)
+    if 8 + 2 * name_length > len(rec):
+        raise ValueError("its catalog holds a record whose name reaches past it")
+    name = _hfsplus_text(rec[8:8 + 2 * name_length])
+    at = 2 + key_length
+    if at + 2 > len(rec):
+        raise ValueError("its catalog holds a record whose key reaches past it")
+    return parent, name, struct.unpack_from('>H', rec, at)[0], at
+
+
+def _read_hfsplus(data: bytes, at: int):
+    """The HFS Plus volume at the image's offset at: its name, its
+    dates, and its root folder as a tree of dicts.  Entries the Finder
+    marks invisible (the journal, Desktop files) are left out, so the
+    catalog matches the Filer's view."""
+    disk = data[at:]
+    if len(disk) < 1024 + 512:
+        raise ValueError("it is too small to hold an HFS Plus volume header")
+    crdate, mddate = struct.unpack_from('>II', disk, 1024 + 16)
+    block_size, total_blocks = struct.unpack_from('>II', disk, 1024 + 40)
+    if not block_size or not total_blocks:
+        raise ValueError("its HFS Plus volume header holds no blocks")
+    overflow = _hfsplus_overflow(disk, block_size)
+    logical, catalog_inline = _hfsplus_fork_data(disk, 1024 + 272)
+    catalog = b"".join(disk[a:b] for a, b in _hfsplus_spans(block_size, logical, catalog_inline,
+                                                            overflow, 4, 0))[:logical]
+    cnids: dict[int, dict] = {}
+    order: list[tuple[int, dict]] = []
+    volume_name: str | None = None
+    for rec in _hfsplus_leaf_records(catalog):
+        try:
+            parent, name, record_type, rec_at = _hfsplus_record(rec)
+        except (UnicodeDecodeError, struct.error, ValueError) as e:
+            raise ValueError(f"its catalog holds a record it cannot read ({e})") from None
+        if record_type in (3, 4):              # threads: the root's names the volume
+            if parent == 2:
+                length, = struct.unpack_from('>H', rec, rec_at + 8)
+                volume_name = _hfsplus_text(rec[rec_at + 10:rec_at + 10 + 2 * length])
+            continue
+        fdflags, = struct.unpack_from('>H', rec, rec_at + 56)
+        if fdflags & 0x4000:                   # invisible: the journal and friends
+            continue
+        cnid, = struct.unpack_from('>I', rec, rec_at + 8)
+        cdate, mdate = struct.unpack_from('>II', rec, rec_at + 12)
+        if record_type == 1:                   # a folder
+            node = {'kind': 'folder', 'name': name,
+                    'crdate': cdate, 'mddate': mdate, 'children': []}
+        elif record_type == 2:                 # a file
+            ftype, fcreator = bytes(rec[rec_at + 48:rec_at + 52]), bytes(rec[rec_at + 52:rec_at + 56])
+            data_len = struct.unpack_from('>Q', rec, rec_at + 88)[0]
+            rsrc_len = struct.unpack_from('>Q', rec, rec_at + 168)[0]
+            node = {'kind': 'file', 'name': name, 'type': ftype, 'creator': fcreator,
+                    'size': data_len + rsrc_len, 'crdate': cdate, 'mddate': mdate,
+                    'children': []}
+        else:
+            continue
+        cnids[cnid] = node
+        order.append((parent, node))
+    for parent, node in order:
+        if parent == 1:                        # the volume itself
+            continue
+        holder = cnids.get(parent)
+        if holder is not None and holder['kind'] == 'folder':
+            holder['children'].append(node)
+    root = cnids.get(2)
+    if root is None:
+        raise ValueError("the HFS Plus volume's catalog has no root folder")
+    return volume_name or 'untitled', crdate, mddate, root
 
 
 # ---------------------------------------------------------------------------
@@ -236,17 +448,21 @@ def _leaf_records(tree: bytes) -> Iterator[bytes]:
 
 def _read_fs(data: bytes, stem: str):
     """The image's filesystem as (name, created, modified, root tree):
-    HFS first (a hybrid disc's Mac view is the HFS one), then ISO 9660."""
+    HFS first (a hybrid disc's Mac view is the HFS one), then
+    HFS Plus, then ISO 9660."""
     at = _find_hfs(data)
     if at is not None:
         return _read_hfs(data, at)
+    at = _find_hfsplus(data)
+    if at is not None:
+        return _read_hfsplus(data, at)
     if len(data) >= 1026 and data[1024:1026] == b'\xd2\xd7':
         raise ValueError("MFS volumes are not supported (their folders "
                          "live in the Finder's Desktop file)")
     if len(data) > 16 * ISO_SECTOR and data[16 * ISO_SECTOR] == 1 \
             and data[16 * ISO_SECTOR + 1:16 * ISO_SECTOR + 6] == b'CD001':
         return _read_iso(data, stem)
-    raise ValueError("unsupported disk image (it is neither HFS nor ISO 9660)")
+    raise ValueError("unsupported disk image (it is neither HFS, HFS Plus nor ISO 9660)")
 
 
 def _emit(node: dict, depth: int) -> list[Item]:

@@ -4,7 +4,7 @@ The public entry points, in the order they're usually reached for:
 
     from disktracker import build_dtc, index_image, parse_dtc
 
-    # A .dtc indexing a list of disk images (HFS or ISO 9660)
+    # A .dtc indexing a list of disk images (HFS, HFS Plus or ISO 9660)
     open('catalog.dtc', 'wb').write(build_dtc(['disk1.iso', 'disk2.dsk']))
 
     # One image's records without writing them: a disk record first,
