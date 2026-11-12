@@ -422,7 +422,8 @@ def is_disk_image(data: bytes) -> bool:
     if moof.is_moof(data):
         return True
     data = _sectors(data)[0]
-    return _hfs_partition(data) is not None or _volume_start(data) is not None
+    return (_hfs_partition(data) is not None or _volume_start(data) is not None or 
+            (len(data) > 16 * 2048 and data[16 * 2048:16 * 2048 + 6] == b'CD001\x01'))
 
 
 def _link_aliases(vol_cr_date, cnids):
