@@ -173,7 +173,7 @@ def _iso_children(data: bytes, lba: int, length: int, depth: int) -> list[dict]:
                         'children': _iso_children(data, child_lba, size, depth + 1)}
             else:
                 node = {'kind': 'file', 'name': name, 'type': b'????',
-                        'creator': b'????', 'size': size, 'crdate': date,
+                        'creator': b'????', 'size': size, 'lba': child_lba, 'crdate': date,
                         'mddate': date, 'children': []}
             out.append(node)
         at += reclen

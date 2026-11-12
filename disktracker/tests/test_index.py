@@ -161,6 +161,19 @@ def test_index_iso_image(iso_image: Path):
     assert (inner.type, inner.creator) == (b'????', b'????')
 
 
+def test_load_volume_reads_iso_image(iso_image: Path):
+    import machfs
+    from macrt.macfile import load_volume
+    vol = load_volume(iso_image)
+    assert isinstance(vol, machfs.Volume)
+    assert vol.name == 'TESTISO'
+    hello = vol['HELLO.TXT']
+    assert isinstance(hello, machfs.File)
+    assert hello.data == b'hello world'
+    inner = vol['SUBDIR']['INNER.BIN']
+    assert inner.data == b'x' * 512
+
+
 def test_an_unsupported_image_is_refused(tmp_path: Path):
     path = tmp_path / 'junk.bin'
     path.write_bytes(b'not a disk image at all' * 100)

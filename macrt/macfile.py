@@ -632,10 +632,30 @@ def load_volume(source: str | os.PathLike | bytes | mmap.mmap) -> machfs.Volume:
         vol = _read_mfs(bytes(data[start[0]:]), start[0] // SECTOR)
         vol.size, vol.startup, vol.disk = len(data), startup, disk
         return vol
+    stem = Path(source).stem if not isinstance(source, (bytes, bytearray, mmap.mmap)) else "CDROM"
     try:
         vol = _read_hfs(data)
-    except Exception as e:      # noqa: BLE001 - a damaged catalog trips over anything
-        raise ValueError(f"the disk image is damaged ({type(e).__name__}: {e})") from None
+    except Exception as hfs_e:
+        try:
+            from disktracker.index import _read_iso
+            vol_name, cr, md, root = _read_iso(bytes(data), stem)
+            vol = machfs.Volume()
+            vol.name = vol_name
+            def populate(node, folder):
+                for child in node['children']:
+                    if child['kind'] == 'folder':
+                        sub = machfs.Folder()
+                        folder[child['name']] = sub
+                        populate(child, sub)
+                    else:
+                        f = machfs.File()
+                        f.data = bytes(data[child['lba'] * 2048 : child['lba'] * 2048 + child['size']])
+                        f.type, f.creator = child.get('type', b'????'), child.get('creator', b'????')
+                        f.crdate, f.mddate = child.get('crdate', 0), child.get('mddate', 0)
+                        folder[child['name']] = f
+            populate(root, vol)
+        except Exception as e2:
+            raise ValueError(f"the disk image is damaged ({type(hfs_e).__name__}: {hfs_e})") from None
     vol.size = len(data)                # the disk's: whether it's a floppy's
     vol.startup, vol.disk = startup, disk
     return vol
@@ -1073,6 +1093,15 @@ def launch_target(f: MacFile) -> MacFile:
     made = copy.copy(made)
     made.documents = (f,)
     return made
+
+
+def open_container(path: str | os.PathLike) -> machfs.Volume:
+    """Open a recognized container (.dtc, .dt1, disk image) into a machfs.Volume,
+    raising ValueError with a clear message for unsupported formats or invalid input."""
+    vol, f = _volume_or_file(path)
+    if vol is not None:
+        return vol
+    raise ValueError(f"{Path(path).name}: not a recognized volume container")
 
 
 def _volume_or_file(path: str | os.PathLike) -> tuple[machfs.Volume | None, MacFile | None]:
