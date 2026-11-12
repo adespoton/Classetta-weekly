@@ -179,7 +179,7 @@ Preserve existing behavior unless a task explicitly changes it. If the codebase 
 
 ### New format support
 
-- [ ] **22. Establish the smallest reusable format-opening interface**
+- [x] **22. Establish the smallest reusable format-opening interface**
   - Base the interface on the existing format handlers integrated in task 14.
   - Support opening a recognized container in a Filer window.
   - Include a clear unsupported-format and invalid-input path.
@@ -215,7 +215,7 @@ Preserve existing behavior unless a task explicitly changes it. If the codebase 
   - Report unsupported UDIF encodings and corrupt images without crashing.
   - Test detection, extraction to a readable volume, and failure paths.
 
-- [ ] **27. CD-image support incrementally**
+- [x] **27. CD-image support incrementally**
   - Add one tested CD-image path first, then expand in separate increments.
   - Cover ISO, Toast, and BIN/CUE images.
   - Cover the requested HFS, HFS+, UDF, and Rock Ridge contents as separate, verifiable format/filesystem combinations.

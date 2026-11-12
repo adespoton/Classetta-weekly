@@ -328,7 +328,7 @@ def _hfs_partition(data: bytes) -> tuple[int, int] | None:
             start, blocks = struct.unpack_from(">II", entry, 8)
             start, end = start * size, min((start + blocks) * size, len(data))
             if (entry[48:80].split(b"\0")[0] == b"Apple_HFS"
-                    and data[start + 1024:start + 1026] == HFS_SIGNATURE):
+                    and data[start + 1024:start + 1026] in (HFS_SIGNATURE, b"H+", b"HX")):
                 return start, end
     return None
 
@@ -337,7 +337,7 @@ def _volume_start(data: bytes) -> tuple[int, bytes] | None:
     """Where the volume starts (its boot blocks, two before the MDB) and
     its signature."""
     for i in range(0, min(len(data), 64 * 512), 512):
-        if data[i + 1024:i + 1026] in (HFS_SIGNATURE, MFS_SIGNATURE):
+        if data[i + 1024:i + 1026] in (HFS_SIGNATURE, MFS_SIGNATURE, b"H+", b"HX"):
             return i, bytes(data[i + 1024:i + 1026])
     return None
 
@@ -629,6 +629,11 @@ def load_volume(source: str | os.PathLike | bytes | mmap.mmap) -> machfs.Volume:
         data = data[part[0]:part[1]]
     start = _volume_start(data)
     startup = _startup_name(bytes(data[start[0]:start[0] + 1024])) if start else None
+    if start and start[1] in (b"H+", b"HX"):
+        from .hfsplus import read_hfsplus
+        vol = read_hfsplus(data[start[0]:] if start[0] else data)
+        vol.size, vol.startup, vol.disk = len(data), startup, disk
+        return vol
     if start and start[1] == MFS_SIGNATURE:
         vol = _read_mfs(bytes(data[start[0]:]), start[0] // SECTOR)
         vol.size, vol.startup, vol.disk = len(data), startup, disk
