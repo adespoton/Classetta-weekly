@@ -719,9 +719,10 @@ class Display(QObject):
                                                     self.input.mac_pos, self.input.modifiers))
         # If hiding the Filer, show the front process
         else:
-            for fwin in self.filer_windows:
-                fwin.lower()
-            # Make the front process come forward
+            # The application coming forward is raised by switch_to()'s
+            # restack(); the Filer's own windows are not to be buried —
+            # on the host's desktop that puts them behind every window,
+            # instead of merely behind the application's.
             if old_process is not None and old_process not in self.processes:
                 # Process might have been quit
                 pass

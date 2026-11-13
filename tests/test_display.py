@@ -576,6 +576,25 @@ def test_selecting_the_app_from_the_menu_brings_its_window_forward(harness):
     h.d.close_filer(win)
 
 
+def test_launching_an_app_from_the_filer_does_not_bury_the_filer(harness, monkeypatch):
+    """An application launched from the Filer comes to the front (the switch
+    raises its window) without the Filer's windows being lowered: on the
+    host's desktop lower() puts them behind every window rather than behind
+    the application's."""
+    import machfs
+    v = machfs.Volume()
+    v.name = "Browse"
+    h = harness(menu_bar="global", disks=[v])
+    win = h.d.open_filer(h.d.config.disks[0])
+    lowered = []
+    monkeypatch.setattr(win, "lower", lambda: lowered.append(1))
+    pa = h.launch(Recorder("Alpha", at=(30, 60)))
+    h.wait_until(lambda: h.d.front_process is pa, what="the app to come front")
+    assert h.d.front_filer is None                  # the app took the front
+    assert lowered == []                            # the Filer stayed in place
+    h.d.close_filer(win)
+
+
 def test_programs_find_the_application_menu_in_their_menu_lists(harness):
     """As on System 7, an application's menu list has the Application menu
     after its own menus, whatever it does to those, with the bar's items:
