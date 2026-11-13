@@ -200,8 +200,15 @@ Preserve existing behavior unless a task explicitly changes it. If the codebase 
   - Test valid, corrupt, password-protected, and unsupported archives.
 
 - [ ] **23a. Finish the macextract.py format ports**
-  - The remaining formats from uzTools/MacExtract's README, in small tested batches, each shipped list + extract with tests before the next begins: StuffIt classic → StuffIt 5 → StuffIt arsenic → Compact Pro → DiskDoubler → Now Compress → MacCompress (.Z) → ARC → LZH/LHA → PackIt splits → DiskDoubler/StuffIt split volumes → MAR → Apple Backup → Tomes → zip/gzip/tar → StuffIt SpaceSaver (with the Aladdin tables, attribution per its NOTICE). StuffIt X never; PC formats (RAR, 7-Zip, bzip2, xz) never.
+  - The remaining formats from uzTools/MacExtract's README, in small tested batches, each shipped list + extract with tests before the next begins: StuffIt classic → StuffIt 5 → StuffIt arsenic → Compact Pro → DiskDoubler → Now Compress → MacCompress (.Z) → ARC → LZH/LHA → PackIt splits → DiskDoubler/StuffIt split volumes → MAR → Apple Backup → Tomes → zip/gzip/tar → RAR, 7-Zip, bzip2 and xz (decompression only, the Python port taking the PC/general compressors the C project never had) → StuffIt SpaceSaver (with the Aladdin tables, attribution per its NOTICE). StuffIt X never.
   - Every batch is automatically browsable in the Filer once its format is registered in macextract.py; no per-format Filer work.
+
+- [ ] **23b. List archives from their directories only**
+  - Where a format states its members in a directory or in per-member headers, opening an archive for listing reads only that index: no member body is decoded until the entry is read, opened or extracted. A format with no directory at all (a bare `.Z`, a single BinHex stream) reads only its header for the listing.
+  - The Filer's `archive_entries` stops reading every fork while building a listing: names, sizes and Finder info come from headers, and a MacFile materialises its forks on first use.
+  - CRC and password checks that need decoded bytes move to first read, and the tests that grade them at `open()` move with them; a structurally damaged directory must still fail at list time.
+  - Verify the completed disk-image paths (raw, HFS, HFS+, ISO, Toast, BIN/CUE) list from filesystem directory structures only and read file contents on demand, and keep them that way as formats are added.
+  - Tests: for every directory-bearing format, a listing succeeds even when a member body is corrupt — reading that entry then fails — with generated fixtures only.
 
 - [ ] **24. Add CHD support**
   - Add CHD handling through an appropriate reader or adapter.
@@ -231,6 +238,12 @@ Preserve existing behavior unless a task explicitly changes it. If the codebase 
   - Cover ISO, Toast, and BIN/CUE images.
   - Cover the requested HFS, HFS+, UDF, and Rock Ridge contents as separate, verifiable format/filesystem combinations.
   - Handle unsupported filesystems and malformed images without crashing.
+
+- [ ] **27b. Add MDF/MDS (Alcohol 1200) CD-image reading**
+  - Read MDF/MDS pairs: the `.mdf` sector image with its `.mds` sidecar describing tracks, sessions and sector format.
+  - Open their contents through the existing disk-image path (`macrt.macfile`); the completed ISO, Toast and BIN/CUE images stay as they are.
+  - Detect from either file of the pair; a missing sidecar, an unrecognised sector format or malformed metadata is reported without crashing the Filer.
+  - Test detection, extraction to a readable volume, and failure paths with generated fixtures only. Manual sanity material: the 7-zipped ADC Developer CD MDF pairs in the gitignored `dt2/` folder — local checks only, never committed and never wired into the test scripts; unwrapping them also serves as manual sanity material for the planned 7z decompression batch.
 
 - [ ] **28. Extend drill-down to newly supported formats**
   - Allow newly supported archives and disk images to participate in nested browsing.
