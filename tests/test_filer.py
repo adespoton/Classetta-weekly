@@ -455,6 +455,71 @@ def test_about_window_close_box_closes_it(harness):
                  what="the About window to close")
 
 
+def test_opening_get_info_makes_it_the_auxiliary_front_window(harness):
+    h = harness(disks=[_volume()])
+    win = h.d.open_filer(h.d.config.disks[0])
+    h.settle()
+    about = h.d.show_about_classetta()
+    h.settle()
+    assert h.d.front_aux_window is about
+    win.tree.setCurrentItem(_item(win, "Widget"))
+    h.settle()
+    win.get_info()
+    h.settle()
+    assert h.d.front_aux_window is h.d.info_windows[0]
+
+
+def test_opening_display_contents_makes_it_the_auxiliary_front_window(harness):
+    h = harness(disks=[_volume()])
+    win = h.d.open_filer(h.d.config.disks[0])
+    h.settle()
+    about = h.d.show_about_classetta()
+    h.settle()
+    assert h.d.front_aux_window is about
+    win.tree.setCurrentItem(_item(win, "Letter"))
+    h.settle()
+    win.display_contents()
+    h.settle()
+    assert h.d.front_aux_window is h.d.viewer_windows[0]
+
+
+def test_opening_about_makes_it_the_auxiliary_front_window(harness):
+    h = harness(disks=[_volume()])
+    win = h.d.open_filer(h.d.config.disks[0])
+    h.settle()
+    win.tree.setCurrentItem(_item(win, "Widget"))
+    h.settle()
+    win.get_info()
+    h.settle()
+    about = h.d.show_about_classetta()
+    h.settle()
+    assert h.d.front_aux_window is about
+
+
+def test_switching_to_an_application_drops_the_auxiliary_front_window(harness):
+    h = harness(disks=[_volume()])
+    win = h.d.open_filer(h.d.config.disks[0])
+    h.settle()
+    about = h.d.show_about_classetta()
+    h.settle()
+    assert h.d.front_aux_window is about
+    app = h.launch(Recorder("Alpha", at=(30, 60)))
+    h.wait_until(lambda: h.d.front_process is app, what="Alpha to come forward")
+    assert h.d.front_aux_window is None
+    h.d.close_filer(win)
+
+
+def test_focusing_the_filer_drops_the_auxiliary_front_window(harness):
+    h = harness(disks=[_volume()])
+    win = h.d.open_filer(h.d.config.disks[0])
+    h.settle()
+    about = h.d.show_about_classetta()
+    h.settle()
+    assert h.d.front_aux_window is about
+    h.d.filer_front(win)
+    assert h.d.front_aux_window is None
+
+
 @pytest.mark.parametrize("host", ["screen", "desktop"])
 def test_control_opens_the_selection(harness, host):
     h = harness(disks=[_volume()], host=host)

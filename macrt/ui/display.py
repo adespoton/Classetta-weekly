@@ -222,6 +222,7 @@ class Display(QObject):
         self.about_windows: list[AboutWindow] = []
         self.info_windows: list[GetInfoWindow] = []
         self.viewer_windows: list[ContentViewerWindow] = []
+        self.front_aux_window: AboutWindow | GetInfoWindow | ContentViewerWindow | None = None
         self.tracker: Tracker | MenuTracker | None = None
         self.body_font = theme.body_font()
         self._swallow_release = False
@@ -368,6 +369,7 @@ class Display(QObject):
         self._shut_down = True
         self.bridge.closed = True
         widgets = [*self.views.values(), *self.app_bars.values(), *self.filer_windows,
+                   *self.about_windows, *self.info_windows, *self.viewer_windows,
                    self.global_bar, self.host_window, *self._alerts, *self.file_dialogs,
                    *self.print_dialogs, *self.disk_dialogs, *self.color_dialogs,
                    *self.edition_dialogs]
@@ -564,6 +566,9 @@ class Display(QObject):
             return                      # an app that has just quit can't come forward
         if self.front_filer is not None:
             self.filer_front(None)      # an application is coming forward
+        else:
+            # No Filer window was front; an application is coming forward.
+            self.front_aux_window = None
         self.processes.remove(proc)
         self.processes.insert(0, proc)
         if proc.hidden:
@@ -684,13 +689,18 @@ class Display(QObject):
         frontmost the bar shows the Filer's menus instead of a process's."""
         if win is not None and win not in self.filer_windows:
             return
+        # No About, Get Info or Viewer window is frontmost together with the
+        # Filer.  It is raised above them below; lowering the auxiliary
+        # windows is not an option — on the host's desktop that buries them
+        # behind every other window instead of merely behind the Filer.
+        self.front_aux_window = None
         if win is self.front_filer:
             return
-        
+
         old_filer = self.front_filer
         old_process = self.front_process
         self.front_filer = win
-        
+
         # If showing the Filer, hide the front app
         if win is not None:
             win.raise_()
@@ -969,7 +979,10 @@ class Display(QObject):
     def show_about_classetta(self) -> AboutClassettaWindow:
         win = AboutClassettaWindow(self)
         self.about_windows.append(win)
+        self.front_aux_window = win
         win.show()
+        win.raise_()
+        win.activateWindow()
         return win
 
     def filer_menu_choice(self, menu_id: int, item: int) -> None:
@@ -1164,6 +1177,7 @@ class Display(QObject):
         self.system.input.modifiers(self.input.modifiers)
 
     def mouse_down(self, obj: QWidget) -> None:
+        self.front_aux_window = None
         gpos = self.input.global_pos
         if self.tracker is not None:
             self.tracker.press(gpos)
@@ -1241,7 +1255,7 @@ class Display(QObject):
         key was one of them."""
         if self.front_filer is None or ev.type() != QEvent.Type.KeyPress:
             return False
-        if any(w.isActiveWindow() for w in self.info_windows + self.about_windows + self.viewer_windows):
+        if self.front_aux_window is not None:
             return False
         if not ev.modifiers() & (Qt.KeyboardModifier.ControlModifier
                                  | Qt.KeyboardModifier.MetaModifier):

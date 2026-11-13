@@ -636,6 +636,7 @@ class FilerWindow(_Hosted):
             return
         win = GetInfoWindow(self.display, item)
         self.display.info_windows.append(win)
+        self.display.front_aux_window = win
         # Center the info window over the Filer window.
         fr = self.frameGeometry()
         win.move(fr.center().x() - win.width() // 2,
@@ -651,6 +652,7 @@ class FilerWindow(_Hosted):
             return
         win = ContentViewerWindow(self.display, item)
         self.display.viewer_windows.append(win)
+        self.display.front_aux_window = win
         fr = self.frameGeometry()
         win.move(fr.center().x() - win.width() // 2,
                  fr.center().y() - win.height() // 2)
@@ -943,9 +945,21 @@ class AboutWindow(_Hosted):
             self._pressed = part
             self.update()
 
+    def _set_hilited(self, hilited: bool) -> None:
+        if hilited != self._hilited:
+            self._hilited = hilited
+            self.update()
+
+    # -- activation, so the pinstripes and close box show when it's front --
+    def changeEvent(self, event):  # noqa: N802
+        if event.type() == QEvent.Type.ActivationChange and self.isWindow():
+            self._set_hilited(self.isActiveWindow())
+        super().changeEvent(event)
+
     def mousePressEvent(self, ev):  # noqa: N802
         self.raise_()
         self.activateWindow()
+        self.display.front_aux_window = self
         self.display.update_mouse(ev.globalPosition().toPoint(), ev.modifiers(), down=True)
         part = self._hit(ev.position().toPoint().x(), ev.position().toPoint().y())
         if part == k.wInGoAway:
@@ -979,6 +993,8 @@ class AboutWindow(_Hosted):
 
     def closeEvent(self, event):  # noqa: N802
         event.accept()
+        if self.display.front_aux_window is self:
+            self.display.front_aux_window = None
         if self in self.display.about_windows:
             self.display.about_windows.remove(self)
 
@@ -1071,6 +1087,8 @@ class GetInfoWindow(AboutWindow):
 
     def closeEvent(self, event):  # noqa: N802
         event.accept()
+        if self.display.front_aux_window is self:
+            self.display.front_aux_window = None
         if self in self.display.info_windows:
             self.display.info_windows.remove(self)
 
@@ -1193,6 +1211,8 @@ class ContentViewerWindow(AboutWindow):
 
     def closeEvent(self, event):  # noqa: N802
         event.accept()
+        if self.display.front_aux_window is self:
+            self.display.front_aux_window = None
         if self in self.display.viewer_windows:
             self.display.viewer_windows.remove(self)
 
